@@ -63,6 +63,7 @@ int smp_expr_output_type(struct sample_expr *expr);
 int c_none(struct sample *smp);
 int c_pseudo(struct sample *smp);
 int smp_dup(struct sample *smp);
+int sample_check_arg_base64(struct arg *arg, char **err);
 
 /*
  * This function just apply a cast on sample. It returns 0 if the cast is not
@@ -100,6 +101,8 @@ struct sample *smp_set_owner(struct sample *smp, struct proxy *px,
 static inline
 int smp_is_safe(struct sample *smp)
 {
+	struct buffer *buf;
+
 	switch (smp->data.type) {
 	case SMP_T_METH:
 		if (smp->data.u.meth.meth != HTTP_METH_OTHER)
@@ -107,16 +110,17 @@ int smp_is_safe(struct sample *smp)
 		__fallthrough;
 
 	case SMP_T_STR:
-		if (!smp->data.u.str.size || smp->data.u.str.data >= smp->data.u.str.size)
+		buf = (smp->data.type == SMP_T_STR ? &smp->data.u.str : &smp->data.u.meth.str);
+		if (!buf->size || buf->data >= buf->size)
 			return 0;
 
-		if (smp->data.u.str.area[smp->data.u.str.data] == 0)
+		if (buf->area[buf->data] == 0)
 			return 1;
 
 		if (smp->flags & SMP_F_CONST)
 			return 0;
 
-		smp->data.u.str.area[smp->data.u.str.data] = 0;
+		buf->area[buf->data] = 0;
 		return 1;
 
 	case SMP_T_BIN:
@@ -147,6 +151,8 @@ int smp_make_safe(struct sample *smp)
 static inline
 int smp_is_rw(struct sample *smp)
 {
+	struct buffer *buf;
+
 	if (smp->flags & SMP_F_CONST)
 		return 0;
 
@@ -157,12 +163,12 @@ int smp_is_rw(struct sample *smp)
 		__fallthrough;
 
 	case SMP_T_STR:
-		if (!smp->data.u.str.size ||
-		    smp->data.u.str.data >= smp->data.u.str.size)
+		buf = (smp->data.type == SMP_T_STR ? &smp->data.u.str : &smp->data.u.meth.str);
+		if (!buf->size || buf->data >= buf->size)
 			return 0;
 
-		if (smp->data.u.str.area[smp->data.u.str.data] != 0)
-			smp->data.u.str.area[smp->data.u.str.data] = 0;
+		if (buf->area[buf->data] != 0)
+			buf->area[buf->data] = 0;
 		return 1;
 
 	case SMP_T_BIN:

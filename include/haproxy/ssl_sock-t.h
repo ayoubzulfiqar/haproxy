@@ -194,7 +194,7 @@ struct issuer_chain {
 
 struct connection;
 
-typedef void (*ssl_sock_msg_callback_func)(struct connection *conn,
+typedef void (*ssl_sock_msg_callback_func)(
 	int write_p, int version, int content_type,
 	const void *buf, size_t len, SSL *ssl);
 
@@ -254,7 +254,7 @@ struct ssl_keylog {
 #define SSL_SOCK_F_KTLS_SEND            (1 << 2) /* kTLS send is configured on that socket */
 #define SSL_SOCK_F_KTLS_RECV            (1 << 3) /* kTLS receive is configure on that socket */
 #define SSL_SOCK_F_CTRL_SEND            (1 << 4) /* We want to send a kTLS control message for that socket */
-#define SSL_SOCK_F_HAS_ALPN             (1 << 5) /* An ALPN has been negociated */
+#define SSL_SOCK_F_HAS_ALPN             (1 << 5) /* An ALPN has been negotiated */
 
 struct ssl_sock_ctx {
 	struct connection *conn;
@@ -338,6 +338,8 @@ struct global_ssl {
 	int renegotiate; /* Renegotiate mode (SSL_RENEGOTIATE_ flag) */
 	char **passphrase_cmd;
 	int passphrase_cmd_args_cnt;
+
+	unsigned int certificate_compression:1; /* allow to explicitly disable certificate compression */
 };
 
 /* The order here matters for picking a default context,
@@ -361,6 +363,7 @@ struct passphrase_cb_data {
 	const char *path;
 	struct ckch_data *ckch_data;
 	int passphrase_idx;
+	int callback_called;
 };
 
 #endif /* USE_OPENSSL */

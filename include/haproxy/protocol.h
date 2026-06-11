@@ -92,8 +92,8 @@ int protocol_resume_all(void);
 int protocol_enable_all(void);
 
 /* returns the protocol associated to family <family> with proto_type among the
- * supported protocol types, and ctrl_type of either SOCK_STREAM or SOCK_DGRAM
- * depending on the requested values, or NULL if not found.
+ * supported protocol types, and index <alt> (0 or 1) selecting between the two
+ * possible entries per (family, proto_type), or NULL if not found.
  */
 static inline struct protocol *protocol_lookup(int family, enum proto_type proto_type, int alt)
 {
@@ -122,6 +122,12 @@ static inline int real_family(int ss_family)
 	const struct proto_fam *fam = proto_fam_lookup(ss_family);
 
 	return fam ? fam->real_family : AF_UNSPEC;
+}
+
+static inline int proto_is_quic(const struct protocol *proto)
+{
+	return (proto->proto_type == PROTO_TYPE_DGRAM &&
+		proto->xprt_type == PROTO_TYPE_STREAM);
 }
 
 #endif /* _HAPROXY_PROTOCOL_H */

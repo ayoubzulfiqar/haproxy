@@ -21,7 +21,38 @@
 #include <haproxy/api.h>
 #include <haproxy/backend.h>
 #include <haproxy/lb_ss.h>
+#include <haproxy/list.h>
 #include <haproxy/server-t.h>
+
+/* This function elects a new stick server for proxy px.
+ *
+ * The lbprm's lock must be held.
+ */
+static void recalc_server_ss(struct proxy *px)
+{
+	struct server *cur, *first;
+	int flag;
+
+	if (!px->lbprm.tot_used)
+		return; /* no server */
+
+	/* here we *know* that we have some servers */
+	if (px->srv_act)
+		flag = 0;
+	else
+		flag = SRV_F_BACKUP;
+
+	first = NULL;
+
+	for (cur = px->srv; cur; cur = cur->next) {
+		if ((cur->flags & SRV_F_BACKUP) == flag &&
+		    srv_willbe_usable(cur)) {
+			first = cur;
+			break;
+		}
+	}
+	px->lbprm.ss.srv = first;
+}
 
 /* this function updates the stick server according to server <srv>'s new state.
  *
@@ -110,49 +141,15 @@ static void ss_set_server_status_up(struct server *srv)
 	srv_lb_commit_status(srv);
 }
 
-/* This function elects a new stick server for proxy px.
- *
- * The lbprm's lock must be held.
- */
-void recalc_server_ss(struct proxy *px)
-{
-	struct server *cur, *first;
-	int flag;
-
-	if (!px->lbprm.tot_used)
-		return; /* no server */
-
-	/* here we *know* that we have some servers */
-	if (px->srv_act)
-		flag = 0;
-	else
-		flag = SRV_F_BACKUP;
-
-	first = NULL;
-
-	for (cur = px->srv; cur; cur = cur->next) {
-		if ((cur->flags & SRV_F_BACKUP) == flag &&
-		    srv_willbe_usable(cur)) {
-			first = cur;
-			break;
-		}
-	}
-	px->lbprm.ss.srv = first;
-}
-
 /* This function is responsible for preparing sticky LB algorithm.
  * It should be called only once per proxy, at config time.
  */
-void init_server_ss(struct proxy *p)
+static int init_server_ss(struct proxy *p)
 {
 	struct server *srv;
 
-	p->lbprm.set_server_status_up   = ss_set_server_status_up;
-	p->lbprm.set_server_status_down = ss_set_server_status_down;
-	p->lbprm.update_server_eweight = NULL;
-
 	if (!p->srv)
-		return;
+		return 0;
 
 	for (srv = p->srv; srv; srv = srv->next) {
 		srv->next_eweight = 1; /* ignore weights, all servers have the same weight */
@@ -163,6 +160,7 @@ void init_server_ss(struct proxy *p)
 	recount_servers(p);
 	update_backend_weight(p);
 	recalc_server_ss(p);
+	return 0;
 }
 
 /*
@@ -181,3 +179,16 @@ struct server *ss_get_server(struct proxy *px)
 	HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &px->lbprm.lock);
 	return srv;
 }
+
+static struct lb_ops lb_ss_ops = {ILH,
+	.map = {
+		{ .mask = BE_LB_KIND | BE_LB_PARM, .match = BE_LB_KIND_SA | BE_LB_SA_SS },
+		{ 0, 0 }
+	},
+	.algo_prop              = BE_LB_PROP_DYN,
+	.proxy_init             = init_server_ss,
+	.set_server_status_up   = ss_set_server_status_up,
+	.set_server_status_down = ss_set_server_status_down,
+};
+
+INITCALL1(STG_REGISTER, lb_ops_register, &lb_ss_ops);

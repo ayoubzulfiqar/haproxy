@@ -59,7 +59,7 @@ static void free_dict_entry(struct dict_entry *de)
 }
 
 /*
- * Simple function to lookup dictionary entries with <s> as value.
+ * Simple function to lookup dictionary entries with <s> as key.
  */
 static struct dict_entry *__dict_lookup(struct dict *d, const char *s)
 {
@@ -75,20 +75,21 @@ static struct dict_entry *__dict_lookup(struct dict *d, const char *s)
 }
 
 /*
- * Insert an entry in <d> dictionary with <s> as value. *
+ * Insert an entry in <d> dictionary with <s> as key.
  */
 struct dict_entry *dict_insert(struct dict *d, char *s)
 {
-	struct dict_entry *de;
+	struct dict_entry *de, *tree_de;
 	struct ebpt_node *n;
 
 	HA_RWLOCK_RDLOCK(DICT_LOCK, &d->rwlock);
 	de = __dict_lookup(d, s);
-	HA_RWLOCK_RDUNLOCK(DICT_LOCK, &d->rwlock);
 	if (de) {
 		HA_ATOMIC_INC(&de->refcount);
+		HA_RWLOCK_RDUNLOCK(DICT_LOCK, &d->rwlock);
 		return de;
 	}
+	HA_RWLOCK_RDUNLOCK(DICT_LOCK, &d->rwlock);
 
 	de = new_dict_entry(s);
 	if (!de)
@@ -96,13 +97,18 @@ struct dict_entry *dict_insert(struct dict *d, char *s)
 
 	HA_RWLOCK_WRLOCK(DICT_LOCK, &d->rwlock);
 	n = ebis_insert(&d->values, &de->value);
-	HA_RWLOCK_WRUNLOCK(DICT_LOCK, &d->rwlock);
-	if (n != &de->value) {
+	tree_de = container_of(n, struct dict_entry, value);
+	if (tree_de == de)
+		HA_RWLOCK_WRUNLOCK(DICT_LOCK, &d->rwlock);
+	else {
+		/* another entry was already there, we'll return it, kill
+		 * ours and bump the other's refcount before returning it.
+		 */
+		HA_ATOMIC_INC(&tree_de->refcount);
+		HA_RWLOCK_WRUNLOCK(DICT_LOCK, &d->rwlock);
 		free_dict_entry(de);
-		de = container_of(n, struct dict_entry, value);
 	}
-
-	return de;
+	return tree_de;
 }
 
 
@@ -116,10 +122,11 @@ void dict_entry_unref(struct dict *d, struct dict_entry *de)
 	if (!de)
 		return;
 
-	if (HA_ATOMIC_SUB_FETCH(&de->refcount, 1) != 0)
-		return;
-
 	HA_RWLOCK_WRLOCK(DICT_LOCK, &d->rwlock);
+	if (HA_ATOMIC_SUB_FETCH(&de->refcount, 1) != 0) {
+		HA_RWLOCK_WRUNLOCK(DICT_LOCK, &d->rwlock);
+		return;
+	}
 	ebpt_delete(&de->value);
 	HA_RWLOCK_WRUNLOCK(DICT_LOCK, &d->rwlock);
 

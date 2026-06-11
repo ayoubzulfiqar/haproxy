@@ -44,6 +44,7 @@
 #   USE_CLOSEFROM           : enable use of closefrom() on *bsd, solaris. Automatic.
 #   USE_PRCTL               : enable use of prctl(). Automatic.
 #   USE_PROCCTL             : enable use of procctl(). Automatic.
+#   USE_TRACE               : enable trace subsystem. Always on.
 #   USE_ZLIB                : enable zlib library support and disable SLZ
 #   USE_SLZ                 : enable slz library instead of zlib (default=enabled)
 #   USE_CPU_AFFINITY        : enable pinning processes to CPU on Linux. Automatic.
@@ -93,6 +94,7 @@
 #   SILENT_DEFINE may be used to specify other defines which will not be
 #     reported by "haproxy -vv".
 #   EXTRA   is used to force building or not building some extra tools.
+#   EXTRA_MAKE space-separated list of external addons using a Makefile.inc
 #   DESTDIR is not set by default and is used for installation only.
 #           It might be useful to set DESTDIR if you want to install haproxy
 #           in a sandbox.
@@ -122,7 +124,7 @@
 #   LUA_LIB        : force the lib path to lua
 #   LUA_INC        : force the include path to lua
 #   LUA_LIB_NAME   : force the lib name (or automatically evaluated, by order of
-#                                        priority : lua5.4, lua54, lua5.3, lua53, lua).
+#                    priority: lua5.5, lua55, lua5.4, lua54, lua5.3, lua53, lua).
 #   OT_DEBUG       : compile the OpenTracing filter in debug mode
 #   OT_INC         : force the include path to libopentracing-c-wrapper
 #   OT_LIB         : force the lib path to libopentracing-c-wrapper
@@ -342,7 +344,7 @@ use_opts = USE_EPOLL USE_KQUEUE USE_NETFILTER USE_POLL                        \
            USE_TPROXY USE_LINUX_TPROXY USE_LINUX_CAP                          \
            USE_LINUX_SPLICE USE_LIBCRYPT USE_CRYPT_H USE_ENGINE               \
            USE_GETADDRINFO USE_OPENSSL USE_OPENSSL_WOLFSSL USE_OPENSSL_AWSLC  \
-	       USE_ECH                                                            \
+           USE_ECH USE_TRACE                                                  \
            USE_SSL USE_LUA USE_ACCEPT4 USE_CLOSEFROM USE_ZLIB USE_SLZ         \
            USE_CPU_AFFINITY USE_TFO USE_NS USE_DL USE_RT USE_LIBATOMIC        \
            USE_MATH USE_DEVICEATLAS USE_51DEGREES                             \
@@ -364,6 +366,9 @@ $(warn_unknown_options)
 # poll() is always supported, unless explicitly disabled by passing USE_POLL=""
 # on the make command line.
 USE_POLL   = default
+
+# traces are always enabled
+USE_TRACE  = default
 
 # SLZ is always supported unless explicitly disabled by passing USE_SLZ=""
 # or disabled by enabling ZLIB using USE_ZLIB=1
@@ -643,7 +648,7 @@ ifneq ($(USE_OPENSSL:0=),)
   OPTIONS_OBJS += src/ssl_sock.o src/ssl_ckch.o src/ssl_ocsp.o src/ssl_crtlist.o       \
                   src/ssl_sample.o src/cfgparse-ssl.o src/ssl_gencert.o                \
                   src/ssl_utils.o src/jwt.o src/ssl_clienthello.o src/jws.o src/acme.o \
-                  src/ssl_trace.o
+                  src/acme_resolvers.o src/ssl_trace.o src/jwe.o
 endif
 
 ifneq ($(USE_ENGINE:0=),)
@@ -666,11 +671,12 @@ OPTIONS_OBJS += src/mux_quic.o src/h3.o src/quic_rx.o src/quic_tx.o	\
                 src/quic_cc_bbr.o src/quic_retry.o			\
                 src/cfgparse-quic.o src/xprt_quic.o src/quic_token.o	\
                 src/quic_ack.o src/qpack-dec.o src/quic_cc_newreno.o	\
-                src/qmux_http.o src/qmux_trace.o src/quic_rules.o	\
+                src/qcm_http.o src/qcm_trace.o src/quic_rules.o		\
                 src/quic_cc_nocc.o src/quic_cc.o src/quic_pacing.o	\
                 src/h3_stats.o src/quic_stats.o src/qpack-enc.o		\
                 src/qpack-tbl.o src/quic_cc_drs.o src/quic_fctl.o	\
-                src/quic_enc.o
+                src/quic_enc.o src/qcm_qmux.o src/xprt_qmux.o		\
+                src/mpring.o
 endif
 
 ifneq ($(USE_QUIC_OPENSSL_COMPAT:0=),)
@@ -678,15 +684,15 @@ OPTIONS_OBJS += src/quic_openssl_compat.o
 endif
 
 ifneq ($(USE_LUA:0=),)
-  check_lua_inc = $(shell if [ -d $(2)$(1) ]; then echo $(2)$(1); fi;)
-  LUA_INC      := $(firstword $(foreach lib,lua5.4 lua54 lua5.3 lua53 lua,$(call check_lua_inc,$(lib),"/usr/include/")))
+  check_lua_inc = $(shell if [ ! -e /usr/include/lua.h -a -e $(2)$(1)/lua.h ]; then echo $(2)$(1); fi;)
+  LUA_INC      := $(firstword $(foreach lib,lua5.5 lua55 lua5.4 lua54 lua5.3 lua53 lua,$(call check_lua_inc,$(lib),"/usr/include/")))
 
-  check_lua_lib = $(shell echo "int main(){}" | $(CC) -o /dev/null -x c - $(2) -l$(1) 2>/dev/null && echo $(1))
+  check_lua_lib = $(shell echo "int main(){}" | $(CC) $(if $(LUA_INC),-I$(LUA_INC)) -o /dev/null -x c - $(2) -l$(1) 2>/dev/null && echo $(1))
   LUA_LD_FLAGS := -Wl,$(if $(EXPORT_SYMBOL),$(EXPORT_SYMBOL),--export-dynamic) $(if $(LUA_LIB),-L$(LUA_LIB))
 
   # Try to automatically detect the Lua library if not set
   ifeq ($(LUA_LIB_NAME),)
-    LUA_LIB_NAME := $(firstword $(foreach lib,lua5.4 lua54 lua5.3 lua53 lua,$(call check_lua_lib,$(lib),$(LUA_LD_FLAGS))))
+    LUA_LIB_NAME := $(firstword $(foreach lib,lua lua5.5 lua55 lua5.4 lua54 lua5.3 lua53,$(call check_lua_lib,$(lib),$(LUA_LD_FLAGS))))
   endif
 
   # Lua lib name must be set now (forced/detected above)
@@ -716,70 +722,15 @@ ifneq ($(USE_PROMEX:0=),)
 endif
 
 ifneq ($(USE_DEVICEATLAS:0=),)
-  # Use DEVICEATLAS_SRC and possibly DEVICEATLAS_INC and DEVICEATLAS_LIB to force path
-  # to DeviceAtlas headers and libraries if needed. In this context, DEVICEATLAS_NOCACHE
-  # can be used to disable the cache support if needed (this also removes the necessity of having
-  # a C++ toolchain installed).
-  DEVICEATLAS_INC = $(DEVICEATLAS_SRC)
-  DEVICEATLAS_LIB = $(DEVICEATLAS_SRC)
-  include addons/deviceatlas/Makefile.inc
-  OPTIONS_OBJS += addons/deviceatlas/da.o
+  EXTRA_MAKE += addons/deviceatlas
 endif
 
-# Use 51DEGREES_SRC and possibly 51DEGREES_INC and 51DEGREES_LIB to force path
-# to 51degrees v3/v4 headers and libraries if needed. Note that the SRC/INC/
-# LIB/CFLAGS/LDFLAGS variables names all use 51DEGREES as the prefix,
-# regardless of the version since they are mutually exclusive. The version
-# (51DEGREES_VER) must be either 3 or 4, and defaults to 3 if not set.
-51DEGREES_INC = $(51DEGREES_SRC)
-51DEGREES_LIB = $(51DEGREES_SRC)
-51DEGREES_VER = 3
-
 ifneq ($(USE_51DEGREES:0=),)
-  ifeq ($(51DEGREES_VER),4)  # v4 here
-    _51DEGREES_SRC      = $(shell find $(51DEGREES_LIB) -maxdepth 2 -name '*.c')
-    OPTIONS_OBJS       += $(_51DEGREES_SRC:%.c=%.o)
-    51DEGREES_CFLAGS   += -DUSE_51DEGREES_V4
-    ifeq ($(USE_THREAD:0=),)
-      51DEGREES_CFLAGS += -DFIFTYONEDEGREES_NO_THREADING -DFIFTYONE_DEGREES_NO_THREADING
-    endif
-    USE_LIBATOMIC       = implicit
-  endif # 51DEGREES_VER==4
-
-  ifeq ($(51DEGREES_VER),3)  # v3 here
-    OPTIONS_OBJS       += $(51DEGREES_LIB)/../cityhash/city.o
-    OPTIONS_OBJS       += $(51DEGREES_LIB)/51Degrees.o
-    ifeq ($(USE_THREAD:0=),)
-      51DEGREES_CFLAGS += -DFIFTYONEDEGREES_NO_THREADING
-    else
-      OPTIONS_OBJS     += $(51DEGREES_LIB)/../threading.o
-    endif
-  else
-    ifneq ($(51DEGREES_VER),4)
-      $(error 51Degrees version (51DEGREES_VER) must be either 3 or 4)
-    endif
-  endif # 51DEGREES_VER==3
-
-  OPTIONS_OBJS        += addons/51degrees/51d.o
-  51DEGREES_CFLAGS    += $(if $(51DEGREES_INC),-I$(51DEGREES_INC))
-  51DEGREES_LDFLAGS   += $(if $(51DEGREES_LIB),-L$(51DEGREES_LIB))
-  USE_MATH             = implicit
+  EXTRA_MAKE += addons/51degrees
 endif # USE_51DEGREES
 
 ifneq ($(USE_WURFL:0=),)
-  # Use WURFL_SRC and possibly WURFL_INC and WURFL_LIB to force path
-  # to WURFL headers and libraries if needed.
-  WURFL_INC = $(WURFL_SRC)
-  WURFL_LIB = $(WURFL_SRC)
-  OPTIONS_OBJS    += addons/wurfl/wurfl.o
-  WURFL_CFLAGS     = $(if $(WURFL_INC),-I$(WURFL_INC))
-  ifneq ($(WURFL_DEBUG),)
-    WURFL_CFLAGS  += -DWURFL_DEBUG
-  endif
-  ifneq ($(WURFL_HEADER_WITH_DETAILS),)
-    WURFL_CFLAGS  += -DWURFL_HEADER_WITH_DETAILS
-  endif
-  WURFL_LDFLAGS    = $(if $(WURFL_LIB),-L$(WURFL_LIB)) -lwurfl
+  EXTRA_MAKE += addons/wurfl
 endif
 
 ifneq ($(USE_PCRE:0=)$(USE_STATIC_PCRE:0=)$(USE_PCRE_JIT:0=),)
@@ -859,7 +810,12 @@ ifneq ($(USE_LINUX_CAP:0=),)
 endif
 
 ifneq ($(USE_OT:0=),)
+  $(call warning, The opentracing filter was deprecated in haproxy 3.3 and will be removed in 3.5.)
   include addons/ot/Makefile
+endif
+
+ifneq ($(EXTRA_MAKE),)
+  include $(addsuffix /Makefile.mk,$(EXTRA_MAKE))
 endif
 
 # better keep this one close to the end, as several libs above may need it
@@ -956,6 +912,7 @@ endif # obsolete targets
 endif # TARGET
 
 OBJS =
+HATERM_OBJS =
 
 ifneq ($(EXTRA_OBJS),)
   OBJS += $(EXTRA_OBJS)
@@ -992,7 +949,7 @@ OBJS += src/mux_h2.o src/mux_h1.o src/mux_fcgi.o src/log.o		\
         src/cfgcond.o src/proto_udp.o src/lb_fwlc.o src/ebmbtree.o	\
         src/proto_uxdg.o src/cfgdiag.o src/sock_unix.o src/sha1.o	\
         src/lb_fas.o src/clock.o src/sock_inet.o src/ev_select.o	\
-        src/lb_map.o src/shctx.o src/hpack-dec.o	                \
+        src/lb_map.o src/shctx.o src/hpack-dec.o src/net_helper.o       \
         src/arg.o src/signal.o src/fix.o src/dynbuf.o src/guid.o	\
         src/cfgparse-tcp.o src/lb_ss.o src/chunk.o src/counters.o	\
         src/cfgparse-unix.o src/regex.o src/fcgi.o src/uri_auth.o	\
@@ -1002,11 +959,14 @@ OBJS += src/mux_h2.o src/mux_h1.o src/mux_fcgi.o src/log.o		\
         src/ebsttree.o src/freq_ctr.o src/systemd.o src/init.o		\
         src/http_acl.o src/dict.o src/dgram.o src/pipe.o		\
         src/hpack-huff.o src/hpack-enc.o src/ebtree.o src/hash.o	\
-        src/httpclient_cli.o src/version.o src/ncbmbuf.o src/ech.o
+        src/httpclient_cli.o src/version.o src/ncbmbuf.o src/ech.o	\
+        src/cfgparse-peers.o src/haterm.o
 
 ifneq ($(TRACE),)
   OBJS += src/calltrace.o
 endif
+
+HATERM_OBJS += $(OBJS) src/haterm_init.o
 
 # Used only for forced dependency checking. May be cleared during development.
 INCLUDES = $(wildcard include/*/*.h)
@@ -1039,11 +999,11 @@ IGNORE_OPTS=help install install-man install-doc install-bin \
 	uninstall clean tags cscope tar git-tar version update-version \
 	opts reg-tests reg-tests-help unit-tests admin/halog/halog dev/flags/flags \
 	dev/haring/haring dev/ncpu/ncpu dev/poll/poll dev/tcploop/tcploop \
-	dev/term_events/term_events
+	dev/term_events/term_events dev/gdb/pm-from-core dev/gdb/libs-from-core
 
 ifneq ($(TARGET),)
 ifeq ($(filter $(firstword $(MAKECMDGOALS)),$(IGNORE_OPTS)),)
-build_opts = $(shell rm -f .build_opts.new; echo \'$(TARGET) $(BUILD_OPTIONS) $(VERBOSE_CFLAGS) $(WARN_CFLAGS) $(NOWARN_CFLAGS) $(DEBUG)\' > .build_opts.new; if cmp -s .build_opts .build_opts.new; then rm -f .build_opts.new; else mv -f .build_opts.new .build_opts; fi)
+build_opts = $(shell rm -f .build_opts.new; echo \'$(TARGET) $(BUILD_OPTIONS) $(EXTRA_MAKE) $(VERBOSE_CFLAGS) $(WARN_CFLAGS) $(NOWARN_CFLAGS) $(DEBUG)\' > .build_opts.new; if cmp -s .build_opts .build_opts.new; then rm -f .build_opts.new; else mv -f .build_opts.new .build_opts; fi)
 .build_opts: $(build_opts)
 else
 .build_opts:
@@ -1053,6 +1013,9 @@ else
 endif # non-empty target
 
 haproxy: $(OPTIONS_OBJS) $(OBJS)
+	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
+
+haterm: $(OPTIONS_OBJS) $(HATERM_OBJS)
 	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
 objsize: haproxy
@@ -1068,6 +1031,12 @@ admin/dyncookie/dyncookie: admin/dyncookie/dyncookie.o
 	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
 dev/flags/flags: dev/flags/flags.o
+	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
+
+dev/gdb/libs-from-core: dev/gdb/libs-from-core.o
+	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
+
+dev/gdb/pm-from-core: dev/gdb/pm-from-core.o
 	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
 dev/haring/haring: dev/haring/haring.o
@@ -1149,7 +1118,7 @@ uninstall:
 	$(Q)rm -f "$(DESTDIR)$(SBINDIR)"/haproxy
 
 clean:
-	$(Q)rm -f *.[oas] src/*.[oas] haproxy test .build_opts .build_opts.new
+	$(Q)rm -f *.[oas] src/*.[oas] haproxy haterm test .build_opts .build_opts.new
 	$(Q)for dir in . src dev/* admin/* addons/* include/* doc; do rm -f $$dir/*~ $$dir/*.rej $$dir/core; done
 	$(Q)rm -f haproxy-$(VERSION).tar.gz haproxy-$(VERSION)$(SUBVERS)$(EXTRAVERSION).tar.gz
 	$(Q)rm -f haproxy-$(VERSION) haproxy-$(VERSION)$(SUBVERS)$(EXTRAVERSION) nohup.out gmon.out
@@ -1168,7 +1137,7 @@ distclean: clean
 	$(Q)rm -f admin/dyncookie/dyncookie
 	$(Q)rm -f dev/haring/haring dev/ncpu/ncpu{,.so} dev/poll/poll dev/tcploop/tcploop
 	$(Q)rm -f dev/hpack/decode dev/hpack/gen-enc dev/hpack/gen-rht
-	$(Q)rm -f dev/qpack/decode
+	$(Q)rm -f dev/qpack/decode dev/gdb/pm-from-core dev/gdb/libs-from-core
 
 tags:
 	$(Q)find src include \( -name '*.c' -o -name '*.h' \) -print0 | \
@@ -1322,7 +1291,8 @@ range:
 			echo "[ $$index/$$count ]   $$commit #############################"; \
 			git checkout -q $$commit || die 1; \
 			$(MAKE) all || die 1; \
-			[ -z "$(TEST_CMD)" ] || $(TEST_CMD) || die 1; \
+			set -- $(TEST_CMD); \
+			[ "$$#" -eq 0 ] || "$$@" || die 1; \
 			index=$$((index + 1)); \
 		done; \
 		echo;echo "Done! $${count} commit(s) built successfully for RANGE $${RANGE}" ; \

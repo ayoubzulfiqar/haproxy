@@ -27,7 +27,7 @@
 DECLARE_STATIC_TYPED_POOL(var_pool, "vars", struct var);
 
 /* list of variables for the process scope. */
-struct vars proc_vars THREAD_ALIGNED(64);
+struct vars proc_vars THREAD_ALIGNED();
 
 /* This array of int contains the system limits per context. */
 static unsigned int var_global_limit = 0;
@@ -56,6 +56,16 @@ static struct var_set_condition conditions_array[] = {
        { "ifgt", VF_COND_IFGT },
        { "iflt", VF_COND_IFLT },
        { NULL, 0 }
+};
+
+/* Variable scope names with their prefixes for output */
+static const char *var_scope_names[] = {
+	[SCOPE_SESS] = "sess.",
+	[SCOPE_TXN]  = "txn.",
+	[SCOPE_REQ]  = "req.",
+	[SCOPE_RES]  = "res.",
+	[SCOPE_PROC] = "proc.",
+	[SCOPE_CHECK] = "check.",
 };
 
 /* returns the struct vars pointer for a session, stream and scope, or NULL if
@@ -177,6 +187,8 @@ scope_sess:
 unsigned int var_clear(struct vars *vars, struct var *var, int force)
 {
 	unsigned int size = 0;
+
+	ha_free(&var->name);
 
 	if (var->data.type == SMP_T_STR || var->data.type == SMP_T_BIN) {
 		ha_free(&var->data.u.str.area);
@@ -308,7 +320,7 @@ static int vars_fill_desc(const char *name, int len, struct var_desc *desc, char
 		desc->scope = SCOPE_CHECK;
 	}
 	else {
-		memprintf(err, "invalid variable name '%.*s'. A variable name must be start by its scope. "
+		memprintf(err, "invalid variable name '%.*s'. A variable name must start with its scope. "
 		               "The scope can be 'proc', '(p)sess', '(p)txn', '(p)req', '(p)res' or 'check'", len, name);
 		return 0;
 	}
@@ -316,12 +328,14 @@ static int vars_fill_desc(const char *name, int len, struct var_desc *desc, char
 	/* Check variable name syntax. */
 	for (tmp = name; tmp < name + len; tmp++) {
 		if (!isalnum((unsigned char)*tmp) && *tmp != '_' && *tmp != '.') {
-			memprintf(err, "invalid syntax at char '%s'", tmp);
+			memprintf(err, "invalid syntax at char '%c'", *tmp);
 			return 0;
 		}
 	}
 
 	desc->name_hash = XXH3(name, len, var_name_hash_seed);
+	desc->name = name;
+	desc->name_len = len;
 	return 1;
 }
 
@@ -346,6 +360,182 @@ static int smp_fetch_var(const struct arg *args, struct sample *smp, const char 
 		def = &args[1].data.str;
 
 	return vars_get_by_desc(var_desc, smp, def);
+}
+
+/* Dumps all variables in the specified scope, optionally filtered by prefix.
+ * Output format: var1=value1, var2=value2, ...
+ * String values are quoted and escaped, binary values are hex-encoded (x...).
+ * Returns 1 on success, 0 on failure (buffer too small).
+ * Note: When using prefix filtering, all variables are still visited, so this
+ * should not be used with configs involving thousands of variables.
+ */
+static int smp_fetch_dump_all_vars(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct buffer *output;
+	struct vars *vars;
+	struct var *var;
+	struct var_desc desc;
+	const char *prefix = NULL;
+	size_t prefix_len = 0;
+	const char *delim = ", ";
+	size_t delim_len = 2;
+	int first = 1;
+	int i;
+	int start_scope, end_scope;
+	int cur_scope;
+
+	/* Get output buffer */
+	output = get_trash_chunk();
+	chunk_reset(output);
+
+	/* Parse arguments */
+	if (args[0].type == ARGT_SINT) {
+		if (args[0].data.sint == -1) {
+			start_scope = SCOPE_SESS;
+			end_scope = SCOPE_PROC;
+		} else {
+			start_scope = end_scope = args[0].data.sint;
+		}
+	} else {
+		/* Auto-detect scope from context */
+		if (smp->strm)
+			start_scope = end_scope = SCOPE_TXN;
+		else if (smp->sess)
+			start_scope = end_scope = SCOPE_SESS;
+		else
+			start_scope = end_scope = SCOPE_PROC;
+	}
+
+	/* Optional prefix filter */
+	if (args[1].type == ARGT_STR) {
+		prefix = args[1].data.str.area;
+		prefix_len = args[1].data.str.data;
+	}
+
+	/* Optional delimiter */
+	if (args[2].type == ARGT_STR) {
+		delim = args[2].data.str.area;
+		delim_len = args[2].data.str.data;
+	}
+
+	desc.flags = 0;
+	desc.name_hash = 0;
+
+	for (cur_scope = start_scope; cur_scope <= end_scope; cur_scope++) {
+		desc.scope = cur_scope;
+
+		vars = get_vars(smp->sess, smp->strm, &desc);
+		if (!vars || vars->scope != desc.scope)
+			continue;
+
+		vars_rdlock(vars);
+
+		/* Iterate through all variable roots */
+		for (i = 0; i < VAR_NAME_ROOTS; i++) {
+			var = cebu64_item_first(&vars->name_root[i], name_node, name_hash, struct var);
+
+			while (var) {
+				const char *scope_prefix;
+
+				/* Check prefix filter */
+				if (prefix) {
+					if (!var->name || strncmp(var->name, prefix, prefix_len) != 0) {
+						var = cebu64_item_next(&vars->name_root[i], name_node, name_hash, var);
+						continue;
+					}
+				}
+
+				/* Add delimiter */
+				if (!first) {
+					if (output->data + delim_len >= output->size)
+						goto fail_unlock;
+					chunk_memcat(output, delim, delim_len);
+				}
+				first = 0;
+
+				/* Add variable name with scope prefix */
+				scope_prefix = var_scope_names[desc.scope];
+				if (var->name) {
+					if (chunk_appendf(output, "%s%s=", scope_prefix, var->name) < 0)
+						goto fail_unlock;
+				} else {
+					if (chunk_appendf(output, "var_%016llx=", (unsigned long long)var->name_hash) < 0)
+						goto fail_unlock;
+				}
+
+				/* Convert value based on type */
+				if (var->data.type == SMP_T_STR) {
+					/* String: quote and escape */
+					if (chunk_escape_string(output, var->data.u.str.area, var->data.u.str.data) < 0)
+						goto fail_unlock;
+
+				} else if (var->data.type == SMP_T_BIN) {
+					/* Binary: hex encode */
+					if (dump_binary(output, var->data.u.str.area, var->data.u.str.data) != var->data.u.str.data)
+						goto fail_unlock;
+				} else if (var->data.type == SMP_T_SINT) {
+					/* Integer */
+					if (chunk_appendf(output, "%lld", (long long)var->data.u.sint) < 0)
+						goto fail_unlock;
+
+				} else if (var->data.type == SMP_T_BOOL) {
+					/* Boolean */
+					const char *bool_str = var->data.u.sint ? "true" : "false";
+					if (chunk_appendf(output, "%s", bool_str) < 0)
+						goto fail_unlock;
+
+				} else if (var->data.type == SMP_T_IPV4 || var->data.type == SMP_T_IPV6) {
+					/* Address */
+					char addr_str[INET6_ADDRSTRLEN];
+					const char *res;
+
+					if (var->data.type == SMP_T_IPV4)
+						res = inet_ntop(AF_INET, &var->data.u.ipv4, addr_str, sizeof(addr_str));
+					else
+						res = inet_ntop(AF_INET6, &var->data.u.ipv6, addr_str, sizeof(addr_str));
+
+					if (!res) {
+						if (chunk_appendf(output, "(addr)") < 0)
+							goto fail_unlock;
+					} else {
+						if (chunk_appendf(output, "%s", addr_str) < 0)
+							goto fail_unlock;
+					}
+				} else if (var->data.type == SMP_T_METH) {
+					/* HTTP Method */
+					if (var->data.u.meth.meth == HTTP_METH_OTHER) {
+						if (chunk_escape_string(output, var->data.u.meth.str.area, var->data.u.meth.str.data) < 0)
+							goto fail_unlock;
+					} else {
+						const char *method_str = http_known_methods[var->data.u.meth.meth].ptr;
+						if (chunk_appendf(output, "\"%s\"", method_str) < 0)
+							goto fail_unlock;
+					}
+				} else {
+					/* Other types: show type number */
+					if (chunk_appendf(output, "(type:%d)", var->data.type) < 0)
+						goto fail_unlock;
+				}
+
+				var = cebu64_item_next(&vars->name_root[i], name_node, name_hash, var);
+			}
+		}
+
+		vars_rdunlock(vars);
+	}
+
+	/* Set output sample */
+	smp->data.type = SMP_T_STR;
+	smp->data.u.str.area = output->area;
+	smp->data.u.str.data = output->data;
+	smp->flags &= ~SMP_F_CONST;
+
+	return 1;
+
+fail_unlock:
+	vars_rdunlock(vars);
+	output->data = 0;
+	return 0;
 }
 
 /*
@@ -431,6 +621,16 @@ int var_set(const struct var_desc *desc, struct sample *smp, uint flags)
 			goto unlock;
 		var->name_hash = desc->name_hash;
 		var->flags = flags & VF_PERMANENT;
+
+		/* Save variable name */
+		var->name = NULL;
+		if (desc->name && desc->name_len > 0) {
+			var->name = my_strndup(desc->name, desc->name_len);
+			if (!var->name) {
+				pool_free(var_pool, var);
+				goto unlock;
+			}
+		}
 		var->data.type = SMP_T_ANY;
 		cebu64_item_insert(&vars->name_root[var->name_hash % VAR_NAME_ROOTS], name_node, name_hash, var);
 	}
@@ -623,6 +823,7 @@ int vars_check_arg(struct arg *arg, char **err)
 {
 	struct sample empty_smp = { };
 	struct var_desc desc;
+	char *saved_name = NULL;
 
 	/* Check arg type. */
 	if (arg->type != ARGT_STR) {
@@ -634,15 +835,30 @@ int vars_check_arg(struct arg *arg, char **err)
 	if (!vars_fill_desc(arg->data.str.area, arg->data.str.data, &desc, err))
 		return 0;
 
-	if (desc.scope == SCOPE_PROC && !var_set(&desc, &empty_smp, VF_CREATEONLY|VF_PERMANENT))
+	/* Save variable name before destroying the chunk */
+	if (desc.name && desc.name_len > 0) {
+		saved_name = my_strndup(desc.name, desc.name_len);
+		if (!saved_name) {
+			memprintf(err, "out of memory");
+			return 0;
+		}
+
+		desc.name = saved_name;
+		desc.flags |= VDF_NAME_ALLOCATED;
+	}
+
+	if (desc.scope == SCOPE_PROC && !var_set(&desc, &empty_smp, VF_CREATEONLY|VF_PERMANENT)) {
+		if (desc.flags & VDF_NAME_ALLOCATED)
+			ha_free(&saved_name);
 		return 0;
+	}
 
 	/* properly destroy the chunk */
 	chunk_destroy(&arg->data.str);
 
 	/* Use the global variable name pointer. */
 	arg->type = ARGT_VAR;
-	arg->data.var = desc;
+	arg->data.var = desc;  /* desc.name already points to saved_name */
 	return 1;
 }
 
@@ -814,7 +1030,7 @@ static enum act_return action_store(struct act_rule *rule, struct proxy *px,
 	/* Process the expression. */
 	memset(&smp, 0, sizeof(smp));
 
-	if (!lf_expr_isempty(&rule->arg.vars.fmt)) {
+	if (rule->action == 2) {  /* set-var-fmt */
 		/* a format-string is used */
 
 		fmtstr = alloc_trash_chunk();
@@ -834,9 +1050,8 @@ static enum act_return action_store(struct act_rule *rule, struct proxy *px,
 		smp_set_owner(&smp, px, sess, s, 0);
 		smp.data.type = SMP_T_STR;
 		smp.data.u.str = *fmtstr;
-		var_set(&rule->arg.vars.desc, &smp, rule->arg.vars.conditions);
 	}
-	else {
+	else { /* set-var */
 		/* an expression is used */
 		if (!sample_process(px, sess, s, dir|SMP_OPT_FINAL,
 	                            rule->arg.vars.expr, &smp))
@@ -868,6 +1083,10 @@ static void release_store_rule(struct act_rule *rule)
 	lf_expr_deinit(&rule->arg.vars.fmt);
 
 	release_sample_expr(rule->arg.vars.expr);
+
+	/* Free variable name if allocated */
+	if (rule->arg.vars.desc.flags & VDF_NAME_ALLOCATED)
+		ha_free((char **)&rule->arg.vars.desc.name);
 }
 
 /* This two function checks the variable name and replace the
@@ -881,6 +1100,70 @@ static void release_store_rule(struct act_rule *rule)
 static int smp_check_var(struct arg *args, char **err)
 {
 	return vars_check_arg(&args[0], err);
+}
+
+/* This function checks all arguments for dump_all_vars()
+ * Args: [scope], [prefix], [delimiter]
+ * Both arguments are optional
+ */
+static int smp_check_dump_all_vars(struct arg *args, char **err)
+{
+	/* First argument (scope) is optional */
+
+	if (args[0].type == ARGT_STR) {
+		const char *scope = args[0].data.str.area;
+		int scope_id = -1;
+		int i;
+		char buf[16];
+
+		if (args[0].data.str.data == 0) {
+			chunk_destroy(&args[0].data.str);
+			args[0].type = ARGT_SINT;
+			args[0].data.sint = scope_id;
+			return 1;
+		}
+
+		if (args[0].data.str.data < sizeof(buf) - 1) {
+			snprintf(buf, sizeof(buf), "%s.", scope);
+
+			for (i = 0; i <= SCOPE_CHECK; i++) {
+				if (strcmp(buf, var_scope_names[i]) == 0) {
+					scope_id = i;
+					break;
+				}
+			}
+		}
+
+		if (scope_id == -1) {
+			memprintf(err, "invalid scope '%s', must be one of: sess, txn, req, res, proc", scope);
+			return 0;
+		}
+
+		chunk_destroy(&args[0].data.str);
+		args[0].type = ARGT_SINT;
+		args[0].data.sint = scope_id;
+	}
+	else if (args[0].type != ARGT_STOP) {
+		memprintf(err, "first argument must be a string (scope) or omitted");
+		return 0;
+	} else {
+		args[0].type = ARGT_SINT;
+		args[0].data.sint = -1;
+	}
+
+	/* Second argument (prefix) is optional */
+	if (args[1].type != ARGT_STR && args[1].type != ARGT_STOP) {
+		memprintf(err, "second argument must be a string (prefix) or omitted");
+		return 0;
+	}
+
+	/* Third argument (delimiter) is optional */
+	if (args[2].type != ARGT_STR && args[2].type != ARGT_STOP) {
+		memprintf(err, "third argument must be a string (delimiter) or omitted");
+		return 0;
+	}
+
+	return 1;
 }
 
 static int conv_check_var(struct arg *args, struct sample_conv *conv,
@@ -919,6 +1202,7 @@ static enum act_parse_ret parse_store(const char **args, int *arg, struct proxy 
 	struct ist condition = IST_NULL;
 	struct ist var = IST_NULL;
 	struct ist varname_ist = IST_NULL;
+	char *saved_name = NULL;
 
 	if (strncmp(var_name, "set-var-fmt", 11) == 0) {
 		var_name += 11;
@@ -973,9 +1257,20 @@ static enum act_parse_ret parse_store(const char **args, int *arg, struct proxy 
 	if (!vars_fill_desc(var_name, var_len, &rule->arg.vars.desc, err))
 		return ACT_RET_PRS_ERR;
 
+	/* Save variable name for runtime use */
+	if (rule->arg.vars.desc.name && rule->arg.vars.desc.name_len > 0) {
+		saved_name = my_strndup(rule->arg.vars.desc.name, rule->arg.vars.desc.name_len);
+		if (!saved_name) {
+			memprintf(err, "out of memory");
+			return ACT_RET_PRS_ERR;
+		}
+		rule->arg.vars.desc.name = saved_name;
+		rule->arg.vars.desc.flags |= VDF_NAME_ALLOCATED;
+	}
+
 	if (rule->arg.vars.desc.scope == SCOPE_PROC &&
 	    !var_set(&rule->arg.vars.desc, &empty_smp, VF_CREATEONLY|VF_PERMANENT))
-		return 0;
+		return ACT_RET_PRS_ERR;
 
 	/* There is no fetch method when variable is unset. Just set the right
 	 * action and return. */
@@ -1065,7 +1360,7 @@ static enum act_parse_ret parse_store(const char **args, int *arg, struct proxy 
 		}
 	}
 
-	rule->action     = ACT_CUSTOM;
+	rule->action     = set_var;
 	rule->action_ptr = action_store;
 	rule->release_ptr = release_store_rule;
 	return ACT_RET_PRS_OK;
@@ -1365,6 +1660,7 @@ INITCALL0(STG_PREPARE, vars_init);
 
 static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 
+	{ "dump_all_vars", smp_fetch_dump_all_vars, ARG3(0,STR,STR,STR), smp_check_dump_all_vars, SMP_T_STR, SMP_USE_CONST },
 	{ "var", smp_fetch_var, ARG2(1,STR,STR), smp_check_var, SMP_T_ANY, SMP_USE_CONST },
 	{ /* END */ },
 }};

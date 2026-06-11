@@ -32,6 +32,7 @@ struct quic_tune quic_tune = {
 		.sec_retry_threshold = QUIC_DFLT_SEC_RETRY_THRESHOLD,
 		.stream_data_ratio = QUIC_DFLT_FE_STREAM_DATA_RATIO,
 		.stream_max_concurrent = QUIC_DFLT_FE_STREAM_MAX_CONCURRENT,
+		.stream_max_total  = 0,
 		.stream_rxbuf      = 0,
 		.fb_opts = QUIC_TUNE_FB_TX_PACING|QUIC_TUNE_FB_TX_UDP_GSO,
 		.opts = QUIC_TUNE_FE_SOCK_PER_CONN,
@@ -97,24 +98,23 @@ static unsigned long parse_window_size(const char *kw, char *value,
 	return 0;
 }
 
-/* parse "quic-cc-algo" bind keyword */
-static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
-                                   struct bind_conf *conf, char **err)
+/* Parse option 'quic-cc-algo' on bind and server lines.
+ *
+ * Returns the selected algorithm or NULL on error. <max_cwnd> is used as a
+ * secondary output parameter, set to the maximum window size if specified.
+ */
+static const struct quic_cc_algo *parse_cc_algo(char **args, int cur_arg, char **err,
+                                                size_t *max_cwnd)
 {
-	struct quic_cc_algo *cc_algo = NULL;
+	const struct quic_cc_algo *cc_algo;
 	const char *algo = NULL;
 	struct ist algo_ist, arg_ist;
+	unsigned long cwnd = 0;
 	char *arg;
-
-	cc_algo = calloc(1, sizeof(struct quic_cc_algo));
-	if (!cc_algo) {
-		memprintf(err, "'%s' : out of memory", args[cur_arg]);
-		goto fail;
-	}
 
 	if (!*args[cur_arg + 1]) {
 		memprintf(err, "'%s' : missing control congestion algorithm", args[cur_arg]);
-		goto fail;
+		goto err;
 	}
 
 	arg = args[cur_arg + 1];
@@ -123,19 +123,19 @@ static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
 	if (isteq(algo_ist, ist(QUIC_CC_NEWRENO_STR))) {
 		/* newreno */
 		algo = QUIC_CC_NEWRENO_STR;
-		*cc_algo = quic_cc_algo_nr;
+		cc_algo = &quic_cc_algo_nr;
 		arg += strlen(QUIC_CC_NEWRENO_STR);
 	}
 	else if (isteq(algo_ist, ist(QUIC_CC_CUBIC_STR))) {
 		/* cubic */
 		algo = QUIC_CC_CUBIC_STR;
-		*cc_algo = quic_cc_algo_cubic;
+		cc_algo = &quic_cc_algo_cubic;
 		arg += strlen(QUIC_CC_CUBIC_STR);
 	}
 	else if (isteq(algo_ist, ist(QUIC_CC_BBR_STR))) {
 		/* bbr */
 		algo = QUIC_CC_BBR_STR;
-		*cc_algo = quic_cc_algo_bbr;
+		cc_algo = &quic_cc_algo_bbr;
 		arg += strlen(QUIC_CC_BBR_STR);
 	}
 	else if (isteq(algo_ist, ist(QUIC_CC_NO_CC_STR))) {
@@ -143,17 +143,17 @@ static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
 		if (!experimental_directives_allowed) {
 			ha_alert("'%s' algo is experimental, must be allowed via a global "
 			         "'expose-experimental-directives'\n", arg);
-			goto fail;
+			goto err;
 		}
 
 		algo = QUIC_CC_NO_CC_STR;
-		*cc_algo = quic_cc_algo_nocc;
+		cc_algo = &quic_cc_algo_nocc;
 		arg += strlen(QUIC_CC_NO_CC_STR);
 		mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
 	}
 	else {
 		memprintf(err, "'%s' : unknown control congestion algorithm", args[cur_arg + 1]);
-		goto fail;
+		goto err;
 	}
 
 	if (*arg++ == '(') {
@@ -163,34 +163,51 @@ static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
 			goto out;
 
 		if (*arg != ',') {
-			unsigned long cwnd = parse_window_size(args[cur_arg], arg, &end_opt, err);
+			cwnd = parse_window_size(args[cur_arg], arg, &end_opt, err);
 			if (!cwnd)
-				goto fail;
-
-			conf->max_cwnd = cwnd;
+				goto err;
 
 			if (*end_opt == ')') {
 				goto out;
 			}
 			else if (*end_opt != ',') {
 				memprintf(err, "'%s' : cannot parse max-window argument for '%s' algorithm", args[cur_arg], algo);
-				goto fail;
+				goto err;
 			}
 			arg = end_opt;
 		}
 
 		if (*++arg != ')') {
 			memprintf(err, "'%s' : too many argument for '%s' algorithm", args[cur_arg], algo);
-			goto fail;
+			goto err;
 		}
 	}
+
+
+ out:
+	if (cwnd)
+		*max_cwnd = cwnd;
+	return cc_algo;
+
+ err:
+	return NULL;
+}
+
+/* parse "quic-cc-algo" bind keyword */
+static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
+                                   struct bind_conf *conf, char **err)
+{
+	const struct quic_cc_algo *cc_algo = NULL;
+
+	cc_algo = parse_cc_algo(args, cur_arg, err, &conf->max_cwnd);
+	if (!cc_algo)
+		goto fail;
 
  out:
 	conf->quic_cc_algo = cc_algo;
 	return 0;
 
  fail:
-	free(cc_algo);
 	return ERR_ALERT | ERR_FATAL;
 }
 
@@ -218,6 +235,24 @@ static int bind_parse_quic_socket(char **args, int cur_arg, struct proxy *px,
 	return 0;
 }
 
+/* parse "quic-cc-algo" server keyword */
+static int srv_parse_quic_cc_algo(char **args, int *cur_arg, struct proxy *px,
+                                  struct server *srv, char **err)
+{
+	const struct quic_cc_algo *cc_algo = NULL;
+
+	cc_algo = parse_cc_algo(args, *cur_arg, err, &srv->quic_max_cwnd);
+	if (!cc_algo)
+		goto fail;
+
+ out:
+	srv->quic_cc_algo = cc_algo;
+	return 0;
+
+ fail:
+	return ERR_ALERT | ERR_FATAL;
+}
+
 static struct bind_kw_list bind_kws = { "QUIC", { }, {
 	{ "quic-force-retry", bind_parse_quic_force_retry, 0 },
 	{ "quic-cc-algo", bind_parse_quic_cc_algo, 1 },
@@ -226,6 +261,13 @@ static struct bind_kw_list bind_kws = { "QUIC", { }, {
 }};
 
 INITCALL1(STG_REGISTER, bind_register_keywords, &bind_kws);
+
+static struct srv_kw_list srv_kws = { "QUIC", { }, {
+	{ "quic-cc-algo", srv_parse_quic_cc_algo, 1 },
+	{ NULL, NULL, 0 },
+}};
+
+INITCALL1(STG_REGISTER, srv_register_keywords, &srv_kws);
 
 /* parse "tune.quic.fe.sock-per-conn", accepts "default-on" or "force-off" */
 static int cfg_parse_quic_tune_sock_per_conn(char **args, int section_type,
@@ -328,7 +370,7 @@ static int cfg_parse_quic_time(char **args, int section_type,
 		ret = 1;
 	}
 	else {
-		memprintf(err, "'%s' keyword not unhandled (please report this bug).", args[0]);
+		memprintf(err, "'%s' keyword not handled (please report this bug).", args[0]);
 		ret = -1;
 	}
 
@@ -432,6 +474,9 @@ static int cfg_parse_quic_tune_setting(char **args, int section_type,
 		                                 &quic_tune.fe.stream_max_concurrent;
 		*ptr = arg;
 	}
+	else if (strcmp(suffix, "fe.stream.max-total") == 0) {
+		quic_tune.fe.stream_max_total = arg;
+	}
 	else if (strcmp(suffix, "be.stream.rxbuf") == 0 ||
 	         strcmp(suffix, "fe.stream.rxbuf") == 0) {
 		uint *ptr = (suffix[0] == 'b') ? &quic_tune.be.stream_rxbuf :
@@ -457,7 +502,7 @@ static int cfg_parse_quic_tune_setting(char **args, int section_type,
 		char *end_opt;
 
 		memprintf(err, "'%s' is deprecated in 3.3 and will be removed in 3.5. "
-		               "Please use the newer keyword syntax 'tune.quic.fe.stream.max-concurrent'.", args[0]);
+		               "Please use the newer keyword syntax 'tune.quic.fe.cc.max-win-size'.", args[0]);
 
 		cwnd = parse_window_size(args[0], args[1], &end_opt, err);
 		if (!cwnd)
@@ -544,7 +589,7 @@ static int cfg_parse_quic_tune_setting(char **args, int section_type,
 		ret = 1;
 	}
 	else {
-		memprintf(err, "'%s' keyword not unhandled (please report this bug).", args[0]);
+		memprintf(err, "'%s' keyword not handled (please report this bug).", args[0]);
 		return -1;
 	}
 
@@ -675,6 +720,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "tune.quic.fe.sock-per-conn", cfg_parse_quic_tune_sock_per_conn },
 	{ CFG_GLOBAL, "tune.quic.fe.stream.data-ratio", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.fe.stream.max-concurrent", cfg_parse_quic_tune_setting },
+	{ CFG_GLOBAL, "tune.quic.fe.stream.max-total", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.fe.stream.rxbuf", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.fe.tx.pacing", cfg_parse_quic_tune_on_off },
 	{ CFG_GLOBAL, "tune.quic.fe.tx.udp-gso", cfg_parse_quic_tune_on_off },
@@ -741,7 +787,7 @@ static int quic_parse_quic_initial(char **args, int section_type, struct proxy *
 	}
 
 	if (!(curpx->mode & PR_MODE_HTTP)) {
-		memprintf(err, "'%s' : proxy '%s' does not used HTTP mode",
+		memprintf(err, "'%s' : proxy '%s' does not use HTTP mode",
 		          args[0], curpx->id);
 		return -1;
 	}

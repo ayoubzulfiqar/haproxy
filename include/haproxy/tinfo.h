@@ -77,7 +77,7 @@ static inline int thread_set_nth_group(const struct thread_set *ts, int n)
 {
 	int i;
 
-	if (ts->grps) {
+	if (ts->nbgrps) {
 		for (i = 0; i < MAX_TGROUPS; i++)
 			if (ts->rel[i] && !n--)
 				return i + 1;
@@ -95,7 +95,7 @@ static inline ulong thread_set_nth_tmask(const struct thread_set *ts, int n)
 {
 	int i;
 
-	if (ts->grps) {
+	if (ts->nbgrps) {
 		for (i = 0; i < MAX_TGROUPS; i++)
 			if (ts->rel[i] && !n--)
 				return ts->rel[i];
@@ -111,10 +111,48 @@ static inline void thread_set_pin_grp1(struct thread_set *ts, ulong mask)
 {
 	int i;
 
-	ts->grps = 1;
+	ts->nbgrps = 1;
 	ts->rel[0] = mask;
 	for (i = 1; i < MAX_TGROUPS; i++)
 		ts->rel[i] = 0;
 }
+
+/* switches the current execution context to <ctx> and returns the previous one
+ * so that this may even be used to save and restore. Setting EXEC_CTX_NONE
+ * resets it. It's efficient because it uses a pair of registers on input and
+ * output.
+ */
+static inline struct thread_exec_ctx switch_exec_ctx(const struct thread_exec_ctx ctx)
+{
+	const struct thread_exec_ctx prev = th_ctx->exec_ctx;
+
+	th_ctx->exec_ctx = ctx;
+	return prev;
+}
+
+/* used to reset the execution context */
+#define EXEC_CTX_NONE ((struct thread_exec_ctx){ .type = 0, .pointer = NULL })
+
+/* make an execution context from a type and a pointer */
+#define EXEC_CTX_MAKE(_type, _pointer) ((struct thread_exec_ctx){ .type = (_type), .pointer = (_pointer) })
+
+/* execute expression <expr> under context <new_ctx> then restore the previous
+ * one, and return the expression's return value.
+ */
+#define EXEC_CTX_WITH_RET(new_ctx, expr) ({                                  \
+	const struct thread_exec_ctx __prev_ctx = switch_exec_ctx(new_ctx);  \
+	typeof(expr) __ret = (expr);                                         \
+	switch_exec_ctx(__prev_ctx);                                         \
+	__ret;                                                               \
+})
+
+/* execute expression <expr> under context <new_ctx> then restore the previous
+ * one. This one has no return value.
+ */
+#define EXEC_CTX_NO_RET(new_ctx, expr) do {                                  \
+	const struct thread_exec_ctx __prev_ctx = switch_exec_ctx(new_ctx);  \
+	do { expr; } while (0);                                              \
+	switch_exec_ctx(__prev_ctx);                                         \
+} while (0)
 
 #endif /* _HAPROXY_TINFO_H */

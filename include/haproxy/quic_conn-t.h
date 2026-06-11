@@ -38,7 +38,6 @@
 #include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_frame-t.h>
 #include <haproxy/quic_openssl_compat-t.h>
-#include <haproxy/quic_stats-t.h>
 #include <haproxy/quic_tls-t.h>
 #include <haproxy/quic_tp-t.h>
 #include <haproxy/show_flags-t.h>
@@ -230,7 +229,7 @@ extern const struct quic_version *quic_version_2;
 /* Flag the packet number space as needing probing */
 #define QUIC_FL_PKTNS_PROBE_NEEDED  (1UL << 2)
 /* Flag the packet number space as having received a packet with a new largest
- * packet number, to be acknowledege
+ * packet number, to be acknowledged
  */
 #define QUIC_FL_PKTNS_NEW_LARGEST_PN (1UL << 3)
 
@@ -401,6 +400,8 @@ struct quic_conn {
 
 	struct eb_root streams_by_id; /* qc_stream_desc tree */
 
+	const char *alpn;
+
 	/* MUX */
 	struct qcc *qcc;
 	struct task *timer_task;
@@ -409,7 +410,9 @@ struct quic_conn {
 	/* Handshake expiration date */
 	unsigned int hs_expire;
 
-	const struct qcc_app_ops *app_ops;
+	/* Callback to close any stream after MUX closure - set by the MUX itself */
+	int (*strm_reject)(struct list *out, uint64_t stream_id);
+
 	/* Proxy counters */
 	struct quic_counters *prx_counters;
 
@@ -434,7 +437,7 @@ struct quic_conn_closed {
 #define QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS    (1U << 2) /* HANDSHAKE_DONE must be sent */
 #define QUIC_FL_CONN_IS_BACK                     (1U << 3) /* conn used on backend side */
 #define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
-#define QUIC_FL_CONN_UDP_GSO_EIO                 (1U << 5) /* GSO disabled due to a EIO occured on same listener */
+#define QUIC_FL_CONN_UDP_GSO_EIO                 (1U << 5) /* GSO disabled due to a EIO occurred on same listener */
 #define QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ (1U << 6)
 #define QUIC_FL_CONN_RETRANS_NEEDED              (1U << 7)
 #define QUIC_FL_CONN_RETRANS_OLD_DATA            (1U << 8) /* retransmission in progress for probing with already sent data */

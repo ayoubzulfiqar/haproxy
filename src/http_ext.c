@@ -356,7 +356,7 @@ static inline int http_7239_extract_node(struct ist *input, struct forwarded_hea
 	if (!quoted)
 		return 0; /* not supported */
 	*input = istnext(*input);
-	if (!http_7239_extract_nodeport(input, nodeport))
+	if (!istlen(*input) || !http_7239_extract_nodeport(input, nodeport))
 		return 0; /* invalid nodeport */
  out:
 	/* ok */
@@ -769,7 +769,7 @@ int http_handle_7239_header(struct stream *s, struct channel *req)
 				return 0; /* htx error */
 		}
 		else {
-			if (unlikely(!http_add_header(htx, hdr, ist2(trash.area, trash.data))))
+			if (unlikely(!http_add_header(htx, hdr, ist2(trash.area, trash.data), 0)))
 				return 0; /* htx error */
 		}
 	}
@@ -823,7 +823,7 @@ int http_handle_xff_header(struct stream *s, struct channel *req)
 				 * on the frontend's header name.
 				 */
 				chunk_printf(&trash, "%d.%d.%d.%d", pn[0], pn[1], pn[2], pn[3]);
-				if (unlikely(!http_add_header(htx, hdr, ist2(trash.area, trash.data))))
+				if (unlikely(!http_add_header(htx, hdr, ist2(trash.area, trash.data), 0)))
 					return 0;
 			}
 		}
@@ -845,7 +845,7 @@ int http_handle_xff_header(struct stream *s, struct channel *req)
 				 * on the frontend's header name.
 				 */
 				chunk_printf(&trash, "%s", pn);
-				if (unlikely(!http_add_header(htx, hdr, ist2(trash.area, trash.data))))
+				if (unlikely(!http_add_header(htx, hdr, ist2(trash.area, trash.data), 0)))
 					return 0;
 			}
 		}
@@ -892,7 +892,7 @@ int http_handle_xot_header(struct stream *s, struct channel *req)
 				 * on the frontend's header name.
 				 */
 				chunk_printf(&trash, "%d.%d.%d.%d", pn[0], pn[1], pn[2], pn[3]);
-				if (unlikely(!http_add_header(htx, hdr, ist2(trash.area, trash.data))))
+				if (unlikely(!http_add_header(htx, hdr, ist2(trash.area, trash.data), 0)))
 					return 0;
 			}
 		}
@@ -914,7 +914,7 @@ int http_handle_xot_header(struct stream *s, struct channel *req)
 				 * on the frontend's header name.
 				 */
 				chunk_printf(&trash, "%s", pn);
-				if (unlikely(!http_add_header(htx, hdr, ist2(trash.area, trash.data))))
+				if (unlikely(!http_add_header(htx, hdr, ist2(trash.area, trash.data), 0)))
 					return 0;
 			}
 		}

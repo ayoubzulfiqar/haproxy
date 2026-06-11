@@ -111,7 +111,8 @@ enum srv_initaddr {
  * at start up time.
  */
 enum srv_init_state {
-	SRV_INIT_STATE_FULLY_DOWN = 0,     /* the server should initially be considered DOWN until it passes all health checks. Please keep set to zero. */
+	SRV_INIT_STATE_NONE = 0,
+	SRV_INIT_STATE_FULLY_DOWN,         /* the server should initially be considered DOWN until it passes all health checks. Please keep set to zero. */
 	SRV_INIT_STATE_DOWN,               /* the server should initially be considered DOWN until it passes one health check. */
 	SRV_INIT_STATE_UP,                 /* the server should initially be considered UP, but will go DOWN if it fails one health check. */
 	SRV_INIT_STATE_FULLY_UP,           /* the server should initially be considered UP, but will go DOWN if it fails all health checks. */
@@ -248,7 +249,9 @@ struct pid_list {
 
 /* srv methods of computing chash keys */
 enum srv_hash_key {
-	SRV_HASH_KEY_ID = 0,         /* derived from server puid */
+	SRV_HASH_KEY_ID = 0,         /* derived from server puid, 28 LSB used */
+	SRV_HASH_KEY_ID32,           /* derived from server puid, 32 bits used */
+	SRV_HASH_KEY_GUID,           /* derived from server guid */
 	SRV_HASH_KEY_ADDR,           /* derived from server address */
 	SRV_HASH_KEY_ADDR_PORT       /* derived from server address and port */
 };
@@ -276,6 +279,8 @@ struct srv_per_thread {
 	struct ceb_root *idle_conns;            /* Shareable idle connections */
 	struct ceb_root *safe_conns;            /* Safe idle connections */
 	struct ceb_root *avail_conns;           /* Connections in use, but with still new streams available */
+	struct server *srv;                     /* Back-pointer to the server */
+	struct eb32_node idle_node;             /* When to next do cleanup in the idle connections */
 #ifdef USE_QUIC
 	struct ist quic_retry_token;
 #endif
@@ -286,6 +291,7 @@ struct srv_per_tgroup {
 	struct queue queue;			/* pending connections */
 	struct server *server;                  /* pointer to the corresponding server */
 	struct eb32_node lb_node;               /* node used for tree-based load balancing */
+	char *extra_counters_storage;           /* storage for extra_counters */
 	struct server *next_full;               /* next server in the temporary full list */
 	unsigned int last_other_tgrp_served;	/* Last other tgrp we dequeued from */
 	unsigned int self_served;		/* Number of connection we dequeued from our own queue */
@@ -294,7 +300,7 @@ struct srv_per_tgroup {
 	struct eb_root *lb_tree;                 /* For LB algos with split between thread groups, the tree to be used, for each group */
 	unsigned npos, lpos;			/* next and last positions in the LB tree, protected by LB lock */
 	unsigned rweight;			/* remainder of weight in the current LB tree */
-} THREAD_ALIGNED(64);
+} THREAD_ALIGNED();
 
 /* Configure the protocol selection for websocket */
 enum __attribute__((__packed__)) srv_ws_mode {
@@ -325,6 +331,7 @@ enum renegotiate_mode {
 struct path_parameters {
 	__decl_thread(HA_RWLOCK_T param_lock);
 	char nego_alpn[MAX_ALPN_SIZE];
+	int64_t srv_hash;
 #ifdef USE_QUIC
 	struct quic_early_transport_params tps;
 #endif
@@ -383,7 +390,6 @@ struct server {
 	unsigned next_eweight;			/* next pending eweight to commit */
 	unsigned cumulative_weight;		/* weight of servers prior to this one in the same group, for chash balancing */
 	int maxqueue;				/* maximum number of pending connections allowed */
-	unsigned int queueslength;		/* Sum of the length of each queue */
 	int shard;				/* shard (in peers protocol context only) */
 	int log_bufsize;			/* implicit ring bufsize (for log server only - in log backend) */
 
@@ -396,8 +402,7 @@ struct server {
 	/* The elements below may be changed on every single request by any
 	 * thread, and generally at the same time.
 	 */
-	THREAD_ALIGN(64);
-	struct eb32_node idle_node;             /* When to next do cleanup in the idle connections */
+	THREAD_ALIGN();
 	unsigned int curr_idle_conns;           /* Current number of orphan idling connections, both the idle and the safe lists */
 	unsigned int curr_idle_nb;              /* Current number of connections in the idle list */
 	unsigned int curr_safe_nb;              /* Current number of connections in the safe list */
@@ -406,6 +411,7 @@ struct server {
 	unsigned int max_used_conns;            /* Max number of used connections (the counter is reset at each connection purges */
 	unsigned int est_need_conns;            /* Estimate on the number of needed connections (max of curr and previous max_used) */
 	unsigned int curr_sess_idle_conns;      /* Current number of idle connections attached to a session instead of idle/safe trees. */
+	unsigned int queueslength;		/* Sum of the length of each queue */
 
 	/* elements only used during boot, do not perturb and plug the hole */
 	struct guid_node guid;			/* GUID global tree node */
@@ -414,7 +420,7 @@ struct server {
 	/* Element below are usd by LB algorithms and must be doable in
 	 * parallel to other threads reusing connections above.
 	 */
-	THREAD_ALIGN(64);
+	THREAD_ALIGN();
 	__decl_thread(HA_SPINLOCK_T lock);      /* may enclose the proxy's lock, must not be taken under */
 	union {
 		struct eb32_node lb_node;       /* node used for tree-based load balancing */
@@ -428,7 +434,7 @@ struct server {
 	};
 
 	/* usually atomically updated by any thread during parsing or on end of request */
-	THREAD_ALIGN(64);
+	THREAD_ALIGN();
 	int cur_sess;				/* number of currently active sessions (including syn_sent) */
 	int served;				/* # of active sessions currently being served (ie not pending) */
 	int consecutive_errors;			/* current number of consecutive errors */
@@ -436,7 +442,7 @@ struct server {
 	struct be_counters counters;		/* statistics counters */
 
 	/* Below are some relatively stable settings, only changed under the lock */
-	THREAD_ALIGN(64);
+	THREAD_ALIGN();
 
 	struct eb_root *lb_tree;                /* we want to know in what tree the server is */
 	struct tree_occ *lb_nodes;              /* lb_nodes_tot * struct tree_occ */
@@ -485,7 +491,7 @@ struct server {
 			unsigned char *ptr;
 			int size;
 			int allocated_size;
-			char *sni; /* SNI used for the session */
+			uint64_t sni_hash; /* Hash of the SNI used for the session */
 			__decl_thread(HA_RWLOCK_T sess_lock);
 		} * reused_sess;
 
@@ -514,6 +520,8 @@ struct server {
 	} ssl_ctx;
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters */
+	const struct quic_cc_algo *quic_cc_algo;  /* QUIC control congestion algorithm */
+	size_t quic_max_cwnd;                     /* QUIC maximum congestion control window size (kB) */
 #endif
 	struct path_parameters path_params;     /* Connection parameters for that server */
 	struct resolv_srvrq *srvrq;		/* Pointer representing the DNS SRV requeest, if any */

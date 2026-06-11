@@ -62,6 +62,13 @@ ssize_t applet_append_line(void *ctx, struct ist v1, struct ist v2, size_t ofs, 
 static forceinline void applet_fl_set(struct appctx *appctx, uint on);
 static forceinline void applet_fl_clr(struct appctx *appctx, uint off);
 
+/* macros to switch the calling context to the applet during a call. There's
+ * one with a return value for most calls, and one without for the few like
+ * fct(), shut(), or release() with no return.
+ */
+#define CALL_APPLET_WITH_RET(applet, func) EXEC_CTX_WITH_RET(EXEC_CTX_MAKE(TH_EX_CTX_APPLET, (applet)), (applet)->func)
+#define CALL_APPLET_NO_RET(applet, func)   EXEC_CTX_NO_RET(EXEC_CTX_MAKE(TH_EX_CTX_APPLET, (applet)), (applet)->func)
+
 
 static forceinline uint appctx_app_test(const struct appctx *appctx, uint test)
 {
@@ -126,7 +133,7 @@ static inline int appctx_init(struct appctx *appctx)
 	task_set_thread(appctx->t, tid);
 
 	if (appctx->applet->init)
-		return appctx->applet->init(appctx);
+		return CALL_APPLET_WITH_RET(appctx->applet, init(appctx));
 	return 0;
 }
 
@@ -366,7 +373,7 @@ static inline size_t applet_output_data(const struct appctx *appctx)
  * This is useful when data have been read directly from the buffer. It is
  * illegal to call this function with <len> causing a wrapping at the end of the
  * buffer. It's the caller's responsibility to ensure that <len> is never larger
- * than available ouput data.
+ * than available output data.
  *
  * This function is not HTX aware.
  */
@@ -392,7 +399,7 @@ static inline void applet_reset_input(struct appctx *appctx)
 		co_skip(sc_oc(appctx_sc(appctx)), co_data(sc_oc(appctx_sc(appctx))));
 }
 
-/* Returns the amout of space available at the HTX output buffer (see applet_get_outbuf).
+/* Returns the amount of space available at the HTX output buffer (see applet_get_outbuf).
  */
 static inline size_t applet_htx_output_room(const struct appctx *appctx)
 {
@@ -402,7 +409,7 @@ static inline size_t applet_htx_output_room(const struct appctx *appctx)
 		return channel_recv_max(sc_ic(appctx_sc(appctx)));
 }
 
-/* Returns the amout of space available at the output buffer (see applet_get_outbuf).
+/* Returns the amount of space available at the output buffer (see applet_get_outbuf).
  */
 static inline size_t applet_output_room(const struct appctx *appctx)
 {

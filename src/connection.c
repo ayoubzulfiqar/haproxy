@@ -102,6 +102,20 @@ void conn_delete_from_tree(struct connection *conn, int thr)
 	ceb64_item_delete(conn_tree, hash_node.node, hash_node.key, conn);
 }
 
+/* Installs the MUX layer for <conn> connection. The behavior is slightly
+ * different for frontend and backend sides.
+ *
+ * For frontend connections, MUX is set up via session initialization
+ * completion. In case of failure, the session and the whole connection stack
+ * are freed. Caller should set <closed_connection> to a non NULL value as it
+ * will be set to 1 to report the connection release.
+ *
+ * For backend connections, MUX layer is immediately initialized by selecting
+ * the most appropriate one depending on the connection protocol. In case of
+ * failure, connection is left as it is and the upper layer is notified.
+ *
+ * Returns 0 on success else a negative error code.
+ */
 int conn_create_mux(struct connection *conn, int *closed_connection)
 {
 	if (closed_connection)
@@ -141,7 +155,7 @@ int conn_create_mux(struct connection *conn, int *closed_connection)
 fail:
 		/* let the upper layer know the connection failed */
 		if (sc) {
-			sc->app_ops->wake(sc);
+			tasklet_wakeup(sc->wait_event.tasklet, TASK_WOKEN_MSG);
 		}
 		else if (conn_reverse_in_preconnect(conn)) {
 			struct listener *l = conn_active_reverse_listener(conn);
@@ -182,7 +196,7 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 	 * information to create one, typically from the ALPN. If we're
 	 * done with the handshake, attempt to create one.
 	 */
-	if (unlikely(!conn->mux) && !(conn->flags & CO_FL_WAIT_XPRT)) {
+	if (unlikely(!conn->mux) && !(conn->flags & (CO_FL_WAIT_XPRT|CO_FL_WAIT_XPRT_L6))) {
 		ret = conn_create_mux(conn, NULL);
 		if (ret < 0)
 			goto done;
@@ -232,14 +246,14 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 
-		ret = conn->mux->wake(conn);
+		ret = CALL_MUX_WITH_RET(conn->mux, wake(conn));
 		if (ret < 0)
 			goto done;
 
 		if (conn_in_list) {
 			if (srv && (srv->cur_admin & SRV_ADMF_MAINT)) {
 				/* Do not store an idle conn if server in maintenance. */
-				conn->mux->destroy(conn->ctx);
+				CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
 				ret = -1;
 				goto done;
 			}
@@ -247,7 +261,7 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 			if (conn->flags & CO_FL_SESS_IDLE) {
 				if (!session_reinsert_idle_conn(conn->owner, conn)) {
 					/* session add conn failure */
-					conn->mux->destroy(conn->ctx);
+					CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
 					ret = -1;
 				}
 			}
@@ -268,6 +282,7 @@ int conn_upgrade_mux_fe(struct connection *conn, void *ctx, struct buffer *buf,
                         struct ist mux_proto, int mode)
 {
 	struct bind_conf *bind_conf = __objt_listener(conn->target)->bind_conf;
+	struct ist alpn = IST_NULL;
 	const struct mux_ops *old_mux, *new_mux;
 	void *old_mux_ctx;
 	const char *alpn_str = NULL;
@@ -275,9 +290,9 @@ int conn_upgrade_mux_fe(struct connection *conn, void *ctx, struct buffer *buf,
 
 	if (!mux_proto.len) {
 		conn_get_alpn(conn, &alpn_str, &alpn_len);
-		mux_proto = ist2(alpn_str, alpn_len);
+		alpn = ist2(alpn_str, alpn_len);
 	}
-	new_mux = conn_get_best_mux(conn, mux_proto, PROTO_SIDE_FE, mode);
+	new_mux = conn_get_best_mux(conn, mux_proto, alpn, PROTO_SIDE_FE, mode);
 	old_mux = conn->mux;
 
 	/* No mux found */
@@ -291,7 +306,7 @@ int conn_upgrade_mux_fe(struct connection *conn, void *ctx, struct buffer *buf,
 	old_mux_ctx = conn->ctx;
 	conn->mux = new_mux;
 	conn->ctx = ctx;
-	if (new_mux->init(conn, bind_conf->frontend, conn->owner, buf) == -1) {
+	if (CALL_MUX_WITH_RET(new_mux, init(conn, bind_conf->frontend, conn->owner, buf)) == -1) {
 		/* The mux upgrade failed, so restore the old mux */
 		conn->ctx = old_mux_ctx;
 		conn->mux = old_mux;
@@ -300,8 +315,31 @@ int conn_upgrade_mux_fe(struct connection *conn, void *ctx, struct buffer *buf,
 
 	/* The mux was upgraded, destroy the old one */
 	*buf = BUF_NULL;
-	old_mux->destroy(old_mux_ctx);
+	CALL_MUX_NO_RET(old_mux, destroy(old_mux_ctx));
 	return 0;
+}
+
+/* Returns the mux_proto_list entry compatible with <conn> frontend connection
+ * or NULL if nothing eligible.
+ * TODO duplicate code to merge with conn_install_mux_fe().
+ */
+const struct mux_proto_list *conn_select_mux_fe(const struct connection *conn)
+{
+	struct bind_conf *bind_conf;
+	const char *alpn_str = NULL;
+	struct ist alpn;
+	int alpn_len = 0, mode;
+
+	bind_conf = __objt_listener(conn->target)->bind_conf;
+
+	if (bind_conf->mux_proto)
+		return bind_conf->mux_proto;
+
+	mode = conn_pr_mode_to_proto_mode(bind_conf->frontend->mode);
+	conn_get_alpn(conn, &alpn_str, &alpn_len);
+	alpn = ist2(alpn_str, alpn_len);
+	return conn_get_best_mux_entry(IST_NULL, alpn, PROTO_SIDE_FE,
+	                               proto_is_quic(conn->ctrl), mode);
 }
 
 /* installs the best mux for incoming connection <conn> using the upper context
@@ -316,14 +354,14 @@ int conn_install_mux_fe(struct connection *conn, void *ctx)
 	if (bind_conf->mux_proto)
 		mux_ops = bind_conf->mux_proto->mux;
 	else {
-		struct ist mux_proto;
+		struct ist alpn;
 		const char *alpn_str = NULL;
 		int alpn_len = 0;
 		int mode = conn_pr_mode_to_proto_mode(bind_conf->frontend->mode);
 
 		conn_get_alpn(conn, &alpn_str, &alpn_len);
-		mux_proto = ist2(alpn_str, alpn_len);
-		mux_ops = conn_get_best_mux(conn, mux_proto, PROTO_SIDE_FE, mode);
+		alpn = ist2(alpn_str, alpn_len);
+		mux_ops = conn_get_best_mux(conn, IST_NULL, alpn, PROTO_SIDE_FE, mode);
 		if (!mux_ops)
 			return -1;
 	}
@@ -337,6 +375,66 @@ int conn_install_mux_fe(struct connection *conn, void *ctx)
 	}
 
 	return conn_install_mux(conn, mux_ops, ctx, bind_conf->frontend, conn->owner);
+}
+
+/* Returns the mux_proto_list entry compatible with <conn> backend connection
+ * or NULL if nothing eligible.
+ * TODO duplicate code to merge with conn_install_mux_be/chk().
+ */
+const struct mux_proto_list *conn_select_mux_be(const struct connection *conn)
+{
+	struct session *sess;
+	struct server *srv;
+	struct proxy *prx;
+	struct check *check;
+	struct ist alpn;
+	const char *alpn_str = NULL;
+	int alpn_len = 0, mode;
+
+	sess = conn->owner;
+	if (sess && obj_type(sess->origin) == OBJ_TYPE_CHECK) {
+		check = __objt_check(sess->origin);
+		if (check->mux_proto)
+			return check->mux_proto;
+
+		mode = tcpchk_rules_type_to_proto_mode(check->tcpcheck->rs->flags);
+
+		conn_get_alpn(conn, &alpn_str, &alpn_len);
+		alpn = ist2(alpn_str, alpn_len);
+
+		return conn_get_best_mux_entry(IST_NULL, alpn, PROTO_SIDE_BE,
+		                               proto_is_quic(conn->ctrl), mode);
+	}
+	else {
+		srv = objt_server(conn->target);
+		prx = objt_proxy(conn->target);
+		if (srv)
+			prx = srv->proxy;
+
+		if (!prx) {
+			/* Target should either be a server or a proxy.
+			 * USE a full a BUG_ON() once considered definitive.
+			 */
+			BUG_ON_HOT(1);
+			return NULL;
+		}
+
+		mode = conn_pr_mode_to_proto_mode(prx->mode);
+
+		if (srv && srv->mux_proto)
+			return srv->mux_proto;
+
+		if (!conn_get_alpn(conn, &alpn_str, &alpn_len)) {
+			if (srv && srv->path_params.nego_alpn[0]) {
+				alpn_str = srv->path_params.nego_alpn;
+				alpn_len = strlen(alpn_str);
+			}
+		}
+		alpn = ist2(alpn_str, alpn_len);
+
+		return conn_get_best_mux_entry(IST_NULL, alpn, PROTO_SIDE_BE,
+		                               proto_is_quic(conn->ctrl), mode);
+	}
 }
 
 /* installs the best mux for outgoing connection <conn> using the upper context
@@ -366,23 +464,34 @@ int conn_install_mux_be(struct connection *conn, void *ctx, struct session *sess
 		mux_ops = force_mux_ops;
 	}
 	else {
-		struct ist mux_proto;
+		struct ist alpn;
 		const char *alpn_str = NULL;
 		int alpn_len = 0;
 		int mode = conn_pr_mode_to_proto_mode(prx->mode);
 
 		if (!conn_get_alpn(conn, &alpn_str, &alpn_len)) {
-			if (srv && srv->path_params.nego_alpn[0]) {
+			if (srv && srv->path_params.srv_hash == conn->hash_node.key && srv->path_params.nego_alpn[0]) {
 				alpn_str = srv->path_params.nego_alpn;
 				alpn_len = strlen(alpn_str);
 			}
 		}
-		mux_proto = ist2(alpn_str, alpn_len);
+		alpn = ist2(alpn_str, alpn_len);
 
-		mux_ops = conn_get_best_mux(conn, mux_proto, PROTO_SIDE_BE, mode);
+		mux_ops = conn_get_best_mux(conn, IST_NULL, alpn, PROTO_SIDE_BE, mode);
 		if (!mux_ops)
 			return -1;
 	}
+
+	/* unless the connection is private or it's temporarily reserved to the
+	 * session due to a mux presenting a risk of head-of-line blocking and
+	 * the reuse mode is set to "safe", we should reset the owner to avoid
+	 * any ambiguity.
+	 */
+	if (!(conn->flags & CO_FL_PRIVATE) &&
+	    ((prx->options & PR_O_REUSE_MASK) != PR_O_REUSE_SAFE ||
+	     !(mux_ops->flags & MX_FL_HOL_RISK)))
+		conn->owner = NULL;
+
 	return conn_install_mux(conn, mux_ops, ctx, prx, sess);
 }
 
@@ -409,15 +518,15 @@ int conn_install_mux_chk(struct connection *conn, void *ctx, struct session *ses
 	if (check->mux_proto)
 		mux_ops = check->mux_proto->mux;
 	else {
-		struct ist mux_proto;
+		struct ist alpn;
 		const char *alpn_str = NULL;
 		int alpn_len = 0;
-		int mode = tcpchk_rules_type_to_proto_mode(check->tcpcheck_rules->flags);
+		int mode = tcpchk_rules_type_to_proto_mode(check->tcpcheck->rs->flags);
 
 		conn_get_alpn(conn, &alpn_str, &alpn_len);
-		mux_proto = ist2(alpn_str, alpn_len);
+		alpn = ist2(alpn_str, alpn_len);
 
-		mux_ops = conn_get_best_mux(conn, mux_proto, PROTO_SIDE_BE, mode);
+		mux_ops = conn_get_best_mux(conn, IST_NULL, alpn, PROTO_SIDE_BE, mode);
 		if (!mux_ops)
 			return -1;
 	}
@@ -520,6 +629,7 @@ void conn_init(struct connection *conn, void *target)
 	conn->xprt = NULL;
 	conn->reverse.target = NULL;
 	conn->reverse.name = BUF_NULL;
+	conn->sni_hash = 0;
 }
 
 /* Initialize members used for backend connections.
@@ -657,7 +767,7 @@ void conn_free(struct connection *conn)
 void conn_release(struct connection *conn)
 {
 	if (conn->mux) {
-		conn->mux->destroy(conn->ctx);
+		CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
 	}
 	else {
 		conn_stop_tracking(conn);
@@ -734,6 +844,43 @@ int xprt_add_hs(struct connection *conn)
 		ops->close(conn, xprt_ctx);
 		return -1;
 	}
+	return 0;
+}
+
+/* Activates an <xprt> layer on top of <conn> connection. This handshake layer
+ * should be designed to work on top of the layer 6. If SSL is active and its
+ * handshake still in progress, this function does nothing.
+ *
+ * Returns 0 on success else a negative error code.
+ */
+int xprt_add_l6hs(struct connection *conn, int xprt)
+{
+	const struct xprt_ops *ops = xprt_get(xprt);
+	void *ops_ctx = NULL;
+
+	/* Only QMux is supported as handshake on top of layer6 for now. */
+	BUG_ON(xprt != XPRT_QMUX);
+
+	if (conn->flags & CO_FL_ERROR)
+		return -1;
+
+	/* Do nothing if SSL is in used but handshake still in progress. In
+	 * this case, xprt layer will be added on handshake completion.
+	 */
+	if (conn->xprt == xprt_get(XPRT_SSL) &&
+	    (conn->flags & CO_FL_WAIT_L6_CONN)) {
+		return 0;
+	}
+
+	if (ops->init(conn, &ops_ctx))
+		return -1;
+
+	ops->add_xprt(conn, ops_ctx, conn->xprt_ctx, conn->xprt, NULL, NULL);
+	conn->xprt = ops;
+	conn->xprt_ctx = ops_ctx;
+	/* Reset XPRT READY flag before the next conn_xprt_start(). */
+	conn->flags &= ~CO_FL_XPRT_READY;
+
 	return 0;
 }
 
@@ -861,6 +1008,8 @@ const char *conn_err_code_str(struct connection *c)
 	case CO_ER_SOCKS4_ABORT:   return "SOCKS4 Proxy handshake aborted by server";
 
 	case CO_ER_SSL_FATAL:      return "SSL fatal error";
+
+	case CO_ER_QMUX:           return "Error during QMux transport parameters initial exchange";
 
 	case CO_ER_REVERSE:        return "Reverse connect failure";
 
@@ -1963,7 +2112,7 @@ void list_mux_proto(FILE *out)
 	fprintf(out, "Available multiplexer protocols :\n"
 		"(protocols marked as <default> cannot be specified using 'proto' keyword)\n");
 	list_for_each_entry(item, &mux_proto_list.list, list) {
-		proto = item->token;
+		proto = item->mux_proto;
 
 		if (item->mode == PROTO_MODE_ANY)
 			mode = "TCP|HTTP";
@@ -2759,7 +2908,7 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "bc_glitches", smp_fetch_fc_glitches, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
 	{ "bc_http_major", smp_fetch_fc_http_major, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
 	{ "bc_nb_streams", smp_fetch_fc_nb_streams, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
-	{ "bc_setting_streams_limit", smp_fetch_fc_streams_limit, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
+	{ "bc_settings_streams_limit", smp_fetch_fc_streams_limit, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
 	{ "fc_err", smp_fetch_fc_err, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
 	{ "fc_err_name", smp_fetch_fc_err_str, 0, NULL, SMP_T_STR, SMP_USE_L4CLI },
 	{ "fc_err_str", smp_fetch_fc_err_str, 0, NULL, SMP_T_STR, SMP_USE_L4CLI },
@@ -3033,7 +3182,7 @@ static struct task *mux_stopping_process(struct task *t, void *ctx, unsigned int
 
 	list_for_each_entry_safe(conn, back, &mux_stopping_data[tid].list, stopping_list) {
 		if (conn->mux && conn->mux->wake)
-			conn->mux->wake(conn);
+			CALL_MUX_NO_RET(conn->mux, wake(conn));
 	}
 
 	return t;

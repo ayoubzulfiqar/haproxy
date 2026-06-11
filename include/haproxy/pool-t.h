@@ -63,7 +63,7 @@ struct pool_cache_head {
 	unsigned int tid;    /* thread id, for debugging only */
 	struct pool_head *pool; /* assigned pool, for debugging only */
 	ulong fill_pattern;  /* pattern used to fill the area on free */
-} THREAD_ALIGNED(64);
+} THREAD_ALIGNED();
 
 /* This describes a pool registration, which is what was passed to
  * create_pool() and that might have been merged with an existing pool.
@@ -72,8 +72,8 @@ struct pool_registration {
 	struct list list;    /* link element */
 	const char *name;    /* name of the pool */
 	const char *file;    /* where the pool is declared */
+	ullong size;         /* expected object size */
 	unsigned int line;   /* line in the file where the pool is declared, 0 if none */
-	unsigned int size;   /* expected object size */
 	unsigned int flags;  /* MEM_F_* */
 	unsigned int type_align;  /* type-imposed alignment; 0=unspecified */
 	unsigned int align;  /* expected alignment; 0=unspecified */
@@ -139,7 +139,7 @@ struct pool_head {
 	struct list regs;       /* registrations: alt names for this pool */
 
 	/* heavily read-write part */
-	THREAD_ALIGN(64);
+	THREAD_ALIGN();
 
 	/* these entries depend on the pointer value, they're used to reduce
 	 * the contention on fast-changing values. The alignment here is
@@ -148,7 +148,7 @@ struct pool_head {
 	 * just meant to shard elements and there are no per-free_list stats.
 	 */
 	struct {
-		THREAD_ALIGN(64);
+		THREAD_ALIGN();
 		struct pool_item *free_list; /* list of free shared objects */
 		unsigned int allocated;	/* how many chunks have been allocated */
 		unsigned int used;	/* how many chunks are currently in use */
@@ -156,8 +156,8 @@ struct pool_head {
 		unsigned int failed;	/* failed allocations (indexed by hash of TID) */
 	} buckets[CONFIG_HAP_POOL_BUCKETS];
 
-	struct pool_cache_head cache[MAX_THREADS] THREAD_ALIGNED(64); /* pool caches */
-} __attribute__((aligned(64)));
+	struct pool_cache_head cache[MAX_THREADS] THREAD_ALIGNED(); /* pool caches */
+} THREAD_ALIGNED();
 
 #endif /* _HAPROXY_POOL_T_H */
 

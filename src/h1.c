@@ -274,17 +274,17 @@ void h1_parse_connection_header(struct h1m *h1m, struct ist *value)
 
 /* Parse the Upgrade: header of an HTTP/1 request.
  * If "websocket" is found, set H1_MF_UPG_WEBSOCKET flag
- * If "h2c" or "h2" found, set H1_MF_UPG_H2C flag.
+ * If "h2c" or "h2" found, the value is skipped.
  */
-void h1_parse_upgrade_header(struct h1m *h1m, struct ist value)
+void h1_parse_upgrade_header(struct h1m *h1m, struct ist *value)
 {
-	char *e, *n;
+	char *e, *n, *p;
 	struct ist word;
 
-	h1m->flags &= ~(H1_MF_UPG_WEBSOCKET|H1_MF_UPG_H2C);
-
-	word.ptr = value.ptr - 1; // -1 for next loop's pre-increment
-	e = istend(value);
+	word.ptr = value->ptr - 1; // -1 for next loop's pre-increment
+	p = value->ptr;
+	e = value->ptr + value->len;
+	value->len = 0;
 
 	while (++word.ptr < e) {
 		/* skip leading delimiter and blanks */
@@ -301,10 +301,24 @@ void h1_parse_upgrade_header(struct h1m *h1m, struct ist value)
 		if (isteqi(word, ist("websocket")))
 			h1m->flags |= H1_MF_UPG_WEBSOCKET;
 		else if (isteqi(word, ist("h2c")) || isteqi(word, ist("h2")))
-			h1m->flags |= H1_MF_UPG_H2C;
+			goto skip_val;
 
-		word.ptr = n;
+		if (value->ptr + value->len == p) {
+			/* no rewrite done till now */
+			value->len = n - value->ptr;
+		}
+		else {
+			if (value->len)
+				value->ptr[value->len++] = ',';
+			istcat(value, word, e - value->ptr);
+		}
+
+	  skip_val:
+		word.ptr = p = n;
 	}
+
+	if (istlen(*value))
+		h1m->flags |= H1_MF_UPG_HDR;
 }
 
 /* Macros used in the HTTP/1 parser, to check for the expected presence of
@@ -699,6 +713,16 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 	case H1_MSG_RPCODE:
 	http_msg_rpcode:
 		if (likely(HTTP_IS_DIGIT(*ptr))) {
+			if (ptr - sl.st.c.ptr >= 3) {
+				/* more than 3 digits */
+				if (h1m->err_pos == -1) /* only capture the error pointer */
+					h1m->err_pos = ptr - start + skip;
+				else if (h1m->err_pos < -1 || sl.st.status >= ((uint16_t)~0 - 9) / 10) {
+					/* strict checks or risk of overflow */
+					state = H1_MSG_RPCODE;
+					goto http_msg_invalid;
+				}
+			}
 			sl.st.status = sl.st.status * 10 + *ptr - '0';
 			EAT_AND_JUMP_OR_RETURN(ptr, end, http_msg_rpcode, http_msg_ood, state, H1_MSG_RPCODE);
 		}
@@ -941,6 +965,20 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 					goto http_output_full;
 				}
 
+				/* Skip headers whose names contain forbidden
+				 * chars. When any is detected, h1m->err_pos >= 0,
+				 * so we recheck the name only when an error was
+				 * detected.
+				 */
+				if (unlikely(h1m->err_pos >= 0)) {
+					size_t i = 0;
+					while (i < n.len && HTTP_IS_TOKEN(n.ptr[i]))
+						i++;
+
+					if (i < n.len)
+						break;
+				}
+
 				if (isteqi(n, ist("transfer-encoding"))) {
 					ret = h1_parse_xfer_enc_header(h1m, v);
 					if (ret < 0) {
@@ -983,7 +1021,11 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 					}
 				}
 				else if (isteqi(n, ist("upgrade"))) {
-					h1_parse_upgrade_header(h1m, v);
+					h1_parse_upgrade_header(h1m, &v);
+					if (!v.len) {
+						/* skip it */
+						break;
+					}
 				}
 				else if (!(h1m->flags & H1_MF_RESP) && isteqi(n, ist("host"))) {
 					if (host_idx == -1) {
@@ -1073,6 +1115,22 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 
 			case URI_PARSER_FORMAT_ABSURI_OR_AUTHORITY:
 				scheme = http_parse_scheme(&parser);
+				authority = http_parse_authority(&parser, 1);
+				if (http_authority_has_forbidden_char(authority)) {
+					if (h1m->err_pos < -1) {
+						state = H1_MSG_LAST_LF;
+						/* WT: gcc seems to see a path where sl.rq.u.ptr was used
+						 * uninitialized, but it doesn't know that the function is
+						 * called with initial states making this impossible.
+						 */
+						ALREADY_CHECKED(sl.rq.u.ptr);
+						ptr = sl.rq.u.ptr; /* Set ptr on the error */
+						goto http_msg_invalid;
+					}
+					if (h1m->err_pos == -1) /* capture the error pointer */
+						h1m->err_pos = sl.rq.u.ptr - start + skip; /* >= 0 now */
+				}
+
 				if (!isttest(scheme)) { /* scheme not found: MUST be an authority */
 					struct ist *host = NULL;
 
@@ -1082,7 +1140,6 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 					}
 					if (host_idx != -1)
 						host = &hdr[host_idx].v;
-					authority = http_parse_authority(&parser, 1);
 					ret = h1_validate_connect_authority(scheme, authority, host);
 					if (ret < 0) {
 						if (h1m->err_pos < -1) {
@@ -1109,7 +1166,6 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 
 					if (host_idx != -1)
 						host = hdr[host_idx].v;
-					authority = http_parse_authority(&parser, 1);
 					/* For non-CONNECT method, the authority must match the host header value */
 					if (isttest(host) && !isteqi(authority, host)) {
 						ret = h1_validate_mismatch_authority(scheme, authority, host);
@@ -1219,9 +1275,10 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 void h1_generate_random_ws_input_key(char key_out[25])
 {
 	/* generate a random websocket key */
-	const uint64_t rand1 = ha_random64(), rand2 = ha_random64();
+	uint64_t rand1, rand2;
 	char key[16];
 
+	ha_random64_pair_hashed(&rand1, &rand2);
 	memcpy(key, &rand1, 8);
 	memcpy(&key[8], &rand2, 8);
 	a2base64(key, 16, key_out, 25);

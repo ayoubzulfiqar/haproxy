@@ -19,7 +19,7 @@ uint8_t mqtt_cpt_flags[MQTT_CPT_ENTRIES] = {
 	[MQTT_CPT_CONNACK]     = 0x00,
 
 	/* MQTT_CPT_PUBLISH flags can have different values (DUP, QoS, RETAIN), must be
-	 * check more carefully
+	 * check more carefully (any combination of the 4 bits is valid).
 	 */
 	[MQTT_CPT_PUBLISH]     = 0x0F,
 
@@ -95,7 +95,7 @@ const uint64_t mqtt_fields_per_packet[MQTT_CPT_ENTRIES] = {
 	                         MQTT_FN_BIT_DELAY_INTERVAL                    | MQTT_FN_BIT_PAYLOAD_FORMAT_INDICATOR           |
 	                         MQTT_FN_BIT_MESSAGE_EXPIRY_INTERVAL           | MQTT_FN_BIT_CONTENT_TYPE                       |
 	                         MQTT_FN_BIT_RESPONSE_TOPIC                    | MQTT_FN_BIT_CORRELATION_DATA                   |
-	                         MQTT_FN_BIT_USER_PROPERTY                     | MQTT_FN_BIT_WILL_TOPIC                         |
+	                         MQTT_FN_BIT_WILL_TOPIC                        |
 	                         MQTT_FN_BIT_WILL_PAYLOAD                      | MQTT_FN_BIT_USERNAME                           |
 	                         MQTT_FN_BIT_PASSWORD,
 
@@ -144,7 +144,7 @@ const uint64_t mqtt_fields_per_packet[MQTT_CPT_ENTRIES] = {
 };
 
 /* Checks the first byte of a message to read the fixed header and extract the
- * packet type and flags. <parser> is supposed to point to the fix header byte.
+ * packet type and flags. <parser> is supposed to point to the fixed header byte.
  *
  * Fix header looks like:
  * +-------+-----------+-----------+-----------+---------+----------+----------+---------+------------+
@@ -162,7 +162,8 @@ static inline struct ist mqtt_read_fixed_hdr(struct ist parser, struct mqtt_pkt 
 	uint8_t ptype = (type & 0xF0) >> 4;
 	uint8_t flags = type & 0x0F;
 
-	if (ptype == MQTT_CPT_INVALID || ptype >= MQTT_CPT_ENTRIES || flags != mqtt_cpt_flags[ptype])
+	if (ptype == MQTT_CPT_INVALID || ptype >= MQTT_CPT_ENTRIES ||
+	    (ptype != MQTT_CPT_PUBLISH && flags != mqtt_cpt_flags[ptype]))
 		return IST_NULL;
 
 	pkt->fixed_hdr.type = ptype;
@@ -670,7 +671,7 @@ struct ist mqtt_field_value(struct ist msg, int type, int fieldname_id)
 		case MQTT_FN_SHARED_SUBSCRIPTION_AVAILABLE:
 			if (mpkt.data.connack.var_hdr.protocol_version != MQTT_VERSION_5_0)
 				goto not_found_or_invalid;
-			if (!mqtt_uint2str(trash, mpkt.data.connack.var_hdr.props.shared_subsription_available))
+			if (!mqtt_uint2str(trash, mpkt.data.connack.var_hdr.props.shared_subscription_available))
 				goto not_found_or_invalid;
 			res = ist2(trash->area, trash->data);
 			goto end;
@@ -789,10 +790,10 @@ static int mqtt_parse_connect(struct ist parser, struct mqtt_pkt *mpkt)
 				break;
 
 			case MQTT_PROP_TOPIC_ALIAS_MAXIMUM:
-				if (fields & MQTT_FN_BIT_TOPIC_ALIAS)
+				if (fields & MQTT_FN_BIT_TOPIC_ALIAS_MAXIMUM)
 					goto end;
 				props = mqtt_read_2byte_int(istnext(props), &mpkt->data.connect.var_hdr.props.topic_alias_maximum);
-				fields |= MQTT_FN_BIT_TOPIC_ALIAS;
+				fields |= MQTT_FN_BIT_TOPIC_ALIAS_MAXIMUM;
 				break;
 
 			case MQTT_PROP_REQUEST_RESPONSE_INFORMATION:
@@ -1127,21 +1128,21 @@ static int mqtt_parse_connack(struct ist parser, struct mqtt_pkt *mpkt)
 				break;
 
 			case MQTT_PROP_SUBSCRIPTION_IDENTIFIERS_AVAILABLE:
-				if (fields & MQTT_FN_BIT_SUBSCRIPTION_IDENTIFIER)
+				if (fields & MQTT_FN_BIT_SUBSCRIPTION_IDENTIFIERS_AVAILABLE)
 					goto end;
 				props = mqtt_read_1byte_int(istnext(props), &mpkt->data.connack.var_hdr.props.subscription_identifiers_available);
 				/* can have only 2 values: 0 or 1 */
 				if (mpkt->data.connack.var_hdr.props.subscription_identifiers_available > 1)
 					goto end;
-				fields |= MQTT_FN_BIT_SUBSCRIPTION_IDENTIFIER;
+				fields |= MQTT_FN_BIT_SUBSCRIPTION_IDENTIFIERS_AVAILABLE;
 				break;
 
 			case MQTT_PROP_SHARED_SUBSRIPTION_AVAILABLE:
 				if (fields & MQTT_FN_BIT_SHARED_SUBSCRIPTION_AVAILABLE)
 					goto end;
-				props = mqtt_read_1byte_int(istnext(props), &mpkt->data.connack.var_hdr.props.shared_subsription_available);
+				props = mqtt_read_1byte_int(istnext(props), &mpkt->data.connack.var_hdr.props.shared_subscription_available);
 				/* can have only 2 values: 0 or 1 */
-				if (mpkt->data.connack.var_hdr.props.shared_subsription_available > 1)
+				if (mpkt->data.connack.var_hdr.props.shared_subscription_available > 1)
 					goto end;
 				fields |= MQTT_FN_BIT_SHARED_SUBSCRIPTION_AVAILABLE;
 				break;
@@ -1196,7 +1197,7 @@ static int mqtt_parse_connack(struct ist parser, struct mqtt_pkt *mpkt)
 				break;
 
 			default:
-				return 0;
+				goto end;
 			}
 
 			if (!isttest(props))

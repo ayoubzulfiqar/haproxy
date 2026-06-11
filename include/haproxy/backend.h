@@ -30,6 +30,10 @@
 #include <haproxy/stream-t.h>
 #include <haproxy/time.h>
 
+extern struct list lb_ops_list;
+
+void lb_ops_register(struct lb_ops *ops);
+
 struct server *get_server_sh(struct proxy *px, const char *addr, int len, const struct server *avoid);
 struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, const struct server *avoid);
 struct server *get_server_ph(struct proxy *px, const char *uri, int uri_len, const struct server *avoid);
@@ -69,6 +73,7 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 int tcp_persist_rdp_cookie(struct stream *s, struct channel *req, int an_bit);
 
 int be_downtime(struct proxy *px);
+int be_supports_dynamic_srv(struct proxy *px, char **msg);
 void recount_servers(struct proxy *px);
 void update_backend_weight(struct proxy *px);
 
@@ -85,11 +90,24 @@ static inline int be_usable_srv(struct proxy *be)
                 return be->srv_bck;
 }
 
+/* Returns true if <be> backend can be used as target to a switching rules. */
+static inline int be_is_eligible(const struct proxy *be)
+{
+	/* A disabled or unpublished backend cannot be selected for traffic.
+	 * Note that STOPPED state is ignored as there is a risk of breaking
+	 * requests during soft-stop.
+	 */
+	return !(be->flags & (PR_FL_DISABLED|PR_FL_BE_UNPUBLISHED));
+}
+
 /* set the time of last session on the backend */
 static inline void be_set_sess_last(struct proxy *be)
 {
-	if (be->be_counters.shared.tg[tgid - 1])
-		HA_ATOMIC_STORE(&be->be_counters.shared.tg[tgid - 1]->last_sess, ns_to_sec(now_ns));
+	uint now_sec = ns_to_sec(now_ns);
+
+	if (be->be_counters.shared.tg)
+		if (HA_ATOMIC_LOAD(&be->be_counters.shared.tg[tgid - 1]->last_sess) != now_sec)
+			HA_ATOMIC_STORE(&be->be_counters.shared.tg[tgid - 1]->last_sess, now_sec);
 }
 
 /* This function returns non-zero if the designated server will be

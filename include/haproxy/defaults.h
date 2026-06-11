@@ -34,6 +34,7 @@
 
 #define MAX_TGROUPS 1
 #define MAX_THREADS_PER_GROUP 1
+#define DEF_MAX_THREADS_PER_GROUP 1
 
 #else
 
@@ -49,7 +50,16 @@
 
 #define MAX_THREADS_PER_GROUP __WORDSIZE
 
-/* threads enabled, max_threads defaults to long bits for 1 tgroup or 4 times
+/* Default value for the maximum number of threads per group. Thread counts
+ * beyond this value will induce the creation of new thread groups and thus
+ * limit contention on highly accessed areas. The value may be changed between
+ * 1 and MAX_THREADS_PER_GROUP via the global "max-threads-per-group" setting.
+ */
+#ifndef DEF_MAX_THREADS_PER_GROUP
+#define DEF_MAX_THREADS_PER_GROUP 16
+#endif
+
+/* threads enabled, max_threads defaults to long bits for 1 tgroup or 16 times
  * long bits if more tgroups are enabled.
  */
 #ifndef MAX_THREADS
@@ -536,6 +546,11 @@
 #define TIME_STATS_SAMPLES 512
 #endif
 
+/* number of samples used to measure the load in the run queue */
+#ifndef RQ_LOAD_SAMPLES
+#define RQ_LOAD_SAMPLES 512
+#endif
+
 /* max ocsp cert id asn1 encoded length */
 #ifndef OCSP_MAX_CERTID_ASN1_LENGTH
 #define OCSP_MAX_CERTID_ASN1_LENGTH 128
@@ -601,7 +616,7 @@
  * store stats.
  */
 #ifndef MEMPROF_HASH_BITS
-# define MEMPROF_HASH_BITS 10
+# define MEMPROF_HASH_BITS 12
 #endif
 #define MEMPROF_HASH_BUCKETS (1U << MEMPROF_HASH_BITS)
 

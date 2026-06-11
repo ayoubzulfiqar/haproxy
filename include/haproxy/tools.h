@@ -466,6 +466,13 @@ char *escape_string(char *start, char *stop,
 		    const char escape, const long *map,
 		    const char *string, const char *string_stop);
 
+/*
+ * Appends a quoted and escaped string to a chunk buffer. The string is
+ * enclosed in double quotes and special characters are escaped with backslash.
+ * Returns 0 on success, -1 if the buffer is too small (output is rolled back).
+ */
+int chunk_escape_string(struct buffer *chunk, const char *str, size_t len);
+
 /* Below are RFC8949 compliant cbor encode helper functions, see source
  * file for functions descriptions
  */
@@ -819,7 +826,7 @@ static inline int get_addr_len(const struct sockaddr_storage *addr)
 	return 0;
 }
 
-/* set port in host byte order */
+/* set port in network byte order (use htons() before calling) */
 static inline int set_net_port(struct sockaddr_storage *addr, int port)
 {
 	switch (addr->ss_family) {
@@ -833,7 +840,7 @@ static inline int set_net_port(struct sockaddr_storage *addr, int port)
 	return 0;
 }
 
-/* set port in network byte order */
+/* set port in host byte order */
 static inline int set_host_port(struct sockaddr_storage *addr, int port)
 {
 	switch (addr->ss_family) {
@@ -1140,10 +1147,15 @@ void dump_hex(struct buffer *out, const char *pfx, const void *buf, int len, int
 int may_access(const void *ptr);
 const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *addr);
 const void *resolve_dso_name(struct buffer *buf, const char *pfx, const void *addr);
+void make_tar_header(char *output, const char *pfx, const char *fname, const char *link, size_t size, mode_t mode);
+int load_file_into_tar(char **storage, size_t *size, const char *pfx, const char *fname, const char *input, const char *link);
 const char *get_exec_path(void);
 void *get_sym_curr_addr(const char *name);
 void *get_sym_next_addr(const char *name);
 int dump_libs(struct buffer *output, int with_addr);
+void collect_libs(void);
+void free_collected_libs(void);
+int copy_libs_to_file(void);
 
 /* Note that this may result in opening libgcc() on first call, so it may need
  * to have been called once before chrooting.
@@ -1278,11 +1290,27 @@ static inline void _ha_aligned_free(void *ptr)
 int parse_dotted_uints(const char *s, unsigned int **nums, size_t *sz);
 
 /* PRNG */
+struct uint64_pair _ha_random64_pair_hashed(void);
+
 void ha_generate_uuid_v4(struct buffer *output);
 void ha_generate_uuid_v7(struct buffer *output);
 void ha_random_seed(const unsigned char *seed, size_t len);
-void ha_random_jump96(uint32_t dist);
+void ha_random_seed_thread(void);
+void ha_random_jump128(uint32_t dist);
+void ha_random_jump192(uint32_t dist);
 uint64_t ha_random64(void);
+uint64_t ha_random64_internal(void);
+
+/* Returns a pair of uint64_t randoms hashed so as not to disclose the internal
+ * PRNG state.
+ */
+static inline void ha_random64_pair_hashed(uint64_t *l, uint64_t *h)
+{
+	struct uint64_pair ret = _ha_random64_pair_hashed();
+
+	*l = ret.l;
+	*h = ret.h;
+}
 
 static inline uint32_t ha_random32()
 {
@@ -1317,6 +1345,62 @@ static inline uint statistical_prng_range(uint range)
 	return mul32hi(statistical_prng(), range ? range - 1 : 0);
 }
 
+/* The functions below are used to hash one or two pointers together and reduce
+ * the result to fit into a given number of bits. The first part is made of a
+ * multiplication (and possibly an addition) by one or two prime numbers giving
+ * a 64-bit number whose center bits are the most distributed, and the second
+ * part will reuse this value and return a mix of the most variable bits that
+ * fits in the requested size. The most convenient approach is to directly
+ * call ptr_hash() / ptr2_hash(), though for some specific use cases where a
+ * second value could be useful, one may prefer to call the lower level
+ * operations instead.
+ */
+
+/* reduce a 64-bit pointer hash to <bits> bits */
+static forceinline uint _ptr_hash_reduce(unsigned long long x, const int bits)
+{
+	if (!bits)
+		return 0;
+
+	if (sizeof(long) == 4)
+		x ^= x >> 32;
+	else
+		x >>= 31 - (bits + 1) / 2;
+	return x & (~0U >> (-bits & 31));
+}
+
+/* single-pointer version, low-level, use ptr_hash() instead */
+static forceinline ullong _ptr_hash(const void *p)
+{
+	unsigned long long x = (unsigned long)p;
+
+	x *= 0xacd1be85U;
+	return x;
+}
+
+/* two-pointer version, low-level, use ptr2_hash() instead */
+static forceinline ullong _ptr2_hash(const void *p1, const void *p2)
+{
+	unsigned long long x = (unsigned long)p1;
+	unsigned long long y = (unsigned long)p2;
+
+	x *= 0xacd1be85U;
+	y *= 0x9d28e4e9U;
+	return x ^ y;
+}
+
+/* two-pointer plus arg version, low-level, use ptr2_hash_arg() instead */
+static forceinline ullong _ptr2_hash_arg(const void *p1, const void *p2, ulong arg)
+{
+	unsigned long long x = (unsigned long)p1;
+	unsigned long long y = (unsigned long)p2;
+
+	x *= 0xacd1be85U;
+	x += arg;
+	y *= 0x9d28e4e9U;
+	return x ^ y;
+}
+
 /* returns a hash on <bits> bits of pointer <p> that is suitable for being used
  * to compute statistic buckets, in that it's fast and reasonably distributed
  * thanks to mixing the bits via a multiplication by a prime number and using
@@ -1330,17 +1414,7 @@ static inline uint statistical_prng_range(uint range)
  */
 static forceinline uint ptr_hash(const void *p, const int bits)
 {
-	unsigned long long x = (unsigned long)p;
-
-	if (!bits)
-		return 0;
-
-	x *= 0xacd1be85U;
-	if (sizeof(long) == 4)
-		x ^= x >> 32;
-	else
-		x >>= 31 - (bits + 1) / 2;
-	return x & (~0U >> (-bits & 31));
+	return _ptr_hash_reduce(_ptr_hash(p), bits);
 }
 
 /* Same as above but works on two pointers. It will return the same values
@@ -1348,20 +1422,15 @@ static forceinline uint ptr_hash(const void *p, const int bits)
  */
 static forceinline uint ptr2_hash(const void *p1, const void *p2, const int bits)
 {
-	unsigned long long x = (unsigned long)p1;
-	unsigned long long y = (unsigned long)p2;
+	return _ptr_hash_reduce(_ptr2_hash(p1, p2), bits);
+}
 
-	if (!bits)
-		return 0;
-
-	x *= 0xacd1be85U;
-	y *= 0x9d28e4e9U;
-	x ^= y;
-	if (sizeof(long) == 4)
-		x ^= x >> 32;
-	else
-		x >>= 33 - bits / 2;
-	return x & (~0U >> (-bits & 31));
+/* Same as above but works on two pointers and a long argument. It will return
+ * the same values if the second pointer is NULL.
+ */
+static forceinline uint ptr2_hash_arg(const void *p1, const void *p2, ulong arg, const int bits)
+{
+	return _ptr_hash_reduce(_ptr2_hash_arg(p1, p2, arg), bits);
 }
 
 
@@ -1489,5 +1558,15 @@ static inline const char *errname(int err_num, char **out)
 int path_base(const char *path, const char *base, char *dst, char **err);
 
 void ha_freearray(char ***array);
+
+void ha_memset_s(void *s, int c, size_t n);
+
+void chunk_append_thread_ctx(struct buffer *output, const struct thread_exec_ctx *ctx, const char *pfx, const char *sfx);
+
+static inline int net_addr_type_is_quic(struct net_addr_type *type)
+{
+	return type->proto_type == PROTO_TYPE_DGRAM &&
+	       type->xprt_type == PROTO_TYPE_STREAM;
+}
 
 #endif /* _HAPROXY_TOOLS_H */

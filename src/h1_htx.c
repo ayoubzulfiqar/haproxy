@@ -79,6 +79,16 @@ static int h1_process_req_vsn(struct h1m *h1m, union h1_sl *sl)
 		sl->rq.v = ist("HTTP/1.0");
 		return 1;
 	}
+	else {
+		if (sl->rq.v.len != 8 ||
+		    !istnmatch(sl->rq.v, ist("HTTP/"), 5) ||
+		    !isdigit((unsigned char)*(sl->rq.v.ptr + 5)) ||
+		    *(sl->rq.v.ptr + 6) != '.' ||
+		    !isdigit((unsigned char)*(sl->rq.v.ptr + 7))) {
+			h1m->flags |= H1_MF_NOT_HTTP;
+			return 1;
+		}
+	}
 
 	if ((sl->rq.v.len == 8) &&
 	    ((*(sl->rq.v.ptr + 5) > '1') ||
@@ -100,11 +110,21 @@ static int h1_process_res_vsn(struct h1m *h1m, union h1_sl *sl)
 		if (sl->st.v.len != 8)
 			return 0;
 
-		if (*(sl->st.v.ptr + 4) != '/' ||
+		if (!istnmatch(sl->st.v, ist("HTTP/"), 5) ||
 		    !isdigit((unsigned char)*(sl->st.v.ptr + 5)) ||
 		    *(sl->st.v.ptr + 6) != '.' ||
 		    !isdigit((unsigned char)*(sl->st.v.ptr + 7)))
 			return 0;
+	}
+	else {
+		if (sl->st.v.len != 8 ||
+		    !istnmatch(sl->st.v, ist("HTTP/"), 5) ||
+		    !isdigit((unsigned char)*(sl->st.v.ptr + 5)) ||
+		    *(sl->st.v.ptr + 6) != '.' ||
+		    !isdigit((unsigned char)*(sl->st.v.ptr + 7))) {
+			h1m->flags |= H1_MF_NOT_HTTP;
+			return 1;
+		}
 	}
 
 	if ((sl->st.v.len == 8) &&
@@ -124,6 +144,8 @@ static unsigned int h1m_htx_sl_flags(struct h1m *h1m)
 		flags |= HTX_SL_F_IS_RESP;
 	if (h1m->flags & H1_MF_VER_11)
 		flags |= HTX_SL_F_VER_11;
+	if (h1m->flags & H1_MF_NOT_HTTP)
+		flags |= HTX_SL_F_NOT_HTTP;
 	if (h1m->flags & H1_MF_XFER_ENC)
 		flags |= HTX_SL_F_XFER_ENC;
 	if (h1m->flags & H1_MF_XFER_LEN) {
@@ -140,6 +162,8 @@ static unsigned int h1m_htx_sl_flags(struct h1m *h1m)
 	}
 	if (h1m->flags & H1_MF_CONN_UPG)
 		flags |= HTX_SL_F_CONN_UPG;
+	if (h1m->flags & H1_MF_UPG_HDR)
+		flags |= HTX_SL_F_UPG_HDR;
 	return flags;
 }
 
@@ -191,21 +215,32 @@ static int h1_postparse_req_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx 
 		}
 	}
 
-	flags |= h1m_htx_sl_flags(h1m);
-
-	/* Remove Upgrade header in problematic cases :
-	 * - "h2c" or "h2" token specified as token
-	 */
-	if ((h1m->flags & (H1_MF_CONN_UPG|H1_MF_UPG_H2C)) == (H1_MF_CONN_UPG|H1_MF_UPG_H2C)) {
+	/* Remove Upgrade header if no 'connection: upgrade' found */
+	if ((h1m->flags & (H1_MF_CONN_UPG|H1_MF_UPG_HDR)) == H1_MF_UPG_HDR) {
 		int i;
 
 		for (i = 0; hdrs[i].n.len; i++) {
 			if (isteqi(hdrs[i].n, ist("upgrade")))
 				hdrs[i].v = IST_NULL;
 		}
-		h1m->flags &=~ H1_MF_CONN_UPG;
-		flags &= ~HTX_SL_F_CONN_UPG;
+		h1m->flags &=~ (H1_MF_CONN_UPG|H1_MF_UPG_HDR);
 	}
+
+	/* Remove 'Upgrade' value from connection header if not Upgrade header found */
+	if ((h1m->flags & (H1_MF_CONN_UPG|H1_MF_UPG_HDR)) == H1_MF_CONN_UPG) {
+		int i;
+
+		for (i = 0; hdrs[i].n.len; i++) {
+			if (isteqi(hdrs[i].n, ist("connection"))) {
+				http_remove_header_value(&hdrs[i].v, ist("upgrade"));
+				if (!istlen(hdrs[i].v))
+					hdrs[i].v = IST_NULL;
+			}
+		}
+		h1m->flags &=~ (H1_MF_CONN_UPG|H1_MF_UPG_HDR);
+	}
+
+	flags |= h1m_htx_sl_flags(h1m);
 
 	sl = htx_add_stline(htx, HTX_BLK_REQ_SL, flags, meth, uri, vsn);
 	if (!sl || !htx_add_all_headers(htx, hdrs))
@@ -378,7 +413,7 @@ int h1_parse_msg_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx *dsthtx,
 	if (!max || !b_data(srcbuf))
 		goto end;
 
-	/* Realing input buffer if necessary */
+	/* Realign input buffer if necessary */
 	if (b_head(srcbuf) + b_data(srcbuf) > b_wrap(srcbuf))
 		b_slow_realign_ofs(srcbuf, trash.area, 0);
 
@@ -464,9 +499,10 @@ static size_t h1_copy_msg_data(struct htx **dsthtx, struct buffer *srcbuf, size_
 	 *   - count == srcbuf->data
 	 *   - srcbuf->head == sizeof(struct htx)
 	 *   => we can swap the buffers and place an htx header into
-	 *      the target buffer instead
+	 *      the target buffer instead (for buffers of same size)
 	 */
-	if (unlikely(htx_is_empty(tmp_htx) && count == b_data(srcbuf) &&
+	if (unlikely(b_size(srcbuf) == b_size(htxbuf) &&
+		     htx_is_empty(tmp_htx) && count == b_data(srcbuf) &&
 		     !ofs && b_head_ofs(srcbuf) == sizeof(struct htx))) {
 		void *raw_area = srcbuf->area;
 		void *htx_area = htxbuf->area;
@@ -724,14 +760,42 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 				break;
 			}
 			else if (likely(end[ridx] == ';')) {
+				int backslash = 0;
+				int quote = 0;
+
 				/* chunk extension, ends at next CRLF */
 				if (!++ridx)
 					goto end_parsing;
-				while (!HTTP_IS_CRLF(end[ridx])) {
+
+				/* The loop seeks the first CRLF or non-tab CTL char
+				 * and stops there. If a backslash/quote is active,
+				 * it's an error. If none, we assume it's the CRLF
+				 * and go back to the top of the loop checking for
+				 * CR then LF. This way CTLs, lone LF etc are handled
+				 * in the fallback path. This allows to protect
+				 * remotes against their own possibly non-compliant
+				 * chunk-ext parser which could mistakenly skip a
+				 * quoted CRLF. Chunk-ext are not used anyway, except
+				 * by attacks.
+				 */
+				while (!HTTP_IS_CTL(end[ridx]) || HTTP_IS_SPHT(end[ridx])) {
+					if (backslash)
+						backslash = 0; // escaped char
+					else if (end[ridx] == '\\' && quote)
+						backslash = 1;
+					else if (end[ridx] == '\\') // backslash not permitted outside quotes
+						goto parsing_error;
+					else if (end[ridx] == '"')  // begin/end of quoted-pair
+						quote = !quote;
 					if (!++ridx)
 						goto end_parsing;
 				}
-				/* we have a CRLF now, loop above */
+
+				/* mismatched quotes / backslashes end here */
+				if (quote || backslash)
+					goto parsing_error;
+
+				/* CTLs (CRLF) fall to the common check */
 				continue;
 			}
 			else {
@@ -795,6 +859,7 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 
   parsing_error:
 	(*dsthtx)->flags |= HTX_FL_PARSING_ERROR;
+	htx_remove_blk(*dsthtx, htxret.blk);
 	h1m->err_state = h1m->state;
 	h1m->err_pos = ofs + end + ridx - start;
 	return 0;
@@ -1106,7 +1171,7 @@ int h1_format_htx_data(const struct ist data, struct buffer *chk, int chunked)
 }
 
 /* Format the htx message into its H1 representation. It returns 1 on success or
- * 0 if <outbuf> is full or not emtpy. No check are preformed on the message, it must be
+ * 0 if <outbuf> is full or not empty. No check is performed on the message, it must be
  * valid. Trailers are silently ignored if the message is not chunked.
  */
 int h1_format_htx_msg(const struct htx *htx, struct buffer *outbuf)

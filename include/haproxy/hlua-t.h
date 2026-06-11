@@ -222,6 +222,7 @@ struct hlua_proxy_list {
 };
 
 struct hlua_proxy_list_iterator_context {
+	struct watcher px_watch; /* watcher to automatically update next pointer on backend deletion */
 	struct proxy *next;
 	char capabilities;
 };
@@ -255,6 +256,12 @@ struct hlua_patref_iterator_context {
 	struct hlua_patref *ref;
 	struct bref bref;       /* back-reference from the pat_ref_elt being accessed
 	                         * during listing */
+	struct pat_ref_gen *gen; /* the generation we are iterating over */
+};
+
+struct hlua_state_init_fct {
+	struct list list;
+	int (*fct)(lua_State *L, char **errmsg);
 };
 
 #else /* USE_LUA */

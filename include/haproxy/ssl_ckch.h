@@ -48,6 +48,17 @@ struct ckch_store *ckch_store_new(const char *filename);
 void ckch_store_free(struct ckch_store *store);
 void ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckchs);
 int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, int cli, const char *file, int linenum, char **err);
+int ckch_store_create(char *path, char **err);
+int ckch_store_load_payload(char *path, char *payload, char **err);
+int ckch_store_rebuild_instances(struct ckch_store *old_ckchs, struct ckch_store *new_ckchs,
+                                 struct ckch_inst **ckchi, int max, int *count, char **err);
+
+int ckch_store_update_init(char *path, struct ckch_store **old_ckchs,
+                           struct ckch_store **new_ckchs, char **err);
+int ckch_store_update_process(struct ckch_store **old_ckchs, struct ckch_store **new_ckchs,
+                              struct ckch_inst **ckchi, int *state,
+                              struct buffer *msg, char **err);
+void ckch_store_update_cleanup(struct ckch_store *new_ckchs);
 
 /* ckch_conf functions */
 
@@ -80,9 +91,11 @@ void ssl_store_delete_cafile_entry(struct cafile_entry *ca_e);
 int ssl_store_load_ca_from_buf(struct cafile_entry *ca_e, char *cert_buf, int append);
 int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_type type);
 int __ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_type type, int shuterror);
+const char *ha_default_cert_dir();
 
 extern struct cert_exts cert_exts[];
 extern int (*ssl_commit_crlfile_cb)(const char *path, X509_STORE *ctx, char **err);
+extern char current_crtstore_name[];
 
 /*
  * ckch_conf keywords loading

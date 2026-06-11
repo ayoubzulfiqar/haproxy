@@ -34,6 +34,7 @@
 #include <haproxy/listener-t.h>
 #include <haproxy/obj_type.h>
 #include <haproxy/pool-t.h>
+#include <haproxy/protocol.h>
 #include <haproxy/server.h>
 #include <haproxy/session-t.h>
 #include <haproxy/task-t.h>
@@ -48,6 +49,13 @@ extern struct mux_proto_list mux_proto_list;
 extern struct mux_stopping_data mux_stopping_data[MAX_THREADS];
 
 #define IS_HTX_CONN(conn) ((conn)->mux && ((conn)->mux->flags & MX_FL_HTX))
+
+/* macros to switch the calling context to the mux during a call. There's one
+ * with a return value for most calls, and one without for the few like shut(),
+ * detach() or destroy() with no return.
+ */
+#define CALL_MUX_WITH_RET(mux, func) EXEC_CTX_WITH_RET(EXEC_CTX_MAKE(TH_EX_CTX_MUX, (mux)), (mux)->func)
+#define CALL_MUX_NO_RET(mux, func)   EXEC_CTX_NO_RET(EXEC_CTX_MAKE(TH_EX_CTX_MUX, (mux)), (mux)->func)
 
 /* receive a PROXY protocol header over a connection */
 int conn_recv_proxy(struct connection *conn, int flag);
@@ -78,7 +86,10 @@ int conn_create_mux(struct connection *conn, int *closed_connection);
 int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake);
 int conn_upgrade_mux_fe(struct connection *conn, void *ctx, struct buffer *buf,
                         struct ist mux_proto, int mode);
+const struct mux_proto_list *conn_select_mux_fe(const struct connection *conn);
 int conn_install_mux_fe(struct connection *conn, void *ctx);
+
+const struct mux_proto_list *conn_select_mux_be(const struct connection *conn);
 int conn_install_mux_be(struct connection *conn, void *ctx, struct session *sess,
                         const struct mux_ops *force_mux_ops);
 int conn_install_mux_chk(struct connection *conn, void *ctx, struct session *sess);
@@ -103,6 +114,7 @@ int conn_reverse(struct connection *conn);
 const char *conn_err_code_name(struct connection *c);
 const char *conn_err_code_str(struct connection *c);
 int xprt_add_hs(struct connection *conn);
+int xprt_add_l6hs(struct connection *conn, int xprt);
 void register_mux_proto(struct mux_proto_list *list);
 
 static inline void conn_report_term_evt(struct connection *conn, enum term_event_loc loc, unsigned char type);
@@ -480,12 +492,70 @@ static inline int conn_install_mux(struct connection *conn, const struct mux_ops
 
 	conn->mux = mux;
 	conn->ctx = ctx;
-	ret = mux->init ? mux->init(conn, prx, sess, &BUF_NULL) : 0;
+	ret = mux->init ? CALL_MUX_WITH_RET(mux, init(conn, prx, sess, &BUF_NULL)) : 0;
 	if (ret < 0) {
 		conn->mux = NULL;
 		conn->ctx = NULL;
 	}
 	return ret;
+}
+
+/* Calculates the approximate number of streams permitted for an already
+ * established frontend connection based on the number of active connections
+ * (including this one), the number of already committed streams in the current
+ * thread group, the limit, and the desired limit (a ratio of which will be
+ * applied as the budget permits). May return 0 for no limit. The minimum value
+ * when a limit is set will be 1 as a minimum.
+ */
+static inline uint conn_calc_max_streams(uint desired)
+{
+	uint per_conn_left;
+	uint avg_per_conn;
+	uint conn_curr;
+	int conn_left;
+	uint extra;
+	uint curr;
+
+	/* check for infinite */
+	if (!global.tune.streams_elasticity)
+		return 0;
+
+	/* check for none (0% overcommit) */
+	if (global.tune.streams_elasticity == 100)
+		return 1;
+
+	if (desired <= 1)
+		return 1;
+
+	conn_curr = _HA_ATOMIC_LOAD(&actconn) - 1;
+	conn_left = global.hardmaxconn - conn_curr;
+	if (conn_left <= 0)
+		return 1;
+
+	/* the limit is per process, we're working per group. Since we're
+	 * counting extra streams max, we subtract 100% from elasticity.
+	 */
+	extra = (((ullong)global.hardmaxconn * (global.tune.streams_elasticity - 100) / 100));
+	curr = _HA_ATOMIC_LOAD(&tg_ctx->committed_extra_streams) * global.nbtgroups;
+	if (curr >= extra)
+		return 1;
+
+	/* this is the average per conn left that we can allocate */
+	per_conn_left = ((extra - curr) + conn_left - 1) / conn_left;
+
+	/* OK so we know we can still allocate (extra - curr) streams per
+	 * tgroup, that will be shared across conn_left connections, but ought
+	 * to be fairly shared between all conn_curr ones. This allows to
+	 * provide at least up to <desired> as long as we leave enough for all
+	 * remaining connections left.
+	 */
+	avg_per_conn = ((ullong)(extra - curr) * (desired - 1)) / extra;
+
+	/* both values are permitted since they respect the global limit,
+	 * so let's deliver the best option to better serve first conns
+	 * so that the limit degrades smoothly with the number of conns.
+	 */
+	return 1 + MAX(per_conn_left, avg_per_conn);
 }
 
 /* Retrieves any valid stream connector from this connection, preferably the first
@@ -583,7 +653,7 @@ static inline struct mux_proto_list *get_mux_proto(const struct ist proto)
 	struct mux_proto_list *item;
 
 	list_for_each_entry(item, &mux_proto_list.list, list) {
-		if (isteq(proto, item->token))
+		if (isteq(proto, item->mux_proto))
 			return item;
 	}
 	return NULL;
@@ -602,17 +672,23 @@ void list_mux_proto(FILE *out);
  */
 static inline const struct mux_proto_list *conn_get_best_mux_entry(
         const struct ist mux_proto,
-        int proto_side, int proto_mode)
+        const struct ist alpn,
+        int proto_side, int proto_is_quic, int proto_mode)
 {
 	struct mux_proto_list *item;
 	struct mux_proto_list *fallback = NULL;
 
 	list_for_each_entry(item, &mux_proto_list.list, list) {
-		if (!(item->side & proto_side) || !(item->mode & proto_mode))
+		if (!(item->side & proto_side) || !(item->mode & proto_mode) || ((proto_is_quic != 0) != ((item->mux->flags & MX_FL_FRAMED) != 0)))
 			continue;
-		if (istlen(mux_proto) && isteq(mux_proto, item->token))
+		if (istlen(mux_proto) && isteq(mux_proto, item->mux_proto)) {
 			return item;
-		else if (!istlen(item->token)) {
+		}
+		else if (istlen(alpn) && item->alpn &&
+		    strlen(item->alpn) == istlen(alpn) + 1 &&
+		    !memcmp(alpn.ptr, item->alpn + 1, istlen(alpn)))
+			return item;
+		else if (!istlen(item->mux_proto)) {
 			if (!fallback || (item->mode == proto_mode && fallback->mode != proto_mode))
 				fallback = item;
 		}
@@ -629,11 +705,12 @@ static inline const struct mux_proto_list *conn_get_best_mux_entry(
  */
 static inline const struct mux_ops *conn_get_best_mux(struct connection *conn,
 						      const struct ist mux_proto,
+						      const struct ist alpn,
 						      int proto_side, int proto_mode)
 {
 	const struct mux_proto_list *item;
 
-	item = conn_get_best_mux_entry(mux_proto, proto_side, proto_mode);
+	item = conn_get_best_mux_entry(mux_proto, alpn, proto_side, proto_is_quic(conn->ctrl), proto_mode);
 
 	return item ? item->mux : NULL;
 }
@@ -681,6 +758,12 @@ static inline struct ssl_sock_ctx *conn_get_ssl_sock_ctx(struct connection *conn
 static inline int conn_is_ssl(struct connection *conn)
 {
 	return !!conn_get_ssl_sock_ctx(conn);
+}
+
+/* Returns true if connection runs over QUIC. */
+static inline int conn_is_quic(const struct connection *conn)
+{
+	return conn->flags & CO_FL_FDLESS;
 }
 
 /* Returns true if connection must be reversed. */

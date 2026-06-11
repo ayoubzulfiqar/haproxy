@@ -51,7 +51,7 @@
 
 /* declare a self-initializing spinlock, aligned on a cache line */
 #define __decl_aligned_spinlock(lock)                          \
-	HA_SPINLOCK_T (lock) __attribute__((aligned(64))) = 0;
+	HA_SPINLOCK_T (lock) ALIGNED(64) = 0;
 
 /* declare a self-initializing rwlock */
 #define __decl_rwlock(lock)                                    \
@@ -59,7 +59,7 @@
 
 /* declare a self-initializing rwlock, aligned on a cache line */
 #define __decl_aligned_rwlock(lock)                            \
-	HA_RWLOCK_T   (lock) __attribute__((aligned(64))) = 0;
+	HA_RWLOCK_T   (lock) ALIGNED(64) = 0;
 
 #else /* !USE_THREAD */
 
@@ -72,7 +72,7 @@
 
 /* declare a self-initializing spinlock, aligned on a cache line */
 #define __decl_aligned_spinlock(lock)                       \
-	HA_SPINLOCK_T (lock) __attribute__((aligned(64)));  \
+	HA_SPINLOCK_T (lock) THREAD_ALIGNED();              \
 	INITCALL1(STG_LOCK, ha_spin_init, &(lock))
 
 /* declare a self-initializing rwlock */
@@ -82,7 +82,7 @@
 
 /* declare a self-initializing rwlock, aligned on a cache line */
 #define __decl_aligned_rwlock(lock)                         \
-	HA_RWLOCK_T   (lock) __attribute__((aligned(64)));  \
+	HA_RWLOCK_T   (lock) THREAD_ALIGNED();              \
 	INITCALL1(STG_LOCK, ha_rwlock_init, &(lock))
 
 #endif /* USE_THREAD */
@@ -217,6 +217,7 @@ enum lock_label {
 	QC_CID_LOCK,
 	CACHE_LOCK,
 	GUID_LOCK,
+	PROXIES_DEL_LOCK,
 	OTHER_LOCK,
 	/* WT: make sure never to use these ones outside of development,
 	 * we need them for lock profiling!

@@ -107,18 +107,32 @@ struct pat_ref {
 	struct list list; /* Used to chain refs. */
 	char *reference; /* The reference name. */
 	char *display; /* String displayed to identify the pattern origin. */
-	struct list head; /* The head of the list of struct pat_ref_elt. */
-	struct ceb_root *ceb_root; /* The tree where pattern reference elements are attached. */
+	struct ceb_root *gen_root; /* The tree mapping generation IDs to pattern reference elements */
 	struct list pat; /* The head of the list of struct pattern_expr. */
 	unsigned int flags; /* flags PAT_REF_*. */
 	unsigned int curr_gen; /* current generation number (anything below can be removed) */
 	unsigned int next_gen; /* next generation number (insertions use this one) */
+	/* We keep a cached pointer to the current generation for performance. */
+	struct {
+		struct pat_ref_gen *data;
+		unsigned int id;
+	} cached_gen;
 	int unique_id; /* Each pattern reference have unique id. */
 	unsigned long long revision; /* updated for each update */
 	unsigned long long entry_cnt; /* the total number of entries */
-	THREAD_ALIGN(64);
+	THREAD_ALIGN();
 	__decl_thread(HA_RWLOCK_T lock); /* Lock used to protect pat ref elements */
 	event_hdl_sub_list e_subs;       /* event_hdl: pat_ref's subscribers list (atomically updated) */
+};
+
+/* This struct represents all the elements in a pattern reference generation. The tree
+ * is used most of the time, but we also maintain a list for when order matters.
+ */
+struct pat_ref_gen {
+	struct list head; /* The head of the list of struct pat_ref_elt. */
+	struct ceb_root *elt_root; /* The tree where pattern reference elements are attached. */
+	struct ceb_node gen_node; /* Linkage for the gen_root cebtree in struct pat_ref */
+	unsigned int gen_id;
 };
 
 /* This is a part of struct pat_ref. Each entry contains one pattern and one
@@ -133,7 +147,7 @@ struct pat_ref_elt {
 	char *sample;
 	unsigned int gen_id; /* generation of pat_ref this was made for */
 	int line;
-	struct ceb_node node; /* Node to attach this element to its <pat_ref> ebtree. */
+	struct ceb_node node; /* Node to attach this element to its <pat_ref_gen> cebtree. */
 	const char pattern[0]; // const only to make sure nobody tries to free it.
 };
 

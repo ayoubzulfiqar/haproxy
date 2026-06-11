@@ -374,7 +374,7 @@ static int secondary_key_cmp(const char *ref_key, const char *new_key)
  * delete_expired==0, write otherwise.
  */
 struct cache_entry *get_secondary_entry(struct cache_tree *cache, struct cache_entry *entry,
-                                        const char *secondary_key, int delete_expired)
+                                        const char *primary_hash, const char *secondary_key, int delete_expired)
 {
 	struct eb32_node *node = &entry->eb;
 
@@ -394,6 +394,12 @@ struct cache_entry *get_secondary_entry(struct cache_tree *cache, struct cache_e
 
 		entry = node ? eb32_entry(node, struct cache_entry, eb) : NULL;
 	}
+
+	/* Now verify the full primary hash matches: eb32 only compares 32 bits so
+	 * we could have ended up on a different, unrelated entry.
+	 */
+	if (entry && primary_hash && memcmp(entry->hash, primary_hash, sizeof(entry->hash)))
+		entry = NULL;
 
 	/* Expired entry */
 	if (entry && entry->expire <= date.tv_sec) {
@@ -626,7 +632,7 @@ cache_store_check(struct proxy *px, struct flt_conf *fconf)
 				return 1;
 			}
 		}
-		else if (f->id == http_comp_flt_id)
+		else if (f->id == http_comp_req_flt_id || f->id == http_comp_res_flt_id)
 			comp = 1;
 		else if (f->id == fcgi_flt_id)
 			continue;
@@ -694,7 +700,7 @@ static int
 cache_store_post_analyze(struct stream *s, struct filter *filter, struct channel *chn,
 			 unsigned an_bit)
 {
-	struct http_txn *txn = s->txn;
+	struct http_txn *txn = s->txn.http;
 	struct http_msg *msg = &txn->rsp;
 	struct cache_st *st = filter->ctx;
 
@@ -755,7 +761,6 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 	struct htx_blk *blk;
 	struct shared_block *fb;
 	struct htx_ret htxret;
-	size_t data_len = 0;
 	unsigned int orig_len, to_forward;
 	int ret;
 
@@ -767,7 +772,6 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 		return len;
 	}
 
-	chunk_reset(&trash);
 	orig_len = len;
 	to_forward = 0;
 
@@ -789,10 +793,17 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 				v = isttrim(v, len);
 
 				info = (type << 28) + v.len;
-				chunk_memcat(&trash, (char *)&info, sizeof(info));
-				chunk_istcat(&trash, v);
+				fb = shctx_row_reserve_hot(shctx, st->first_block, sizeof(info)+v.len);
+				if (!fb)
+					goto no_cache;
+				ret = shctx_row_data_append(shctx, st->first_block, (unsigned char *)&info, sizeof(info));
+				if (ret < 0)
+					goto no_cache;
+				ret = shctx_row_data_append(shctx, st->first_block, (unsigned char *)istptr(v), istlen(v));
+				if (ret < 0)
+					goto no_cache;
+				ASSUME_NONNULL((struct cache_entry *)st->first_block->data)->body_size += v.len;
 				to_forward += v.len;
-				data_len += v.len;
 				len -= v.len;
 				break;
 
@@ -804,8 +815,15 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 				if (sz > len)
 					goto end;
 
-				chunk_memcat(&trash, (char *)&blk->info, sizeof(blk->info));
-				chunk_memcat(&trash, htx_get_blk_ptr(htx, blk), sz);
+				fb = shctx_row_reserve_hot(shctx, st->first_block, sizeof(blk->info)+sz);
+				if (!fb)
+					goto no_cache;
+				ret = shctx_row_data_append(shctx, st->first_block, (unsigned char *)&(blk->info), sizeof(blk->info));
+				if (ret < 0)
+					goto no_cache;
+				ret = shctx_row_data_append(shctx, st->first_block, (unsigned char *)htx_get_blk_ptr(htx, blk), sz);
+				if (ret < 0)
+					goto no_cache;
 				to_forward += sz;
 				len -= sz;
 				break;
@@ -815,18 +833,6 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 	}
 
   end:
-
-	fb = shctx_row_reserve_hot(shctx, st->first_block, trash.data);
-	if (!fb) {
-		goto no_cache;
-	}
-
-	ASSUME_NONNULL((struct cache_entry *)st->first_block->data)->body_size += data_len;
-	ret = shctx_row_data_append(shctx, st->first_block,
-				    (unsigned char *)b_head(&trash), b_data(&trash));
-	if (ret < 0)
-		goto no_cache;
-
 	return to_forward;
 
   no_cache:
@@ -943,8 +949,8 @@ int http_calc_maxage(struct stream *s, struct cache *cache, int *true_maxage)
 		if (value) {
 			struct buffer *chk = get_trash_chunk();
 
-			chunk_memcat(chk, value, ctx.value.len - 8 + 1);
-			chunk_memcat(chk, "", 1);
+			chunk_memcat(chk, value, ctx.value.len - (8 + 1));
+			*(b_tail(chk)) = '\0';
 			offset = (*chk->area == '"') ? 1 : 0;
 			smaxage = strtol(chk->area + offset, &endptr, 10);
 			if (unlikely(smaxage < 0 || endptr == chk->area + offset))
@@ -955,8 +961,8 @@ int http_calc_maxage(struct stream *s, struct cache *cache, int *true_maxage)
 		if (value) {
 			struct buffer *chk = get_trash_chunk();
 
-			chunk_memcat(chk, value, ctx.value.len - 7 + 1);
-			chunk_memcat(chk, "", 1);
+			chunk_memcat(chk, value, ctx.value.len - (7 + 1));
+			*(b_tail(chk)) = '\0';
 			offset = (*chk->area == '"') ? 1 : 0;
 			maxage = strtol(chk->area + offset, &endptr, 10);
 			if (unlikely(maxage < 0 || endptr == chk->area + offset))
@@ -1189,7 +1195,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 {
 	int effective_maxage = 0;
 	int true_maxage = 0;
-	struct http_txn *txn = s->txn;
+	struct http_txn *txn = s->txn.http;
 	struct http_msg *msg = &txn->rsp;
 	struct filter *filter;
 	struct shared_block *first = NULL;
@@ -1303,7 +1309,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	if (old) {
 		if (vary_signature)
 			old = get_secondary_entry(cache_tree, old,
-			                          txn->cache_secondary_hash, 1);
+			                          txn->cache_hash, txn->cache_secondary_hash, 1);
 		if (old) {
 			if (!old->complete) {
 				/* An entry with the same primary key is already being
@@ -1738,7 +1744,7 @@ static int htx_cache_add_age_hdr(struct appctx *appctx, struct htx *htx)
 		age = CACHE_ENTRY_MAX_AGE;
 	end = ultoa_o(age, b_head(&trash), b_size(&trash));
 	b_set_data(&trash, end - b_head(&trash));
-	if (!http_add_header(htx, ist("Age"), ist2(b_head(&trash), b_data(&trash))))
+	if (!http_add_header(htx, ist("Age"), ist2(b_head(&trash), b_data(&trash)), 0))
 		return 0;
 	return 1;
 }
@@ -1800,8 +1806,6 @@ static void http_cache_io_handler(struct appctx *appctx)
 	if (unlikely(applet_fl_test(appctx, APPCTX_FL_EOS|APPCTX_FL_ERROR))) {
 		goto exit;
 	}
-
-	res_htx = htx_from_buf(&appctx->outbuf);
 
 	len = first->len - sizeof(*cache_ptr) - ctx->sent;
 	res_htx = htx_from_buf(&appctx->outbuf);
@@ -1950,7 +1954,10 @@ static int parse_cache_rule(struct proxy *proxy, const char *name, struct act_ru
 	return 1;
 
   err:
-	free(cconf);
+	if (cconf) {
+		free(cconf->c.name);
+		free(cconf);
+	}
 	return 0;
 }
 
@@ -1972,7 +1979,7 @@ enum act_parse_ret parse_cache_store(const char **args, int *orig_arg, struct pr
  * if it begins with a slash ('/'). */
 int sha1_hosturi(struct stream *s)
 {
-	struct http_txn *txn = s->txn;
+	struct http_txn *txn = s->txn.http;
 	struct htx *htx = htxbuf(&s->req.buf);
 	struct htx_sl *sl;
 	struct http_hdr_ctx ctx;
@@ -2105,7 +2112,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
                                          struct session *sess, struct stream *s, int flags)
 {
 
-	struct http_txn *txn = s->txn;
+	struct http_txn *txn = s->txn.http;
 	struct cache_entry *res, *sec_entry = NULL;
 	struct cache_flt_conf *cconf = rule->arg.act.p[0];
 	struct cache *cache = cconf->c.cache;
@@ -2129,25 +2136,26 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 	if (!sha1_hosturi(s))
 		return ACT_RET_CONT;
 
-	if (s->txn->flags & TX_CACHE_IGNORE)
+	if (s->txn.http->flags & TX_CACHE_IGNORE)
 		return ACT_RET_CONT;
 
 	if (px == strm_fe(s)) {
-		if (px->fe_counters.shared.tg[tgid - 1])
+		if (px->fe_counters.shared.tg)
 			_HA_ATOMIC_INC(&px->fe_counters.shared.tg[tgid - 1]->p.http.cache_lookups);
 	}
 	else {
-		if (px->be_counters.shared.tg[tgid - 1])
+		if (px->be_counters.shared.tg)
 			_HA_ATOMIC_INC(&px->be_counters.shared.tg[tgid - 1]->p.http.cache_lookups);
 	}
 
-	cache_tree = get_cache_tree_from_hash(cache, read_u32(s->txn->cache_hash));
+	cache_tree = get_cache_tree_from_hash(cache,
+					      read_u32(s->txn.http->cache_hash));
 
 	if (!cache_tree)
 		return ACT_RET_CONT;
 
 	cache_rdlock(cache_tree);
-	res = get_entry(cache_tree, s->txn->cache_hash, 0);
+	res = get_entry(cache_tree, s->txn.http->cache_hash, 0);
 	/* We must not use an entry that is not complete but the check will be
 	 * performed after we look for a potential secondary entry (in case of
 	 * Vary). */
@@ -2176,8 +2184,20 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 			if (!http_request_build_secondary_key(s, res->secondary_key_signature)) {
 				cache_rdlock(cache_tree);
 				sec_entry = get_secondary_entry(cache_tree, res,
-				                                s->txn->cache_secondary_hash, 0);
-				if (sec_entry && sec_entry != res) {
+				                                s->txn.http->cache_hash,
+				                                s->txn.http->cache_secondary_hash,
+				                                0);
+				if (!sec_entry) {
+					/* Secondary key miss: release the retained primary entry
+					 * and reattach the detached row before returning.
+					 */
+					release_entry(cache_tree, res, 0);
+					shctx_wrlock(shctx);
+					if (detached)
+						shctx_row_reattach(shctx, entry_block);
+					shctx_wrunlock(shctx);
+				}
+				else if (sec_entry != res) {
 					/* The wrong row was added to the hot list. */
 					release_entry(cache_tree, res, 0);
 					retain_entry(sec_entry);
@@ -2226,11 +2246,11 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
                                 should_send_notmodified_response(cache, htxbuf(&s->req.buf), res);
 
 			if (px == strm_fe(s)) {
-				if (px->fe_counters.shared.tg[tgid - 1])
+				if (px->fe_counters.shared.tg)
 					_HA_ATOMIC_INC(&px->fe_counters.shared.tg[tgid - 1]->p.http.cache_hits);
 			}
 			else {
-				if (px->be_counters.shared.tg[tgid - 1])
+				if (px->be_counters.shared.tg)
 					_HA_ATOMIC_INC(&px->be_counters.shared.tg[tgid - 1]->p.http.cache_hits);
 			}
 			return ACT_RET_CONT;
@@ -2837,7 +2857,7 @@ static int http_request_prebuild_full_secondary_key(struct stream *s)
  */
 static int http_request_build_secondary_key(struct stream *s, int vary_signature)
 {
-	struct http_txn *txn = s->txn;
+	struct http_txn *txn = s->txn.http;
 	struct htx *htx = htxbuf(&s->req.buf);
 
 	unsigned int idx;
@@ -3027,6 +3047,7 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 				node = eb32_lookup_ge(&cache_tree->entries, next_key);
 				if (!node) {
 					ctx->next_key = 0;
+					next_key = 0;
 					break;
 				}
 

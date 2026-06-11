@@ -77,7 +77,7 @@ void cfg_free_cond_term(struct cfg_cond_term *term)
  * cfg_free_cond_term(). An error will be set in <err> on error, and only
  * in this case. In this case the first bad character will be reported in
  * <errptr>. <maxdepth> corresponds to the maximum recursion depth permitted,
- * it is decremented on each recursive call and the parsing will fail one
+ * it is decremented on each recursive call and the parsing will fail upon
  * reaching <= 0.
  */
 int cfg_parse_cond_term(const char **text, struct cfg_cond_term **term, char **err, const char **errptr, int maxdepth)
@@ -190,7 +190,7 @@ static int cfg_eval_cond_enabled(const char *str)
 	else if (strcmp(str, "EPOLL") == 0)
 		return !!(global.tune.options & GTUNE_USE_EPOLL);
 	else if (strcmp(str, "KQUEUE") == 0)
-		return !!(global.tune.options & GTUNE_USE_EPOLL);
+		return !!(global.tune.options & GTUNE_USE_KQUEUE);
 	else if (strcmp(str, "EVPORTS") == 0)
 		return !!(global.tune.options & GTUNE_USE_EVPORTS);
 	else if (strcmp(str, "SPLICE") == 0)
@@ -232,7 +232,7 @@ int cfg_eval_cond_term(const struct cfg_cond_term *term, char **err)
 			const char *p;
 
 			ret = 0; // assume feature not found
-			for (p = build_features; (p = strstr(p, term->args[0].data.str.area)); p++) {
+			for (p = build_features; *p && (p = strstr(p, term->args[0].data.str.area)); p++) {
 				if (p > build_features &&
 				    (p[term->args[0].data.str.data] == ' ' ||
 				     p[term->args[0].data.str.data] == 0)) {
@@ -272,8 +272,10 @@ int cfg_eval_cond_term(const struct cfg_cond_term *term, char **err)
 		case CFG_PRED_OSSL_VERSION_ATLEAST: { // checks if the current openssl version is at least this one
 			int opensslret = openssl_compare_current_version(term->args[0].data.str.area);
 
-			if (opensslret < -1) /* can't parse the string or no openssl available */
+			if (opensslret < -1) { /* can't parse the string or no openssl available */
+				memprintf(err, "invalid argument to conditional expression predicate '%s': '%s'", term->pred->word, term->args[0].data.str.area);
 				ret = -1;
+			}
 			else
 				ret = opensslret <= 0;
 			break;
@@ -281,8 +283,10 @@ int cfg_eval_cond_term(const struct cfg_cond_term *term, char **err)
 		case CFG_PRED_OSSL_VERSION_BEFORE: { // checks if the current openssl version is older than this one
 			int opensslret = openssl_compare_current_version(term->args[0].data.str.area);
 
-			if (opensslret < -1) /* can't parse the string or no openssl available */
+			if (opensslret < -1) { /* can't parse the string or no openssl available */
+				memprintf(err, "invalid argument to conditional expression predicate '%s': '%s'", term->pred->word, term->args[0].data.str.area);
 				ret = -1;
+			}
 			else
 				ret = opensslret > 0;
 			break;
@@ -290,8 +294,10 @@ int cfg_eval_cond_term(const struct cfg_cond_term *term, char **err)
 		case CFG_PRED_AWSLC_API_ATLEAST: { // checks if the current AWSLC API is at least this one
 			int awslcret = awslc_compare_current_api(term->args[0].data.str.area);
 
-			if (awslcret < -1) /* can't parse the string or no AWS-LC available */
+			if (awslcret < -1) { /* can't parse the string or no AWS-LC available */
+				memprintf(err, "invalid argument to conditional expression predicate '%s': '%s'", term->pred->word, term->args[0].data.str.area);
 				ret = -1;
+			}
 			else
 				ret = awslcret <= 0;
 			break;
@@ -299,8 +305,10 @@ int cfg_eval_cond_term(const struct cfg_cond_term *term, char **err)
 		case CFG_PRED_AWSLC_API_BEFORE: { // checks if the current AWSLC API is older than this one
 			int awslcret = awslc_compare_current_api(term->args[0].data.str.area);
 
-			if (awslcret < -1) /* can't parse the string or no AWS-LC available */
+			if (awslcret < -1) { /* can't parse the string or no AWS-LC available */
+				memprintf(err, "invalid argument to conditional expression predicate '%s': '%s'", term->pred->word, term->args[0].data.str.area);
 				ret = -1;
+			}
 			else
 				ret = awslcret > 0;
 			break;
@@ -362,11 +370,11 @@ void cfg_free_cond_expr(struct cfg_cond_expr *expr)
  * success. <expr> is filled with the parsed info, and <text> is updated on
  * success to point to the first unparsed character, or is left untouched
  * on failure. On success, the caller will have to free all lower-level
- * allocated structs using cfg_free_cond_expr(). An error will be set in
+ * allocated structs using cfg_free_cond_and(). An error will be set in
  * <err> on error, and only in this case. In this case the first bad
  * character will be reported in <errptr>. <maxdepth> corresponds to the
  * maximum recursion depth permitted, it is decremented on each recursive
- * call and the parsing will fail one reaching <= 0.
+ * call and the parsing will fail upon reaching <= 0.
  */
 int cfg_parse_cond_and(const char **text, struct cfg_cond_and **expr, char **err, const char **errptr, int maxdepth)
 {
@@ -430,7 +438,7 @@ int cfg_parse_cond_and(const char **text, struct cfg_cond_and **expr, char **err
 	return ret;
 }
 
-/* Parse an indirect input text as a possible config condition term.
+/* Parse an indirect input text as a possible config condition expression.
  * Returns <0 on parsing error, 0 if the parser is desynchronized, or >0 on
  * success. <expr> is filled with the parsed info, and <text> is updated on
  * success to point to the first unparsed character, or is left untouched
@@ -439,7 +447,7 @@ int cfg_parse_cond_and(const char **text, struct cfg_cond_and **expr, char **err
  * <err> on error, and only in this case. In this case the first bad
  * character will be reported in <errptr>. <maxdepth> corresponds to the
  * maximum recursion depth permitted, it is decremented on each recursive call
- * and the parsing will fail one reaching <= 0.
+ * and the parsing will fail upon reaching <= 0.
  */
 int cfg_parse_cond_expr(const char **text, struct cfg_cond_expr **expr, char **err, const char **errptr, int maxdepth)
 {
@@ -503,7 +511,7 @@ int cfg_parse_cond_expr(const char **text, struct cfg_cond_expr **expr, char **e
 	return ret;
 }
 
-/* evaluate an sub-expression on a .if/.elif line. The expression is valid and
+/* evaluate a sub-expression on a .if/.elif line. The expression is valid and
  * was already parsed in <expr>. Returns -1 on error (in which case err is
  * filled with a message, and only in this case), 0 if the condition is false,
  * 1 if it's true.
@@ -536,7 +544,7 @@ int cfg_eval_cond_expr(struct cfg_cond_expr *expr, char **err)
 }
 
 /* evaluate a condition on a .if/.elif line. The condition is already tokenized
- * in <err>. Returns -1 on error (in which case err is filled with a message,
+ * in <args>. Returns -1 on error (in which case err is filled with a message,
  * and only in this case), 0 if the condition is false, 1 if it's true. If
  * <errptr> is not NULL, it's set to the first invalid character on error.
  */
@@ -564,6 +572,8 @@ int cfg_eval_condition(char **args, char **err, const char **errptr)
 		}
 
 		ret = cfg_eval_cond_expr(expr, err);
+		if (ret < 0)
+			goto fail;
 		goto done;
 	}
 

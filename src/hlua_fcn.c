@@ -1966,9 +1966,19 @@ void hlua_listable_servers(lua_State *L, struct proxy *px)
 	lua_setmetatable(L, -2);
 }
 
+int hlua_proxy_gc(lua_State *L)
+{
+	struct proxy *px = hlua_checkudata(L, 1, class_proxy_ref);
+	proxy_drop(px);
+	return 0;
+}
+
 static struct proxy *hlua_check_proxy(lua_State *L, int ud)
 {
-	return hlua_checkudata(L, ud, class_proxy_ref);
+	struct proxy *px = hlua_checkudata(L, ud, class_proxy_ref);
+	if (px->flags & PR_FL_DELETED)
+		return NULL;
+	return px;
 }
 
 int hlua_proxy_get_name(lua_State *L)
@@ -1976,6 +1986,11 @@ int hlua_proxy_get_name(lua_State *L)
 	struct proxy *px;
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
 	lua_pushstring(L, px->id);
 	return 1;
 }
@@ -1986,6 +2001,11 @@ int hlua_proxy_get_uuid(lua_State *L)
 	char buffer[17];
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
 	snprintf(buffer, sizeof(buffer), "%d", px->uuid);
 	lua_pushstring(L, buffer);
 	return 1;
@@ -2024,6 +2044,9 @@ int hlua_proxy_pause(lua_State *L)
 	struct proxy *px;
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL)
+		return 0;
+
 	/* safe to call without PROXY_LOCK - pause_proxy takes it */
 	pause_proxy(px);
 	return 0;
@@ -2034,6 +2057,9 @@ int hlua_proxy_resume(lua_State *L)
 	struct proxy *px;
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL)
+		return 0;
+
 	/* safe to call without PROXY_LOCK - resume_proxy takes it */
 	resume_proxy(px);
 	return 0;
@@ -2044,6 +2070,9 @@ int hlua_proxy_stop(lua_State *L)
 	struct proxy *px;
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL)
+		return 0;
+
 	/* safe to call without PROXY_LOCK - stop_proxy takes it */
 	stop_proxy(px);
 	return 0;
@@ -2055,6 +2084,11 @@ int hlua_proxy_get_cap(lua_State *L)
 	const char *str;
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
 	str = proxy_cap_str(px->cap);
 	lua_pushstring(L, str);
 	return 1;
@@ -2066,6 +2100,11 @@ int hlua_proxy_get_stats(lua_State *L)
 	int i;
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
 	if (px->cap & PR_CAP_BE)
 		stats_fill_be_line(px, STAT_F_SHLGNDS, stats, STATS_LEN, NULL);
 	else
@@ -2086,6 +2125,11 @@ int hlua_proxy_get_mode(lua_State *L)
 	const char *str;
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
 	str = proxy_mode_str(px->mode);
 	lua_pushstring(L, str);
 	return 1;
@@ -2096,6 +2140,9 @@ int hlua_proxy_shut_bcksess(lua_State *L)
 	struct proxy *px;
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL)
+		return 0;
+
 	srv_shutdown_backup_streams(px, SF_ERR_KILLED);
 	return 0;
 }
@@ -2105,6 +2152,11 @@ int hlua_proxy_get_srv_act(lua_State *L)
 	struct proxy *px;
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
 	lua_pushinteger(L, px->srv_act);
 	return 1;
 }
@@ -2114,6 +2166,11 @@ int hlua_proxy_get_srv_bck(lua_State *L)
 	struct proxy *px;
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
 	lua_pushinteger(L, px->srv_bck);
 	return 1;
 }
@@ -2128,6 +2185,10 @@ int hlua_proxy_get_mailers(lua_State *L)
 	struct mailer *mailer;
 
 	px = hlua_check_proxy(L, 1);
+	if (px == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
 
 	if (!px->email_alert.mailers.m)
 		return 0; /* email-alert mailers not found on proxy */
@@ -2207,6 +2268,8 @@ int hlua_fcn_new_proxy(lua_State *L, struct proxy *px)
 
 	lua_pushlightuserdata(L, px);
 	lua_rawseti(L, -2, 0);
+
+	proxy_take(px);
 
 	/* set public methods */
 	hlua_class_function(L, "get_name", hlua_proxy_get_name);
@@ -2316,11 +2379,28 @@ int hlua_listable_proxies_pairs_iterator(lua_State *L)
 	lua_pushstring(L, ctx->next->id);
 	hlua_fcn_new_proxy(L, ctx->next);
 
-	for (ctx->next = ctx->next->next;
+	ctx->next = watcher_next(&ctx->px_watch, ctx->next->next);
+	for (;
 	     ctx->next && !hlua_listable_proxies_match(ctx->next, ctx->capabilities);
-	     ctx->next = ctx->next->next);
+	     ctx->next = watcher_next(&ctx->px_watch, ctx->next->next))
+		;
 
 	return 2;
+}
+
+/* ensure proper cleanup for listable_proxies_pairs */
+int hlua_listable_proxies_pairs_gc(lua_State *L)
+{
+	struct hlua_proxy_list_iterator_context *ctx;
+
+	ctx = lua_touserdata(L, 1);
+
+	/* we need to make sure that the watcher leaves in detached state even
+	 * if the iterator was interrupted (ie: "break" from the loop), else
+	 * the server watcher list will become corrupted
+	 */
+	watcher_detach(&ctx->px_watch);
+	return 0;
 }
 
 /* init the iterator context, return iterator function
@@ -2336,10 +2416,21 @@ int hlua_listable_proxies_pairs(lua_State *L)
 
 	ctx = lua_newuserdata(L, sizeof(*ctx));
 
+	/* add gc metamethod to the newly created userdata */
+	lua_newtable(L);
+	hlua_class_function(L, "__gc", hlua_listable_proxies_pairs_gc);
+	lua_setmetatable(L, -2);
+
 	ctx->capabilities = hlua_px->capabilities;
-	for (ctx->next = proxies_list;
+
+	ctx->next = NULL;
+	watcher_init(&ctx->px_watch, &ctx->next, offsetof(struct proxy, watcher_list));
+
+	for (watcher_attach(&ctx->px_watch, proxies_list);
 	     ctx->next && !hlua_listable_proxies_match(ctx->next, ctx->capabilities);
-	     ctx->next = ctx->next->next);
+	     ctx->next = watcher_next(&ctx->px_watch, ctx->next->next))
+		;
+
 	lua_pushcclosure(L, hlua_listable_proxies_pairs_iterator, 1);
 	return 1;
 }
@@ -2779,7 +2870,7 @@ int hlua_patref_add(lua_State *L)
 
 
 	if (!ret) {
-		ret = hlua_error(L, errmsg);
+		ret = hlua_error(L, "%s", errmsg);
 		ha_free(&errmsg);
 		return ret;
 	}
@@ -2796,6 +2887,11 @@ static int _hlua_patref_add_bulk(lua_State *L, int status, lua_KContext ctx)
 	int count = 0;
 	int ret;
 
+	if (!lua_istable(L, 2)) {
+		luaL_argerror(L, 2, "argument is expected to be a table");
+		return 0; // not reached
+	}
+
 	if ((ref->flags & HLUA_PATREF_FL_GEN) &&
 	    pat_ref_may_commit(ref->ptr, ref->curr_gen))
 		curr_gen = ref->curr_gen;
@@ -2807,17 +2903,6 @@ static int _hlua_patref_add_bulk(lua_State *L, int status, lua_KContext ctx)
 	while (lua_next(L, 2) != 0) {
 		const char *key;
 		const char *value = NULL;
-
-		/* check if we may do something to try to prevent thread contention,
-		 * unless we run from body/init state where hlua_yieldk is no-op
-		 */
-		if (count > 100 && hlua_gethlua(L)) {
-			/* let's yield and wait for being called again to continue where we left off */
-			HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
-			hlua_yieldk(L, 0, 0, _hlua_patref_add_bulk, TICK_ETERNITY, HLUA_CTRLYIELD); // continue
-			return 0; // not reached
-
-		}
 
 		if (ref->ptr->flags & PAT_REF_SMP) {
 			/* key:val table */
@@ -2834,7 +2919,7 @@ static int _hlua_patref_add_bulk(lua_State *L, int status, lua_KContext ctx)
 
 		if (!pat_ref_load(ref->ptr, curr_gen, key, value, -1, &errmsg)) {
 			HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
-			ret = hlua_error(L, errmsg);
+			ret = hlua_error(L, "%s", errmsg);
 			ha_free(&errmsg);
 			return ret;
 		}
@@ -2843,6 +2928,17 @@ static int _hlua_patref_add_bulk(lua_State *L, int status, lua_KContext ctx)
 		/* removes 'value'; keeps 'key' for next iteration */
 		lua_pop(L, 1);
 		count += 1;
+
+		/* check if we may do something to try to prevent thread contention,
+		 * unless we run from body/init state where hlua_yieldk is no-op
+		 */
+		if (count > 100 && hlua_gethlua(L)) {
+			/* let's yield and wait for being called again to continue where we left off */
+			HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
+			hlua_yieldk(L, 0, 0, _hlua_patref_add_bulk, TICK_ETERNITY, HLUA_CTRLYIELD); // continue
+			return 0; // not reached
+
+		}
 	}
 	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
 	lua_pushboolean(L, 1);
@@ -2927,7 +3023,7 @@ int hlua_patref_set(lua_State *L)
 	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
 
 	if (!ret) {
-		ret = hlua_error(L, errmsg);
+		ret = hlua_error(L, "%s", errmsg);
 		ha_free(&errmsg);
 		return ret;
 	}
@@ -3047,7 +3143,6 @@ static int _hlua_listable_patref_pairs_iterator(lua_State *L, int status, lua_KC
 	int context_index;
 	struct hlua_patref_iterator_context *hctx;
 	struct pat_ref_elt *elt;
-	int cnt = 0;
 	unsigned int curr_gen;
 
 	context_index = lua_upvalueindex(1);
@@ -3063,37 +3158,20 @@ static int _hlua_listable_patref_pairs_iterator(lua_State *L, int status, lua_KC
 
 	if (LIST_ISEMPTY(&hctx->bref.users)) {
 		/* first iteration */
-		hctx->bref.ref = hctx->ref->ptr->head.n;
+		hctx->gen = pat_ref_gen_get(hctx->ref->ptr, curr_gen);
+		if (!hctx->gen)
+			goto done;
+		hctx->bref.ref = hctx->gen->head.n;
 	}
 	else
 		LIST_DEL_INIT(&hctx->bref.users); // drop back ref from previous iteration
 
  next:
 	/* reached end of list? */
-	if (hctx->bref.ref == &hctx->ref->ptr->head) {
-		HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &hctx->ref->ptr->lock);
-		lua_pushnil(L);
-		return 1;
-	}
+	if (hctx->bref.ref == &hctx->gen->head)
+		goto done;
 
 	elt = LIST_ELEM(hctx->bref.ref, struct pat_ref_elt *, list);
-
-	if (elt->gen_id != curr_gen) {
-		/* check if we may do something to try to prevent thread contention,
-		 * unless we run from body/init state where hlua_yieldk is no-op
-		 */
-		if (cnt > 10000 && hlua_gethlua(L)) {
-			/* let's yield and wait for being called again to continue where we left off */
-			LIST_APPEND(&elt->back_refs, &hctx->bref.users);
-			HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &hctx->ref->ptr->lock);
-			hlua_yieldk(L, 0, 0, _hlua_listable_patref_pairs_iterator, TICK_ETERNITY, HLUA_CTRLYIELD); // continue
-			return 0; // not reached
-		}
-
-		hctx->bref.ref = elt->list.n;
-		cnt++;
-		goto next;
-	}
 
 	LIST_APPEND(&elt->back_refs, &hctx->bref.users);
 	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &hctx->ref->ptr->lock);
@@ -3106,6 +3184,11 @@ static int _hlua_listable_patref_pairs_iterator(lua_State *L, int status, lua_KC
 	else
 		return 1;
 	return 2;
+
+done:
+	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &hctx->ref->ptr->lock);
+	lua_pushnil(L);
+	return 1;
 
 }
 /* iterator must return key as string and value as patref
@@ -3213,6 +3296,7 @@ void hlua_fcn_reg_core_fcn(lua_State *L)
 
 	/* Create proxy object. */
 	lua_newtable(L);
+	hlua_class_function(L, "__gc", hlua_proxy_gc);
 	hlua_class_function(L, "__index", hlua_proxy_index);
 	class_proxy_ref = hlua_register_metatable(L, CLASS_PROXY);
 

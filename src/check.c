@@ -34,7 +34,7 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/check.h>
 #include <haproxy/chunk.h>
-#include <haproxy/counters.h>
+#include <haproxy/counters-t.h>
 #include <haproxy/dgram.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/extcheck.h>
@@ -58,7 +58,6 @@
 #include <haproxy/sample.h>
 #include <haproxy/server.h>
 #include <haproxy/ssl_sock.h>
-#include <haproxy/stats-t.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
 #include <haproxy/thread.h>
@@ -233,22 +232,13 @@ static void check_trace(enum trace_level level, uint64_t mask,
 		chunk_appendf(&trace_buf, " sc=%p(0x%08x)", check->sc, check->sc->flags);
 	}
 
+	if (check->type != PR_O2_TCPCHK_CHK)
+		return;
+
 	if (mask & CHK_EV_TCPCHK) {
 		const char *type;
 
-		switch (check->tcpcheck_rules->flags & TCPCHK_RULES_PROTO_CHK) {
-			case TCPCHK_RULES_PGSQL_CHK: type = "PGSQL"; break;
-			case TCPCHK_RULES_REDIS_CHK: type = "REDIS"; break;
-			case TCPCHK_RULES_SMTP_CHK:  type = "SMTP";  break;
-			case TCPCHK_RULES_HTTP_CHK:  type = "HTTP";  break;
-			case TCPCHK_RULES_MYSQL_CHK: type = "MYSQL"; break;
-			case TCPCHK_RULES_LDAP_CHK:  type = "LDAP";  break;
-			case TCPCHK_RULES_SSL3_CHK:  type = "SSL3";  break;
-			case TCPCHK_RULES_AGENT_CHK: type = "AGENT"; break;
-			case TCPCHK_RULES_SPOP_CHK:  type = "SPOP";  break;
-			case TCPCHK_RULES_TCP_CHK:   type = "TCP";   break;
-			default:                     type = "???"; break;
-		}
+		type = tcpcheck_ruleset_type_to_str(check->tcpcheck->rs);
 		if (check->current_step)
 			chunk_appendf(&trace_buf, " - tcp-check=(%s,%d)", type, tcpcheck_get_step_id(check, NULL));
 		else
@@ -272,7 +262,7 @@ static void check_trace(enum trace_level level, uint64_t mask,
 			buf = (b_is_null(&check->bo) ? NULL : &check->bo);
 
 		if (buf) {
-			if ((check->tcpcheck_rules->flags & TCPCHK_RULES_PROTO_CHK) == TCPCHK_RULES_HTTP_CHK) {
+			if ((check->tcpcheck->rs->flags & TCPCHK_RULES_PROTO_CHK) == TCPCHK_RULES_HTTP_CHK) {
 				int full = (src->verbosity == CHK_VERB_COMPLETE);
 
 				chunk_memcat(&trace_buf, "\n\t", 2);
@@ -471,6 +461,11 @@ void set_server_check_status(struct check *check, short status, const char *desc
 		check->result = CHK_RES_UNKNOWN;	/* no result yet */
 		check->desc[0] = '\0';
 		check->start = now_ns;
+
+		/* Reset unique_id. */
+		pool_free(pool_head_uniqueid, istptr(check->unique_id));
+		check->unique_id = IST_NULL;
+
 		return;
 	}
 
@@ -513,7 +508,7 @@ void set_server_check_status(struct check *check, short status, const char *desc
 		if ((!(check->state & CHK_ST_AGENT) ||
 		    (check->status >= HCHK_STATUS_L57DATA)) &&
 		    (check->health > 0)) {
-			if (s->counters.shared.tg[tgid - 1])
+			if (s->counters.shared.tg)
 				_HA_ATOMIC_INC(&s->counters.shared.tg[tgid - 1]->failed_checks);
 			report = 1;
 			check->health--;
@@ -741,7 +736,7 @@ void __health_adjust(struct server *s, short status)
 	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 
 	HA_ATOMIC_STORE(&s->consecutive_errors, 0);
-	if (s->counters.shared.tg[tgid - 1])
+	if (s->counters.shared.tg)
 		_HA_ATOMIC_INC(&s->counters.shared.tg[tgid - 1]->failed_hana);
 
 	if (s->check.fastinter) {
@@ -820,7 +815,7 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 	}
 
 	errno = unclean_errno(errno_bck);
-	if (conn && errno)
+	if (conn && !errno)
 		retrieve_errno_from_socket(conn);
 
 	TRACE_ENTER(CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check, 0, 0, (size_t[]){expired});
@@ -833,7 +828,7 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 	chk = get_trash_chunk();
 
 	if (check->type == PR_O2_TCPCHK_CHK &&
-	    (check->tcpcheck_rules->flags & TCPCHK_RULES_PROTO_CHK) == TCPCHK_RULES_TCP_CHK) {
+	    (check->tcpcheck->rs->flags & TCPCHK_RULES_PROTO_CHK) == TCPCHK_RULES_TCP_CHK) {
 		step = tcpcheck_get_step_id(check, NULL);
 		if (!step) {
 			TRACE_DEVEL("initial connection failure", CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check);
@@ -1046,13 +1041,12 @@ int httpchk_build_status_header(struct server *s, struct buffer *buf)
 /**************************************************************************/
 /***************** Health-checks based on connections *********************/
 /**************************************************************************/
-/* This function is used only for server health-checks. It handles connection
- * status updates including errors. If necessary, it wakes the check task up.
- * It returns 0 on normal cases, <0 if at least one close() has happened on the
- * connection (eg: reconnect). It relies on tcpcheck_main().
+/* This function handles connection status updates including errors. If
+ * necessary, it wakes the check task up.
  */
-int wake_srv_chk(struct stconn *sc)
+struct task *srv_chk_io_cb(struct task *t, void *ctx, unsigned int state)
 {
+	struct stconn *sc = ctx;
 	struct connection *conn;
 	struct check *check = __sc_check(sc);
 	int ret = 0;
@@ -1099,15 +1093,6 @@ int wake_srv_chk(struct stconn *sc)
 
   end:
 	TRACE_LEAVE(CHK_EV_HCHK_WAKE, check);
-	return ret;
-}
-
-/* This function checks if any I/O is wanted, and if so, attempts to do so */
-struct task *srv_chk_io_cb(struct task *t, void *ctx, unsigned int state)
-{
-	struct stconn *sc = ctx;
-
-	wake_srv_chk(sc);
 	return t;
 }
 
@@ -1328,7 +1313,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 
 		check->current_step = NULL;
 
-		check->sc = sc_new_from_check(check, SC_FL_NONE);
+		check->sc = sc_new_from_check(check);
 		if (!check->sc) {
 			set_server_check_status(check, HCHK_STATUS_SOCKERR, NULL);
 			goto end;
@@ -1422,7 +1407,20 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);
-	_HA_ATOMIC_DEC(&th_ctx->running_checks);
+
+	if (unlikely(LIST_INLIST(&check->check_queue))) {
+		/*
+		 * If that check is still queued, and we're about to
+		 * purge it, then remove it from the queue, as it is
+		 * about to be freed.
+		 * This can happen if a server is deleted while the check
+		 * is queued.
+		 */
+		if (check->state & CHK_ST_PURGE)
+			LIST_DEL_INIT(&check->check_queue);
+	}
+	else
+		_HA_ATOMIC_DEC(&th_ctx->running_checks);
 	_HA_ATOMIC_DEC(&th_ctx->active_checks);
 	check->state &= ~(CHK_ST_INPROGRESS|CHK_ST_IN_ALLOC|CHK_ST_OUT_ALLOC);
 	check->state &= ~CHK_ST_READY;
@@ -1526,13 +1524,15 @@ int check_buf_available(void *target)
 /*
  * Allocate a buffer. If it fails, it adds the check in buffer wait queue.
  */
-struct buffer *check_get_buf(struct check *check, struct buffer *bptr)
+struct buffer *check_get_buf(struct check *check, struct buffer *bptr, unsigned int small_buffer)
 {
 	struct buffer *buf = NULL;
 
-	if (likely(!LIST_INLIST(&check->buf_wait.list)) &&
-	    unlikely((buf = b_alloc(bptr, DB_CHANNEL)) == NULL)) {
-		b_queue(DB_CHANNEL, &check->buf_wait, check, check_buf_available);
+	if (small_buffer == 0 || (buf = b_alloc_small(bptr)) == NULL) {
+		if (likely(!LIST_INLIST(&check->buf_wait.list)) &&
+		    unlikely((buf = b_alloc(bptr, DB_CHANNEL)) == NULL)) {
+			b_queue(DB_CHANNEL, &check->buf_wait, check, check_buf_available);
+		}
 	}
 	return buf;
 }
@@ -1544,8 +1544,11 @@ struct buffer *check_get_buf(struct check *check, struct buffer *bptr)
 void check_release_buf(struct check *check, struct buffer *bptr)
 {
 	if (bptr->size) {
+		int defbuf = b_is_default(bptr);
+
 		b_free(bptr);
-		offer_buffers(check->buf_wait.target, 1);
+		if (defbuf)
+			offer_buffers(check->buf_wait.target, 1);
 	}
 }
 
@@ -1570,11 +1573,15 @@ void free_check(struct check *check)
 	 * done for health-check : the proxy is the owner of the rules / vars
 	 * in this case.
 	 */
-	if (check->state & CHK_ST_AGENT) {
-		free_tcpcheck_vars(&check->tcpcheck_rules->preset_vars);
-		ha_free(&check->tcpcheck_rules);
+	if (check->state & CHK_ST_AGENT || check->tcpcheck->healthcheck) {
+		free_tcpcheck_vars(&check->tcpcheck->preset_vars);
+		ha_free(&check->tcpcheck->healthcheck);
+		ha_free(&check->tcpcheck);
 	}
 
+	LIST_DEL_INIT(&check->check_queue);
+	pool_free(pool_head_uniqueid, istptr(check->unique_id));
+	check->unique_id = IST_NULL;
 	ha_free(&check->pool_conn_name);
 	ha_free(&check->sni);
 	ha_free(&check->alpn_str);
@@ -1665,7 +1672,6 @@ int start_check_task(struct check *check, int mininter,
  */
 static int start_checks()
 {
-
 	struct proxy *px;
 	struct server *s;
 	char *errmsg = NULL;
@@ -1692,6 +1698,10 @@ static int start_checks()
 	 */
 	for (px = proxies_list; px; px = px->next) {
 		for (s = px->srv; s; s = s->next) {
+			if ((px->options2 & PR_O2_USE_SBUF_CHECK) &&
+			    (s->check.tcpcheck->rs && s->check.tcpcheck->rs->flags & TCPCHK_RULES_MAY_USE_SBUF))
+				s->check.state |= CHK_ST_USE_SMALL_BUFF;
+
 			if (s->check.state & CHK_ST_CONFIGURED) {
 				nbcheck++;
 				if ((srv_getinter(&s->check) >= SRV_CHK_INTER_THRES) &&
@@ -1806,7 +1816,10 @@ int init_srv_check(struct server *srv)
 	if (!srv->do_check || !(srv->proxy->cap & PR_CAP_BE))
 		goto out;
 
-	check_type = srv->check.tcpcheck_rules->flags & TCPCHK_RULES_PROTO_CHK;
+	if (!srv->check.type && (srv->proxy->options2 & PR_O2_CHK_ANY) != PR_O2_TCPCHK_CHK)
+		goto init;
+
+	check_type = srv->check.tcpcheck->rs->flags & TCPCHK_RULES_PROTO_CHK;
 
 	if (!(srv->flags & SRV_F_DYNAMIC)) {
 		/* If neither a port nor an addr was specified and no check
@@ -1816,21 +1829,45 @@ int init_srv_check(struct server *srv)
 		 * specified.
 		 */
 		if (!srv->check.port && !is_addr(&srv->check.addr)) {
-			if (!srv->check.use_ssl && srv->use_ssl != -1)
+			if ((!srv->check.use_ssl && srv->use_ssl != -1) ||
+			    (srv->check.use_ssl == srv->use_ssl))
 				srv->check.xprt = srv->xprt;
 			else if (srv->check.use_ssl == 1)
 				srv->check.xprt = xprt_get(XPRT_SSL);
 			srv->check.send_proxy |= (srv->pp_opts);
+			srv->check.addr_type = srv->addr_type;
+			srv->check.alt_proto = srv->alt_proto;
+		} else {
+			/* Only port was specified, so let's go with TCP */
+			if (!is_addr(&srv->check.addr)) {
+				srv->check.addr_type.proto_type = PROTO_TYPE_STREAM;
+				srv->check.addr_type.xprt_type = PROTO_TYPE_STREAM;
+			}
+			if (net_addr_type_is_quic(&srv->check.addr_type))
+				srv->check.xprt = xprt_get(XPRT_QUIC);
+			else
+				if (srv->check.use_ssl == 1)
+					srv->check.xprt = xprt_get(XPRT_SSL);
 		}
-		else if (srv->check.use_ssl == 1)
-			srv->check.xprt = xprt_get(XPRT_SSL);
 	}
 	else {
 		/* For dynamic servers, check-ssl and check-send-proxy must be
 		 * explicitly defined even if the check port was not
 		 * overridden.
 		 */
-		if (srv->check.use_ssl == 1)
+		if (!is_addr(&srv->check.addr)) {
+			if (srv->check.port) {
+				srv->check.addr_type.proto_type = PROTO_TYPE_STREAM;
+				srv->check.addr_type.xprt_type = PROTO_TYPE_STREAM;
+				srv->check.alt_proto = 0;
+			} else {
+				srv->check.addr_type = srv->addr_type;
+				srv->check.alt_proto = srv->alt_proto;
+			}
+		}
+		if (net_addr_type_is_quic(&srv->check.addr_type))
+			srv->check.xprt = xprt_get(XPRT_QUIC);
+		else if (srv->check.use_ssl == 1)
 			srv->check.xprt = xprt_get(XPRT_SSL);
 	}
 
@@ -1840,7 +1877,8 @@ int init_srv_check(struct server *srv)
 	if (srv->mux_proto && !srv->check.mux_proto &&
 	    ((srv->mux_proto->mode == PROTO_MODE_HTTP && check_type == TCPCHK_RULES_HTTP_CHK) ||
 	     (srv->mux_proto->mode == PROTO_MODE_SPOP && check_type == TCPCHK_RULES_SPOP_CHK) ||
-	     (srv->mux_proto->mode == PROTO_MODE_TCP && check_type != TCPCHK_RULES_HTTP_CHK))) {
+	     (srv->mux_proto->mode == PROTO_MODE_TCP && check_type != TCPCHK_RULES_HTTP_CHK)) &&
+	     (net_addr_type_is_quic(&srv->check.addr_type) == srv_is_quic(srv))) {
 		srv->check.mux_proto = srv->mux_proto;
 	}
 	/* test that check proto is valid if explicitly defined */
@@ -1856,7 +1894,7 @@ int init_srv_check(struct server *srv)
 
 	/* validate <srv> server health-check settings */
 
-	if (srv_is_quic(srv)) {
+	if (net_addr_type_is_quic(&srv->check.addr_type)) {
 		if (srv->check.mux_proto && srv->check.mux_proto != get_mux_proto(ist("quic"))) {
 			ha_alert("config: %s '%s': QUIC server '%s' uses an incompatible MUX protocol for checks.\n",
 			         proxy_type_str(srv->proxy), srv->proxy->id, srv->id);
@@ -1892,7 +1930,7 @@ int init_srv_check(struct server *srv)
 	    (!is_inet_addr(&srv->check.addr) && (is_addr(&srv->check.addr) || !is_inet_addr(&srv->addr))))
 		goto init;
 
-	if (!srv->proxy->tcpcheck_rules.list || LIST_ISEMPTY(srv->proxy->tcpcheck_rules.list)) {
+	if (LIST_ISEMPTY(&srv->check.tcpcheck->rs->rules)) {
 		ha_alert("config: %s '%s': server '%s' has neither service port nor check port.\n",
 			 proxy_type_str(srv->proxy), srv->proxy->id, srv->id);
 		ret |= ERR_ALERT | ERR_ABORT;
@@ -1900,7 +1938,7 @@ int init_srv_check(struct server *srv)
 	}
 
 	/* search the first action (connect / send / expect) in the list */
-	r = get_first_tcpcheck_rule(&srv->proxy->tcpcheck_rules);
+	r = get_first_tcpcheck_rule(srv->check.tcpcheck->rs);
 	if (!r || (r->action != TCPCHK_ACT_CONNECT) || (!r->connect.port && !get_host_port(&r->connect.addr))) {
 		ha_alert("config: %s '%s': server '%s' has neither service port nor check port "
 			 "nor tcp_check rule 'connect' with port information.\n",
@@ -1910,7 +1948,7 @@ int init_srv_check(struct server *srv)
 	}
 
 	/* scan the tcp-check ruleset to ensure a port has been configured */
-	list_for_each_entry(r, srv->proxy->tcpcheck_rules.list, list) {
+	list_for_each_entry(r, &srv->check.tcpcheck->rs->rules, list) {
 		if ((r->action == TCPCHK_ACT_CONNECT) && (!r->connect.port && !get_host_port(&r->connect.addr))) {
 			ha_alert("config: %s '%s': server '%s' has neither service port nor check port, "
 				 "and a tcp_check rule 'connect' with no port information.\n",
@@ -1921,7 +1959,7 @@ int init_srv_check(struct server *srv)
 	}
 
   init:
-	err = init_check(&srv->check, srv->proxy->options2 & PR_O2_CHK_ANY);
+	err = init_check(&srv->check, srv->check.type ? srv->check.type : (srv->proxy->options2 & PR_O2_CHK_ANY));
 	if (err) {
 		ha_alert("config: %s '%s': unable to init check for server '%s' (%s).\n",
 			 proxy_type_str(srv->proxy), srv->proxy->id, srv->id, err);
@@ -1957,7 +1995,7 @@ int init_srv_agent_check(struct server *srv)
 	/* If there is no connect rule preceding all send / expect rules, an
 	 * implicit one is inserted before all others.
 	 */
-	chk = get_first_tcpcheck_rule(srv->agent.tcpcheck_rules);
+	chk = get_first_tcpcheck_rule(srv->agent.tcpcheck->rs);
 	if (!chk || chk->action != TCPCHK_ACT_CONNECT) {
 		chk = calloc(1, sizeof(*chk));
 		if (!chk) {
@@ -1969,14 +2007,14 @@ int init_srv_agent_check(struct server *srv)
 		}
 		chk->action = TCPCHK_ACT_CONNECT;
 		chk->connect.options = (TCPCHK_OPT_DEFAULT_CONNECT|TCPCHK_OPT_IMPLICIT);
-		LIST_INSERT(srv->agent.tcpcheck_rules->list, &chk->list);
+		LIST_INSERT(&srv->agent.tcpcheck->rs->rules, &chk->list);
 	}
 
 	/* <chk> is always defined here and it is a CONNECT action. If there is
 	 * a preset variable, it means there is an agent string defined and data
 	 * will be sent after the connect.
 	 */
-	if (!LIST_ISEMPTY(&srv->agent.tcpcheck_rules->preset_vars))
+	if (!LIST_ISEMPTY(&srv->agent.tcpcheck->preset_vars))
 		chk->connect.options |= TCPCHK_OPT_HAS_DATA;
 
 
@@ -2067,7 +2105,9 @@ static int srv_parse_addr(char **args, int *cur_arg, struct proxy *curpx, struct
 			  char **errmsg)
 {
 	struct sockaddr_storage *sk;
+	struct net_addr_type addr_type;
 	int port1, port2, err_code = 0;
+	int alt = 0;
 
 
 	if (!*args[*cur_arg+1]) {
@@ -2075,7 +2115,7 @@ static int srv_parse_addr(char **args, int *cur_arg, struct proxy *curpx, struct
 		goto error;
 	}
 
-	sk = str2sa_range(args[*cur_arg+1], NULL, &port1, &port2, NULL, NULL, NULL, errmsg, NULL, NULL, NULL,
+	sk = str2sa_range(args[*cur_arg+1], NULL, &port1, &port2, NULL, NULL, &addr_type, errmsg, NULL, NULL, &alt,
 	                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_STREAM | PA_O_CONNECT);
 	if (!sk) {
 		memprintf(errmsg, "'%s' : %s", args[*cur_arg], *errmsg);
@@ -2083,6 +2123,8 @@ static int srv_parse_addr(char **args, int *cur_arg, struct proxy *curpx, struct
 	}
 
 	srv->check.addr = *sk;
+	srv->check.addr_type = addr_type;
+	srv->check.alt_proto = alt;
 	/* if agentaddr was never set, we can use addr */
 	if (!(srv->flags & SRV_F_AGENTADDR))
 		srv->agent.addr = *sk;
@@ -2112,7 +2154,10 @@ static int srv_parse_agent_addr(char **args, int *cur_arg, struct proxy *curpx, 
 		goto error;
 	}
 	set_srv_agent_addr(srv, &sk);
-
+	/* Agent currently only uses TCP */
+	srv->agent.addr_type.proto_type = PROTO_TYPE_STREAM;
+	srv->agent.addr_type.xprt_type = PROTO_TYPE_STREAM;
+	srv->agent.alt_proto = 0;
   out:
 	return err_code;
 
@@ -2126,7 +2171,7 @@ static int srv_parse_agent_check(char **args, int *cur_arg, struct proxy *curpx,
 				 char **errmsg)
 {
 	struct tcpcheck_ruleset *rs = NULL;
-	struct tcpcheck_rules *rules = srv->agent.tcpcheck_rules;
+	struct tcpcheck *tc = srv->agent.tcpcheck;
 	struct tcpcheck_rule *chk;
 	int err_code = 0;
 
@@ -2139,17 +2184,15 @@ static int srv_parse_agent_check(char **args, int *cur_arg, struct proxy *curpx,
 		return ERR_WARN;
 	}
 
-	if (!rules) {
-		rules = calloc(1, sizeof(*rules));
-		if (!rules) {
+	if (!tc) {
+		tc = calloc(1, sizeof(*tc));
+		if (!tc) {
 			memprintf(errmsg, "out of memory.");
 			goto error;
 		}
-		LIST_INIT(&rules->preset_vars);
-		srv->agent.tcpcheck_rules = rules;
+		LIST_INIT(&tc->preset_vars);
+		srv->agent.tcpcheck = tc;
 	}
-	rules->list  = NULL;
-	rules->flags = 0;
 
 	rs = find_tcpcheck_ruleset("*agent-check");
 	if (rs)
@@ -2182,9 +2225,9 @@ static int srv_parse_agent_check(char **args, int *cur_arg, struct proxy *curpx,
 	LIST_APPEND(&rs->rules, &chk->list);
 
   ruleset_found:
-	rules->list = &rs->rules;
-	rules->flags &= ~(TCPCHK_RULES_PROTO_CHK|TCPCHK_RULES_UNUSED_RS);
-	rules->flags |= TCPCHK_RULES_AGENT_CHK;
+	tc->rs = rs;
+	tc->flags &= ~TCPCHK_FL_UNUSED_RS;
+	rs->flags |= TCPCHK_RULES_AGENT_CHK;
 	srv->do_agent = 1;
 
   out:
@@ -2277,7 +2320,7 @@ static int srv_parse_agent_port(char **args, int *cur_arg, struct proxy *curpx, 
 
 int set_srv_agent_send(struct server *srv, const char *send)
 {
-	struct tcpcheck_rules *rules = srv->agent.tcpcheck_rules;
+	struct tcpcheck *tc = srv->agent.tcpcheck;
 	struct tcpcheck_var *var = NULL;
 	char *str;
 
@@ -2286,13 +2329,13 @@ int set_srv_agent_send(struct server *srv, const char *send)
 	if (str == NULL || var == NULL)
 		goto error;
 
-	free_tcpcheck_vars(&rules->preset_vars);
+	free_tcpcheck_vars(&tc->preset_vars);
 
 	var->data.type = SMP_T_STR;
 	var->data.u.str.area = str;
 	var->data.u.str.data = strlen(str);
 	LIST_INIT(&var->list);
-	LIST_APPEND(&rules->preset_vars, &var->list);
+	LIST_APPEND(&tc->preset_vars, &var->list);
 
 	return 1;
 
@@ -2306,7 +2349,7 @@ int set_srv_agent_send(struct server *srv, const char *send)
 static int srv_parse_agent_send(char **args, int *cur_arg, struct proxy *curpx, struct server *srv,
 				char **errmsg)
 {
-	struct tcpcheck_rules *rules = srv->agent.tcpcheck_rules;
+	struct tcpcheck *tc = srv->agent.tcpcheck;
 	int err_code = 0;
 
 	if (!*(args[*cur_arg+1])) {
@@ -2314,14 +2357,14 @@ static int srv_parse_agent_send(char **args, int *cur_arg, struct proxy *curpx, 
 		goto error;
 	}
 
-	if (!rules) {
-		rules = calloc(1, sizeof(*rules));
-		if (!rules) {
+	if (!tc) {
+		tc = calloc(1, sizeof(*tc));
+		if (!tc) {
 			memprintf(errmsg, "out of memory.");
 			goto error;
 		}
-		LIST_INIT(&rules->preset_vars);
-		srv->agent.tcpcheck_rules = rules;
+		LIST_INIT(&tc->preset_vars);
+		srv->agent.tcpcheck = tc;
 	}
 
 	if (!set_srv_agent_send(srv, args[*cur_arg+1])) {

@@ -151,6 +151,9 @@ void sock_inet_set_port(struct sockaddr_storage *addr, int port)
  */
 int sock_inet_get_dst(int fd, struct sockaddr *sa, socklen_t salen, int dir)
 {
+	int val __maybe_unused;
+	socklen_t len __maybe_unused;
+
 	if (dir)
 		return getpeername(fd, sa, &salen);
 	else {
@@ -161,10 +164,19 @@ int sock_inet_get_dst(int fd, struct sockaddr *sa, socklen_t salen, int dir)
 
 #if defined(USE_TPROXY) && defined(SO_ORIGINAL_DST)
 		/* For TPROXY and Netfilter's NAT, we can retrieve the original
-		 * IPv4 address before DNAT/REDIRECT. We must not do that with
-		 * other families because v6-mapped IPv4 addresses are still
-		 * reported as v4.
+		 * IPv4 address before DNAT/REDIRECT. However we must not do
+		 * that for sockets created using TPROXY (in transparent mode)
+		 * because sometimes users configure them with NOTRACK only in
+		 * one direction, leading to the connection being created anyway
+		 * in reverse direction, and even without this it seldom happens
+		 * that a late retransmit of a previous connection recreates the
+		 * conntrack entry.
 		 */
+# if defined(IP_TRANSPARENT)
+		len = sizeof(val);
+		if (getsockopt(fd, IPPROTO_IP, IP_TRANSPARENT, &val, &len) == 0 && val)
+			return ret;
+# endif
 		if (getsockopt(fd, IPPROTO_IP, SO_ORIGINAL_DST, sa, &salen) == 0)
 			return 0;
 #endif
@@ -315,12 +327,6 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 			err |= ERR_RETRYABLE;
 			goto bind_ret_err;
 		}
-		/* taking the other one's FD will result in it being marked
-		 * extern and being dup()ed. Let's mark the receiver as
-		 * inherited so that it properly bypasses all second-stage
-		 * setup and avoids being passed to new processes.
-		 */
-		rx->flags |= RX_F_INHERITED;
 		rx->fd = rx->shard_info->ref->fd;
 	}
 
@@ -455,7 +461,7 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 	fd_insert(fd, rx->owner, rx->iocb, rx->bind_tgroup, rx->bind_thread);
 
 	/* for now, all regularly bound TCP listeners are exportable */
-	if (!(rx->flags & RX_F_INHERITED))
+	if (!(rx->flags & (RX_F_INHERITED_FD|RX_F_INHERITED_SOCK)))
 		HA_ATOMIC_OR(&fdtab[fd].state, FD_EXPORTED);
 
  bind_return:

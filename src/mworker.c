@@ -26,10 +26,9 @@
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
-#include <haproxy/list.h>
 #include <haproxy/log.h>
-#include <haproxy/listener.h>
 #include <haproxy/list.h>
+#include <haproxy/listener.h>
 #include <haproxy/mworker.h>
 #include <haproxy/peers.h>
 #include <haproxy/proto_sockpair.h>
@@ -122,11 +121,11 @@ void mworker_proc_list_to_env()
 
 		if (child->options & PROC_O_TYPE_MASTER)
 			type = 'm';
-		else if (child->options &= PROC_O_TYPE_WORKER)
+		else if (child->options & PROC_O_TYPE_WORKER)
 			type = 'w';
 
 		if (child->pid > -1)
-			memprintf(&msg, "%s|type=%c;fd=%d;cfd=%d;pid=%d;reloads=%d;failedreloads=%d;timestamp=%d;id=%s;version=%s", msg ? msg : "", type, child->ipc_fd[0], child->ipc_fd[1], child->pid, child->reloads, child->failedreloads, child->timestamp, child->id ? child->id : "", child->version);
+			memprintf(&msg, "%s|type=%c;fd=%d;cfd=%d;pid=%d;reloads=%d;failedreloads=%d;timestamp=%d;id=%s;version=%s", msg ? msg : "", type, child->ipc_fd[0], child->ipc_fd[1], child->pid, child->reloads, child->failedreloads, child->timestamp, child->id ? child->id : "", child->version ? child->version : "");
 	}
 	if (msg)
 		setenv("HAPROXY_PROCESSES", msg, 1);
@@ -223,8 +222,21 @@ int mworker_env_to_proc_list()
 				child->version = strdup(subtoken+8);
 			}
 		}
-		if (child->pid) {
-			LIST_APPEND(&proc_list, &child->list);
+		if (child->pid > 0) {
+			struct list *insert_pt = &proc_list;
+			struct mworker_proc *pos;
+
+			/* insert at the right position in ASC reload order;
+			 * search from the tail since items are sorted most of
+			 * the time
+			 */
+			list_for_each_entry_rev(pos, &proc_list, list) {
+				if (pos->reloads <= child->reloads) {
+					insert_pt = &pos->list;
+					break;
+				}
+			}
+			LIST_INSERT(insert_pt, &child->list);
 		} else {
 			mworker_free_child(child);
 		}
@@ -233,28 +245,18 @@ int mworker_env_to_proc_list()
 	/* set the leaving processes once we know which number of reloads are the current processes */
 
 	list_for_each_entry(child, &proc_list, list) {
-		if (child->reloads > 0)
+		if (child->reloads > 0  && !(child->options & PROC_O_TYPE_MASTER))
 			child->options |= PROC_O_LEAVING;
 	}
 
 	unsetenv("HAPROXY_PROCESSES");
 
 no_env:
-
+	/* couldn't find the master element, exiting  */
 	if (!proc_self) {
-
-		proc_self = mworker_proc_new();
-		if (!proc_self) {
-			ha_alert("Cannot allocate process structures.\n");
-			err = -1;
-			goto out;
-		}
-		proc_self->options |= PROC_O_TYPE_MASTER;
-		proc_self->pid = pid;
-		proc_self->timestamp = 0; /* we don't know the startime anymore */
-
-		LIST_APPEND(&proc_list, &proc_self->list);
-		ha_warning("The master internals are corrupted or it was started with a too old version (< 1.9). Please restart the master process.\n");
+		err = -1;
+		ha_alert("Failed to deserialize data for the master process. Unrecoverable error, exiting.\n");
+		goto out;
 	}
 
 out:
@@ -509,6 +511,14 @@ void mworker_catch_sigterm(struct sig_handler *sh)
 	mworker_kill(sig);
 }
 
+/* handle operations that can't be done in the signal handler */
+static struct task *mworker_task_child_failure(struct task *task, void *context, unsigned int state)
+{
+	mworker_unblock_signals();
+	task_destroy(task);
+	return NULL;
+}
+
 /*
  * Performs some routines for the worker process, which has failed the reload,
  * updates the global load_status.
@@ -516,6 +526,7 @@ void mworker_catch_sigterm(struct sig_handler *sh)
 static void mworker_on_new_child_failure(int exitpid, int status)
 {
 	struct mworker_proc *child;
+	struct task *t;
 
 	/* increment the number of failed reloads */
 	list_for_each_entry(child, &proc_list, list) {
@@ -532,6 +543,15 @@ static void mworker_on_new_child_failure(int exitpid, int status)
 	 * the READY=1 signal still need to be sent */
 	if (global.tune.options & GTUNE_USE_SYSTEMD)
 		sd_notify(0, "READY=1\nSTATUS=Reload failed!\n");
+
+	/* call a task to unblock the signals from outside the sig handler */
+	if ((t = task_new_here()) == NULL) {
+		ha_warning("Can't restore HAProxy signals!\n");
+		return;
+	}
+
+	t->process = mworker_task_child_failure;
+	task_wakeup(t, TASK_WOKEN_MSG);
 }
 
 /*
@@ -808,7 +828,25 @@ void mworker_cleanup_proc()
 
 struct cli_showproc_ctx {
 	int debug;
+	int resume_reload; /* reload count of the last flushed old worker row, 0 = none yet */
 };
+
+/* Append a single worker row to trash (shared between current/old sections) */
+static void cli_append_worker_row(struct cli_showproc_ctx *ctx, struct mworker_proc *child, time_t tv_sec)
+{
+	char *uptime = NULL;
+	int up = tv_sec - child->timestamp;
+
+	if (up < 0) /* must never be negative because of clock drift */
+		up = 0;
+
+	memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
+	chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s", child->pid, "worker", child->reloads, uptime, child->version);
+	if (ctx->debug)
+		chunk_appendf(&trash, "\t\t %-15d %-15d", child->ipc_fd[0], child->ipc_fd[1]);
+	chunk_appendf(&trash, "\n");
+	ha_free(&uptime);
+}
 
 /*  Displays workers and processes  */
 static int cli_io_handler_show_proc(struct appctx *appctx)
@@ -825,26 +863,31 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 
 	chunk_reset(&trash);
 
-	memprintf(&reloadtxt, "%d [failed: %d]", proc_self->reloads, proc_self->failedreloads);
-	chunk_printf(&trash, "#%-14s %-15s %-15s %-15s %-15s", "<PID>", "<type>", "<reloads>", "<uptime>", "<version>");
-	if (ctx->debug)
-		chunk_appendf(&trash, "\t\t %-15s %-15s", "<ipc_fd[0]>", "<ipc_fd[1]>");
-	chunk_appendf(&trash, "\n");
-	memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-	chunk_appendf(&trash, "%-15u %-15s %-15s %-15s %-15s", (unsigned int)getpid(), "master", reloadtxt, uptime, haproxy_version);
-	if (ctx->debug)
-		chunk_appendf(&trash, "\t\t %-15d %-15d", proc_self->ipc_fd[0], proc_self->ipc_fd[1]);
-	chunk_appendf(&trash, "\n");
+	if (ctx->resume_reload == 0) {
+		memprintf(&reloadtxt, "%d [failed: %d]", proc_self->reloads, proc_self->failedreloads);
+		chunk_printf(&trash, "#%-14s %-15s %-15s %-15s %-15s", "<PID>", "<type>", "<reloads>", "<uptime>", "<version>");
+		if (ctx->debug)
+			chunk_appendf(&trash, "\t\t %-15s %-15s", "<ipc_fd[0]>", "<ipc_fd[1]>");
+		chunk_appendf(&trash, "\n");
+
+		/* display the master only the first time */
+		memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
+		chunk_appendf(&trash, "%-15u %-15s %-15s %-15s %-15s", (unsigned int)getpid(), "master", reloadtxt, uptime, haproxy_version);
+		if (ctx->debug)
+			chunk_appendf(&trash, "\t\t %-15d %-15d", proc_self->ipc_fd[0], proc_self->ipc_fd[1]);
+		chunk_appendf(&trash, "\n");
+	}
 	ha_free(&reloadtxt);
 	ha_free(&uptime);
 
 	/* displays current processes */
-
-	chunk_appendf(&trash, "# workers\n");
+	if (ctx->resume_reload == 0)
+		chunk_appendf(&trash, "# workers\n");
 	list_for_each_entry(child, &proc_list, list) {
-		up = date.tv_sec - child->timestamp;
-		if (up < 0) /* must never be negative because of clock drift */
-			up = 0;
+
+		/* don't display current worker if we only need the next ones */
+		if (ctx->resume_reload != 0)
+			continue;
 
 		if (!(child->options & PROC_O_TYPE_WORKER))
 			continue;
@@ -853,46 +896,79 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 			old++;
 			continue;
 		}
-		memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-		chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s", child->pid, "worker", child->reloads, uptime, child->version);
-		if (ctx->debug)
-			chunk_appendf(&trash, "\t\t %-15d %-15d", child->ipc_fd[0], child->ipc_fd[1]);
-		chunk_appendf(&trash, "\n");
-		ha_free(&uptime);
-	}
-
-	/* displays old processes */
-
-	if (old) {
-		char *msg = NULL;
-
-		chunk_appendf(&trash, "# old workers\n");
-		list_for_each_entry(child, &proc_list, list) {
-			up = date.tv_sec - child->timestamp;
-			if (up <= 0) /* must never be negative because of clock drift */
-				up = 0;
-
-			if (!(child->options & PROC_O_TYPE_WORKER))
-				continue;
-
-			if (child->options & PROC_O_LEAVING) {
-				memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-				chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s", child->pid, "worker", child->reloads, uptime, child->version);
-				if (ctx->debug)
-					chunk_appendf(&trash, "\t\t %-15d %-15d", child->ipc_fd[0], child->ipc_fd[1]);
-				chunk_appendf(&trash, "\n");
-				ha_free(&uptime);
-			}
-		}
-		free(msg);
+		cli_append_worker_row(ctx, child, date.tv_sec);
 	}
 
 	if (applet_putchk(appctx, &trash) == -1)
 		return 0;
 
-	/* dump complete */
+	/* displays old processes */
+	if (old || ctx->resume_reload) { /* there's more */
+		int skip = ctx->resume_reload; /* if resuming, skip until we pass this reload count */
+		int prev_reload = 0; /* previous LEAVING entry's reload count during skip phase */
+
+		if (!ctx->resume_reload)
+			chunk_appendf(&trash, "# old workers\n");
+		list_for_each_entry(child, &proc_list, list) {
+			if (!(child->options & PROC_O_TYPE_WORKER))
+				continue;
+
+			if (!(child->options & PROC_O_LEAVING))
+				continue;
+
+			/* When resuming after a flush failure, skip entries
+			 * up to and including the last successfully flushed
+			 * row (identified by its reload count). This is
+			 * direction-agnostic: works whether the list is in
+			 * ascending or descending reload order.
+			 *
+			 * If the target entry was deleted from proc_list
+			 * (e.g. process exited between handler calls), we
+			 * detect that we've passed its former position when
+			 * two consecutive LEAVING entries straddle the skip
+			 * value — i.e. one has reloads > skip and the next
+			 * has reloads < skip (or vice versa). In that case
+			 * we stop skipping and emit the current entry.
+			 */
+			if (skip) {
+				if (child->reloads == skip) {
+					skip = 0; /* found it, resume from the next entry */
+					prev_reload = 0;
+					continue;
+				}
+				if (prev_reload &&
+				    ((prev_reload > skip) != (child->reloads > skip))) {
+					/* Crossed where skip would have been —
+					 * the entry was deleted. Stop skipping
+					 * and fall through to emit this entry.
+					 */
+					skip = 0;
+				} else {
+					prev_reload = child->reloads;
+					continue;
+				}
+			}
+
+			cli_append_worker_row(ctx, child, date.tv_sec);
+
+			if (applet_putchk(appctx, &trash) == -1) {
+				/* ctx->resume_reload already holds the last
+				 * flushed row or 0; don't update it here so
+				 * the failed row will be replayed.
+				 */
+				return 0;
+			}
+			/* This row was successfully flushed, remember it */
+			ctx->resume_reload = child->reloads;
+			chunk_reset(&trash);
+		}
+	}
+
+	/* dump complete: reset resume cursor so next 'show proc' starts from the top */
+	ctx->resume_reload = 0;
 	return 1;
 }
+
 /* reload the master process */
 static int cli_parse_show_proc(char **args, char *payload, struct appctx *appctx, void *private)
 {
@@ -1222,7 +1298,7 @@ void mworker_apply_master_worker_mode(void)
 
 		/* This one must not be exported, it's internal! */
 		unsetenv("HAPROXY_MWORKER_REEXEC");
-		ha_random_jump96(1);
+		ha_random_jump128(1);
 
 		list_for_each_entry(child, &proc_list, list) {
 			if ((child->options & PROC_O_TYPE_WORKER) && (child->options & PROC_O_INIT)) {

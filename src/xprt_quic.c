@@ -165,7 +165,7 @@ static int qc_conn_init(struct connection *conn, void **xprt_ctx)
 			goto out;
 		}
 
-		qc = qc_new_conn(srv, NULL, NULL, conn_id, NULL, &srv->addr);
+		qc = qc_new_conn(srv, NULL, NULL, conn, conn_id, NULL, &srv->addr);
 		if (!qc) {
 			pool_free(pool_head_quic_connection_id, conn_id);
 			goto out;
@@ -175,7 +175,6 @@ static int qc_conn_init(struct connection *conn, void **xprt_ctx)
 
 		conn->flags |= CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN | CO_FL_FDLESS;
 		conn->handle.qc = qc;
-		qc->conn = conn;
 	}
 
 	ret = 0;
@@ -204,7 +203,7 @@ static int qc_xprt_start(struct connection *conn, void *ctx)
 	qc = conn->handle.qc;
 	TRACE_ENTER(QUIC_EV_CONN_NEW, qc);
 
-	/* This has as side effet to create a SSL_SESSION object attached to
+	/* This has as side effect to create a SSL_SESSION object attached to
 	 * the SSL object.
 	 */
 	if (qc_is_back(qc) && !qc_ssl_do_hanshake(qc, ctx))
@@ -240,6 +239,23 @@ static void qc_xprt_dump_info(struct buffer *msg, const struct connection *conn)
 	quic_dump_qc_info(msg, conn->handle.qc);
 }
 
+static int qc_get_alpn(const struct connection *conn, void *xprt_ctx, const char **str, int *len)
+{
+	struct quic_conn *qc = conn->handle.qc;
+	int ret = 0;
+
+	TRACE_ENTER(QUIC_EV_CONN_NEW, qc);
+
+	if (qc->alpn) {
+		*str = qc->alpn;
+		*len = strlen(qc->alpn);
+		ret = 1;
+	}
+
+	TRACE_LEAVE(QUIC_EV_CONN_NEW, qc);
+	return ret;
+}
+
 /* transport-layer operations for QUIC connections. */
 static struct xprt_ops ssl_quic = {
 	.close    = quic_close,
@@ -251,7 +267,7 @@ static struct xprt_ops ssl_quic = {
 	.destroy_bind_conf = ssl_sock_destroy_bind_conf,
 	.prepare_srv = ssl_sock_prepare_srv_ctx,
 	.destroy_srv = ssl_sock_free_srv_ctx,
-	.get_alpn = ssl_sock_get_alpn,
+	.get_alpn = qc_get_alpn,
 	.get_ssl_sock_ctx = qc_get_ssl_sock_ctx,
 	.dump_info = qc_xprt_dump_info,
 	.name     = "QUIC",

@@ -127,7 +127,16 @@ static int _51d_property_name_list(char **args, int section_type, struct proxy *
 
 	while (*(args[cur_arg])) {
 		name = calloc(1, sizeof(*name));
+		if (!name) {
+			memprintf(err, "'%s' failed to allocate memory.", args[0]);
+			return -1;
+		}
 		name->name = strdup(args[cur_arg]);
+		if (!name->name) {
+			free(name);
+			memprintf(err, "'%s' failed to allocate memory.", args[0]);
+			return -1;
+		}
 		LIST_APPEND(&global_51degrees.property_names, &name->list);
 		++cur_arg;
 	}
@@ -303,6 +312,7 @@ static void _51d_init_device_offsets(fiftyoneDegreesDeviceOffsets *offsets) {
 
 static void _51d_set_device_offsets(struct sample *smp, fiftyoneDegreesDeviceOffsets *offsets)
 {
+	struct buffer *temp = get_trash_chunk();
 	struct channel *chn;
 	struct htx *htx;
 	struct http_hdr_ctx ctx;
@@ -324,7 +334,15 @@ static void _51d_set_device_offsets(struct sample *smp, fiftyoneDegreesDeviceOff
 
 		if (http_find_header(htx, name, &ctx, 1)) {
 			(offsets->firstOffset + offsets->size)->httpHeaderOffset = *(global_51degrees.header_offsets + i);
-			(offsets->firstOffset + offsets->size)->deviceOffset = fiftyoneDegreesGetDeviceOffset(&global_51degrees.data_set, ctx.value.ptr);
+			/* Copy value into trash and NUL-terminate before passing to the
+			 * 51Degrees Trie API, which expects a C string.
+			 */
+			if (ctx.value.len >= temp->size)
+				continue;
+			memcpy(temp->area, ctx.value.ptr, ctx.value.len);
+			temp->area[ctx.value.len] = '\0';
+			temp->data = ctx.value.len + 1;
+			(offsets->firstOffset + offsets->size)->deviceOffset = fiftyoneDegreesGetDeviceOffset(&global_51degrees.data_set, temp->area);
 			offsets->size++;
 		}
 	}
@@ -550,6 +568,8 @@ static void _51d_process_match(const struct arg *args, struct sample *smp)
 	char valuesBuffer[1024];
 #endif
 
+#if defined(FIFTYONEDEGREES_H_PATTERN_INCLUDED) || defined(FIFTYONEDEGREES_H_TRIE_INCLUDED) || defined(FIFTYONE_DEGREES_HASH_INCLUDED)
+
 	char no_data[] = "NoData";  /* response when no data could be found */
 	struct buffer *temp = get_trash_chunk();
 	int i = 0, found;
@@ -636,6 +656,7 @@ static void _51d_process_match(const struct arg *args, struct sample *smp)
 	smp->data.u.str.area = temp->area;
 	smp->data.u.str.data = temp->data;
 }
+#endif
 
 /* Sets the sample data as a constant string. This ensures that the
  * string will be processed correctly.
@@ -916,6 +937,10 @@ static int init_51degrees(void)
 		list_for_each_entry(name, &global_51degrees.property_names, list)
 			++i;
 		_51d_property_list = calloc(i, sizeof(*_51d_property_list));
+		if (!_51d_property_list) {
+			ha_alert("51Degrees: Failed to allocate property list.\n");
+			return (ERR_FATAL | ERR_ALERT);
+		}
 
 		i = 0;
 		list_for_each_entry(name, &global_51degrees.property_names, list)
@@ -1050,7 +1075,7 @@ static int init_51degrees(void)
 
 static void deinit_51degrees(void)
 {
-	struct _51d_property_names *_51d_prop_name, *_51d_prop_nameb;
+	struct _51d_property_names *_51d_prop_name = NULL, *_51d_prop_nameb = NULL;
 
 #if defined(FIFTYONEDEGREES_H_PATTERN_INCLUDED) || defined(FIFTYONEDEGREES_H_TRIE_INCLUDED)
 	free(global_51degrees.header_names);

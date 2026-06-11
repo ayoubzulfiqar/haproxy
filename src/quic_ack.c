@@ -68,7 +68,7 @@ static void quic_arngs_set_enc_sz(struct quic_conn *qc, struct quic_arngs *arngs
 	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
 }
 
-/* Insert <ar> ack range into <argns> tree of ack ranges.
+/* Insert <ar> ack range into <arngs> tree of ack ranges.
  * Returns the ack range node which has been inserted if succeeded, NULL if not.
  */
 static inline
@@ -86,7 +86,7 @@ struct quic_arng_node *quic_insert_new_range(struct quic_conn *qc,
 		first = eb64_first(&arngs->root);
 		BUG_ON(first == NULL);
 		eb64_delete(first);
-		pool_free(pool_head_quic_arng, first);
+		pool_free(pool_head_quic_arng, eb64_entry(first, struct quic_arng_node, first));
 		arngs->sz--;
 	}
 

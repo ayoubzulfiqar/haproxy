@@ -290,7 +290,7 @@ static struct field me_generate_field(const struct stat_col *col,
 	case STATS_PX_CAP_FE:
 	case STATS_PX_CAP_LI:
 		if (col->flags & STAT_COL_FL_SHARED) {
-			counter = (char *)&((struct fe_counters *)counters)->shared.tg;
+			counter = ((struct fe_counters *)counters)->shared.tg;
 			offset = col->metric.offset[0];
 		}
 		else
@@ -301,7 +301,7 @@ static struct field me_generate_field(const struct stat_col *col,
 	case STATS_PX_CAP_BE:
 	case STATS_PX_CAP_SRV:
 		if (col->flags & STAT_COL_FL_SHARED) {
-			counter = (char *)&((struct be_counters *)counters)->shared.tg;
+			counter = ((struct be_counters *)counters)->shared.tg;
 			offset = col->metric.offset[1];
 		}
 		else
@@ -548,8 +548,6 @@ static int stats_dump_fe_line(struct stconn *sc, struct proxy *px)
 		return 0;
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
-		void *counters;
-
 		if (ctx->flags & STAT_F_FMT_FILE)
 			continue;
 
@@ -558,8 +556,7 @@ static int stats_dump_fe_line(struct stconn *sc, struct proxy *px)
 			continue;
 		}
 
-		counters = EXTRA_COUNTERS_GET(px->extra_counters_fe, mod);
-		if (!mod->fill_stats(counters, line + stats_count, NULL))
+		if (!mod->fill_stats(mod, px->extra_counters_fe, line + stats_count, NULL))
 			continue;
 		stats_count += mod->stats_count;
 	}
@@ -699,8 +696,6 @@ static int stats_dump_li_line(struct stconn *sc, struct proxy *px, struct listen
 		return 0;
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
-		void *counters;
-
 		if (ctx->flags & STAT_F_FMT_FILE)
 			continue;
 
@@ -709,8 +704,7 @@ static int stats_dump_li_line(struct stconn *sc, struct proxy *px, struct listen
 			continue;
 		}
 
-		counters = EXTRA_COUNTERS_GET(l->extra_counters, mod);
-		if (!mod->fill_stats(counters, line + stats_count, NULL))
+		if (!mod->fill_stats(mod, l->extra_counters, line + stats_count, NULL))
 			continue;
 		stats_count += mod->stats_count;
 	}
@@ -833,7 +827,7 @@ int stats_fill_sv_line(struct proxy *px, struct server *sv, int flags,
 		stats_fill_sv_computestate(sv, ref, &state);
 	}
 
-	/* compue time values for later use */
+	/* compute time values for later use */
 	if (index == NULL || *index == ST_I_PX_QTIME ||
 	    *index == ST_I_PX_CTIME || *index == ST_I_PX_RTIME ||
 	    *index == ST_I_PX_TTIME) {
@@ -1137,8 +1131,6 @@ static int stats_dump_sv_line(struct stconn *sc, struct proxy *px, struct server
 		return 0;
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
-		void *counters;
-
 		if (ctx->flags & STAT_F_FMT_FILE)
 			continue;
 
@@ -1150,8 +1142,7 @@ static int stats_dump_sv_line(struct stconn *sc, struct proxy *px, struct server
 			continue;
 		}
 
-		counters = EXTRA_COUNTERS_GET(sv->extra_counters, mod);
-		if (!mod->fill_stats(counters, line + stats_count, NULL))
+		if (!mod->fill_stats(mod, sv->extra_counters, line + stats_count, NULL))
 			continue;
 		stats_count += mod->stats_count;
 	}
@@ -1262,6 +1253,8 @@ int stats_fill_be_line(struct proxy *px, int flags, struct field *line, int len,
 			case ST_I_PX_STATUS:
 				fld = chunk_newstr(out);
 				chunk_appendf(out, "%s", (px->lbprm.tot_weight > 0 || !px->srv) ? "UP" : "DOWN");
+				if (px->flags & PR_FL_BE_UNPUBLISHED)
+					chunk_appendf(out, " (UNPUB)");
 				if (flags & (STAT_F_HIDE_MAINT|STAT_F_HIDE_DOWN))
 					chunk_appendf(out, " (%d/%d)", nbup, nbsrv);
 				field = mkf_str(FO_STATUS, fld);
@@ -1376,8 +1369,6 @@ static int stats_dump_be_line(struct stconn *sc, struct proxy *px)
 		return 0;
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
-		struct extra_counters *counters;
-
 		if (ctx->flags & STAT_F_FMT_FILE)
 			continue;
 
@@ -1389,8 +1380,7 @@ static int stats_dump_be_line(struct stconn *sc, struct proxy *px)
 			continue;
 		}
 
-		counters = EXTRA_COUNTERS_GET(px->extra_counters_be, mod);
-		if (!mod->fill_stats(counters, line + stats_count, NULL))
+		if (!mod->fill_stats(mod, px->extra_counters_be, line + stats_count, NULL))
 			continue;
 		stats_count += mod->stats_count;
 	}
@@ -1626,11 +1616,13 @@ int stats_dump_proxies(struct stconn *sc, struct buffer *buf, struct htx *htx)
 	struct proxy *px;
 
 	/* dump proxies */
-	while (ctx->obj1) {
+	/* obj1 is updated and returned through watcher_next() */
+	for (px = ctx->obj1; px;
+	     px = watcher_next(&ctx->px_watch, px->next)) {
+
 		if (stats_is_full(appctx, buf, htx))
 			goto full;
 
-		px = ctx->obj1;
 		/* Skip the global frontend proxies and non-networked ones.
 		 * Also skip proxies that were disabled in the configuration
 		 * This change allows retrieving stats from "old" proxies after a reload.
@@ -1641,7 +1633,6 @@ int stats_dump_proxies(struct stconn *sc, struct buffer *buf, struct htx *htx)
 				return 0;
 		}
 
-		ctx->obj1 = px->next;
 		ctx->px_st = STAT_PX_ST_INIT;
 		ctx->field = 0;
 	}

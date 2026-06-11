@@ -1,4 +1,4 @@
-2020/03/05                                                        Willy Tarreau
+2026/04/27                                                        Willy Tarreau
                                                            HAProxy Technologies
                                The PROXY protocol
                                  Versions 1 & 2
@@ -30,6 +30,8 @@ Revision history
    2020/03/05 - added the unique ID TLV type (Tim Düsterhus)
    2025/09/09 - added SSL-related TLVs for key exchange group and signature
                 scheme (Steven Collison)
+   2026/01/15 - added SSL client certificate TLV (Simon Ser)
+   2026/04/27 - clarified UDP usage (Valaphee)
 
 1. Background
 
@@ -173,6 +175,11 @@ protocols where the receiver is expected to speak first (eg: SMTP, FTP or SSH).
 The receiver may apply a short timeout and decide to abort the connection if
 the protocol header is not seen within a few seconds (at least 3 seconds to
 cover a TCP retransmit).
+
+For UDP, the PROXY protocol header and the proxied UDP payload MUST be sent in
+the same datagram. The sender MUST NOT split the PROXY protocol header across
+multiple UDP datagrams, and the receiver MUST parse the header independently
+for each received datagram.
 
 The receiver MUST be configured to only receive the protocol described in this
 specification and MUST not try to guess whether the protocol header is present
@@ -536,20 +543,21 @@ the information they choose to publish.
 
 The following types have already been registered for the <type> field :
 
-        #define PP2_TYPE_ALPN              0x01
-        #define PP2_TYPE_AUTHORITY         0x02
-        #define PP2_TYPE_CRC32C            0x03
-        #define PP2_TYPE_NOOP              0x04
-        #define PP2_TYPE_UNIQUE_ID         0x05
-        #define PP2_TYPE_SSL               0x20
-        #define PP2_SUBTYPE_SSL_VERSION    0x21
-        #define PP2_SUBTYPE_SSL_CN         0x22
-        #define PP2_SUBTYPE_SSL_CIPHER     0x23
-        #define PP2_SUBTYPE_SSL_SIG_ALG    0x24
-        #define PP2_SUBTYPE_SSL_KEY_ALG    0x25
-        #define PP2_SUBTYPE_SSL_GROUP      0x26
-        #define PP2_SUBTYPE_SSL_SIG_SCHEME 0x27
-        #define PP2_TYPE_NETNS             0x30
+        #define PP2_TYPE_ALPN               0x01
+        #define PP2_TYPE_AUTHORITY          0x02
+        #define PP2_TYPE_CRC32C             0x03
+        #define PP2_TYPE_NOOP               0x04
+        #define PP2_TYPE_UNIQUE_ID          0x05
+        #define PP2_TYPE_SSL                0x20
+        #define PP2_SUBTYPE_SSL_VERSION     0x21
+        #define PP2_SUBTYPE_SSL_CN          0x22
+        #define PP2_SUBTYPE_SSL_CIPHER      0x23
+        #define PP2_SUBTYPE_SSL_SIG_ALG     0x24
+        #define PP2_SUBTYPE_SSL_KEY_ALG     0x25
+        #define PP2_SUBTYPE_SSL_GROUP       0x26
+        #define PP2_SUBTYPE_SSL_SIG_SCHEME  0x27
+        #define PP2_SUBTYPE_SSL_CLIENT_CERT 0x28
+        #define PP2_TYPE_NETNS              0x30
 
 
 2.2.1 PP2_TYPE_ALPN
@@ -625,7 +633,10 @@ For the type PP2_TYPE_SSL, the value is itself a defined like this :
                 uint8_t  client;
                 uint32_t verify;
                 struct pp2_tlv sub_tlv[0];
-        };
+        } __attribute__((packed));
+
+Note the "packed" attribute which indicates that each field starts immediately
+after the previous one (i.e. without type-specific alignment nor padding).
 
 The <verify> field will be zero if the client presented a certificate
 and it was successfully verified, and non-zero otherwise.
@@ -671,6 +682,10 @@ the key exchange algorithm used for the frontend TLS connection, for example
 The second level TLV PP2_SUBTYPE_SSL_SIG_SCHEME provides the US-ASCII string
 name of the algorithm the frontend used to sign the ServerKeyExchange or
 CertificateVerify message, for example "rsa_pss_rsae_sha256".
+
+The optional second level TLV PP2_SUBTYPE_SSL_CLIENT_CERT provides the raw
+X.509 client certificate encoded in ASN.1 DER. The frontend may choose to omit
+this TLV depending on configuration.
 
 In all cases, the string representation (in UTF8) of the Common Name field
 (OID: 2.5.4.3) of the client certificate's Distinguished Name, is appended

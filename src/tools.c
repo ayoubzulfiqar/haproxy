@@ -66,6 +66,7 @@ extern void *__elf_aux_vector;
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
 #include <haproxy/chunk.h>
+#include <haproxy/cli-t.h>
 #include <haproxy/compiler.h>
 #include <haproxy/dgram.h>
 #include <haproxy/global.h>
@@ -987,6 +988,11 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 	int new_fd = -1;
 	enum proto_type proto_type = 0; // to shut gcc warning
 	int ctrl_type = 0; // to shut gcc warning
+	/*
+	 * Indicates that we want to use an alternate protocol instead of the
+	 * default one.
+	 * Currently, only MPTCP is defined as an alternate protocol for TCP
+	 */
 	int alt_proto = 0;
 
 	portl = porth = porta = 0;
@@ -1011,7 +1017,6 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 	    ((opts & (PA_O_STREAM|PA_O_DGRAM)) == (PA_O_DGRAM|PA_O_STREAM) && (opts & PA_O_DEFAULT_DGRAM))) {
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
-		alt_proto = 1;
 	} else {
 		proto_type = PROTO_TYPE_STREAM;
 		ctrl_type = SOCK_STREAM;
@@ -1026,7 +1031,6 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		str2 += 6;
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
-		alt_proto = 1;
 	}
 	else if (strncmp(str2, "quic+", 5) == 0) {
 		str2 += 5;
@@ -1043,7 +1047,6 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		ss.ss_family = AF_UNIX;
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
-		alt_proto = 1;
 	}
 	else if (strncmp(str2, "uxst@", 5) == 0) {
 		str2 += 5;
@@ -1089,7 +1092,6 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		ss.ss_family = AF_INET;
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
-		alt_proto = 1;
 	}
 	else if (strncmp(str2, "tcp6@", 5) == 0) {
 		str2 += 5;
@@ -1109,7 +1111,6 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		ss.ss_family = AF_INET6;
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
-		alt_proto = 1;
 	}
 	else if (strncmp(str2, "tcp@", 4) == 0) {
 		str2 += 4;
@@ -1129,7 +1130,6 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		ss.ss_family = AF_UNSPEC;
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
-		alt_proto = 1;
 	}
 	else if (strncmp(str2, "quic4@", 6) == 0) {
 		str2 += 6;
@@ -1399,6 +1399,8 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 	}
 
 	if (proto || (opts & PA_O_CONNECT)) {
+		// if the socket type is SOCK_DGRAM, use by default an alternate protocol
+		alt_proto = alt_proto || (ctrl_type == SOCK_DGRAM);
 		/* Note: if the caller asks for a proto, we must find one,
 		 * except if we inherit from a raw FD (family == AF_CUST_EXISTING_FD)
 		 * orif we return with an fqdn that will resolve later,
@@ -2127,6 +2129,60 @@ char *escape_string(char *start, char *stop,
 		return start;
 	}
 	return NULL;
+}
+
+/*
+ * Appends a quoted and escaped string to a chunk buffer. The string is
+ * enclosed in double quotes and special characters are escaped with backslash:
+ * ", \, \r, \n, \b, \0
+ * Returns 0 on success, -1 if the buffer is too small (output is rolled back).
+ */
+int chunk_escape_string(struct buffer *chunk, const char *str, size_t len)
+{
+	size_t initial_data = chunk->data;
+	size_t i;
+
+	/* Opening quote */
+	if (chunk->data + 1 >= chunk->size)
+		return -1;
+	chunk->area[chunk->data++] = '"';
+
+	/* Escape and append each character */
+	for (i = 0; i < len; i++) {
+		unsigned char c = str[i];
+		const char *esc = NULL;
+
+		if (c == '"') esc = "\\\"";
+		else if (c == '\\') esc = "\\\\";
+		else if (c == '\r') esc = "\\r";
+		else if (c == '\n') esc = "\\n";
+		else if (c == '\b') esc = "\\b";
+		else if (c == '\0') esc = "\\0";
+
+		if (esc) {
+			if (chunk->data + 2 >= chunk->size) {
+				chunk->data = initial_data;
+				return -1;
+			}
+			chunk->area[chunk->data++] = esc[0];
+			chunk->area[chunk->data++] = esc[1];
+		} else {
+			if (chunk->data + 1 >= chunk->size) {
+				chunk->data = initial_data;
+				return -1;
+			}
+			chunk->area[chunk->data++] = c;
+		}
+	}
+
+	/* Closing quote */
+	if (chunk->data + 1 >= chunk->size) {
+		chunk->data = initial_data;
+		return -1;
+	}
+	chunk->area[chunk->data++] = '"';
+
+	return 0;
 }
 
 /* CBOR helper to encode an uint64 value with prefix (3bits MAJOR type)
@@ -3014,20 +3070,20 @@ size_t my_memspn(const void *str, size_t len, const void *accept, size_t acceptl
 {
 	size_t ret = 0;
 
-	while (ret < len && memchr(accept, *((int *)str), acceptlen)) {
+	while (ret < len && memchr(accept, *((const unsigned char *)str), acceptlen)) {
 		str++;
 		ret++;
 	}
 	return ret;
 }
 
-/* get length of the initial segment consisting entirely of bytes not in <rejcet> */
+/* get length of the initial segment consisting entirely of bytes not in <reject> */
 size_t my_memcspn(const void *str, size_t len, const void *reject, size_t rejectlen)
 {
 	size_t ret = 0;
 
 	while (ret < len) {
-		if(memchr(reject, *((int *)str), rejectlen))
+		if (memchr(reject, *((const unsigned char *)str), rejectlen))
 			return ret;
 		str++;
 		ret++;
@@ -3536,7 +3592,7 @@ unsigned int mask_find_rank_bit(unsigned int r, unsigned long m)
 	t  = (m >> (s - 1)) & 0x1;
 	s -= ((t - r) & 256) >> 8;
 
-       return s - 1;
+	return s - 1;
 }
 
 /* Same as mask_find_rank_bit() above but makes use of pre-computed bitmaps
@@ -4622,10 +4678,8 @@ char *memvprintf(char **out, const char *format, va_list orig_args)
 		ha_free(&ret);
 	}
 
-	if (out) {
-		free(*out);
-		*out = ret;
-	}
+	free(*out);
+	*out = ret;
 
 	return ret;
 }
@@ -4690,7 +4744,8 @@ char *indent_msg(char **out, int level)
 	needed = 1 + level * (lf + 1) + len + 1;
 	p = ret = malloc(needed);
 	if (unlikely(!ret))
-		return NULL;
+		goto leave;
+
 	in = *out;
 
 	/* skip initial LFs */
@@ -4710,6 +4765,7 @@ char *indent_msg(char **out, int level)
 	}
 	*p = 0;
 
+ leave:
 	free(*out);
 	*out = ret;
 
@@ -4844,8 +4900,10 @@ char *env_expand(char *in)
 		}
 
 		out = my_realloc2(out, out_len + (txt_end - txt_beg) + val_len + 1);
-		if (!out)
+		if (!out) {
+			free(in);
 			goto leave;
+		}
 
 		if (txt_end > txt_beg) {
 			memcpy(out + out_len, txt_beg, txt_end - txt_beg);
@@ -5606,7 +5664,7 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 	 *   - if we're isolated or in a panic, we're safe and don't need to
 	 *     lock so we don't wait.
 	 *   - otherwise we use a trylock and we fail on conflict so that
-	 *     noone waits when there is contention.
+	 *     no one waits when there is contention.
 	 */
 	isolated = thread_isolated() || (get_tainted() & TAINTED_PANIC);
 
@@ -5753,6 +5811,151 @@ const void *resolve_dso_name(struct buffer *buf, const char *pfx, const void *ad
 	return NULL;
 }
 
+/* make a simplistic tar header (512 bytes) into output for file name <fname>
+ * of size <size> and mode <mode>. An optional prefix directory name can be
+ * passed in <pfx>, and an optional symlink destination may be passed in
+ * <link>. NULL is accepted for <pfx> and <link> if unused. Note that here we
+ * may abuse the link destination that is normally not used with regular files
+ * to place a magic.
+ */
+void make_tar_header(char *output, const char *pfx, const char *fname, const char *link, size_t size, mode_t mode)
+{
+	uint i, csum;
+
+	union {
+		uchar buffer[512];            /* raw data */
+		struct {                      /* byte offset */
+			char name[100];       /*   0 */
+			char mode[8];         /* 100 : octal */
+			char uid[8];          /* 108 : octal */
+			char gid[8];          /* 116 : octal */
+			char size[12];        /* 124 : octal */
+			char mtime[12];       /* 136 : octal */
+			char chksum[8];       /* 148 : sum of the header's bytes */
+			char typeflag;        /* 156 : '0' = regular file */
+			char linkname[100];   /* 157 */
+			char magic_ver[8];    /* 257 : "ustar  \0" or "ustar\0""00" */
+			char uname[32];       /* 265 */
+			char gname[32];       /* 297 */
+			char devmajor[8];     /* 329 */
+			char devminor[8];     /* 337 */
+			char prefix[155];     /* 345 */
+			char pad12[12];       /* 500 */
+		} hdr;
+	} blk = {
+		.hdr = {
+			.name  = "",
+			.mode  = "",
+			.uid   = "0000000",
+			.gid   = "0000000",
+			.size  = "00000000000",
+			.mtime = "00000000000",
+			.chksum = { ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ' },
+			.typeflag = '0',  // regular file
+			.magic_ver = { 'u', 's', 't', 'a', 'r', '\0', '0', '0' },
+			.uname = "root",
+			.gname = "root",
+			.devmajor = "0",
+			.devminor = "0",
+		},
+	};
+
+	strlcpy2(blk.hdr.linkname, link ? link : NULL, sizeof(blk.hdr.linkname));
+	strlcpy2(blk.hdr.prefix, pfx ? pfx : NULL, sizeof(blk.hdr.prefix));
+	strlcpy2(blk.hdr.name, fname, sizeof(blk.hdr.name));
+	snprintf(blk.hdr.size, sizeof(blk.hdr.size), "%llo", (ullong)size);
+	snprintf(blk.hdr.mode, sizeof(blk.hdr.mode), "%07o", (uint)mode & 0x1FFFFF);
+
+	/* cksum: 6 octal bytes followed by NUL then space. Computed with cksum
+	 * preset to 8 spaces.
+	 */
+	for (i = csum = 0; i < 512; i++)
+		csum += blk.buffer[i];
+
+	snprintf(blk.hdr.chksum, sizeof(blk.hdr.chksum), "%06o", csum);
+	memcpy(output, &blk, sizeof(blk));
+}
+
+/* appends file <input> into the tar file at location <storage> and size
+ * <size>. The file's location in the archive will appear at <pfx>/<fname>. If
+ * <pfx> is NULL, no prefix is inserted. Note that <pfx> must not end with a
+ * slash. If <fname> is NULL, then the basename of <input> is used. If <input>
+ * is NULL, then <fname> is used. The two may not be NULL simultaneously. An
+ * optional <link> tag (100 chars max) may be added if not NULL. The file's
+ * mode is set with just r/x depending on what was present, or zero in case of
+ * open error (so as to keep trace of the attempt to load the file). Returns 0
+ * on success, non-zero with errno set on error.
+ */
+int load_file_into_tar(char **storage, size_t *size, const char *pfx, const char *fname, const char *input, const char *link)
+{
+	size_t alloc_size;
+	ssize_t fsize = 0;
+	struct stat buf;
+	ssize_t ret = -1;
+	mode_t mode;
+	int fd = -1;
+	char *ptr;
+
+	if (!input)
+		input = fname;
+	else if (!fname) {
+		fname = strrchr(input, '/');
+		if (!fname++)
+			fname = input;
+	}
+
+	/* do not concatenate slashes */
+	if (*fname == '/')
+		fname++;
+
+	if (stat(input, &buf) != 0)
+		goto leave;
+
+	fsize = buf.st_size;
+
+	/* only keep read and exec */
+	mode = buf.st_mode;
+	if (mode & 0111)
+		mode |= 0111;
+	if (mode & 0444)
+		mode |= 0444;
+	mode &= 0555;
+
+	/* Open the file. In case of failure, we'll still create an entry of
+	 * size zero to indicate that we tried to read this file.
+	 */
+	fd = open(input, O_RDONLY);
+	if (fd < 0) {
+		fsize = 0;
+		mode = 0;
+	}
+
+	/* we need one 512B block for the header + as many 512B blocks as
+	 * needed for the file.
+	 */
+	alloc_size = (fsize + 512 + 511) & -512;
+	ptr = realloc(*storage, *size + alloc_size);
+	if (!ptr)
+		goto leave;
+
+	*storage = ptr;
+	ptr += *size;        // previous end
+	*size += alloc_size; // new end
+
+	make_tar_header(ptr, pfx, fname, link, fsize, mode);
+
+	ret = fsize ? read(fd, ptr + 512, fsize) : 0;
+	/* always pad with zeroes (complete of partial reads) */
+	if (ret < 0)
+		ret = 0;
+	memset(ptr + 512 + ret, 0, alloc_size - 512 - ret);
+
+ leave:
+	if (fd >= 0)
+		close(fd);
+	return ret == fsize ? 0 : 1;
+}
+
 /* On systems where this is supported, let's provide a possibility to enumerate
  * the list of object files. The output is appended to a buffer initialized by
  * the caller, with one name per line. A trailing zero is always emitted if data
@@ -5830,6 +6033,172 @@ int dump_libs(struct buffer *output, int with_addr)
 	dl_iterate_phdr(dl_dump_libs_cb, &ctx);
 	return output->data != old_data;
 }
+
+/* the private <data> we pass below is a dump context initialized like this */
+struct dl_collect_ctx {
+	char *storage;
+	size_t size;
+	char *prefix;
+	int pos;
+	char libpthread_path[PATH_MAX];
+};
+
+static int dl_collect_libs_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+	struct dl_collect_ctx *ctx = data;
+	const char *fname;
+
+	if (!info || !info->dlpi_name)
+		goto leave;
+
+	if (!*info->dlpi_name)
+		fname = get_exec_path();
+	else if (strchr(info->dlpi_name, '/'))
+		fname = info->dlpi_name;
+	else
+		/* else it's a VDSO or similar and we're not interested */
+		goto leave;
+
+	if (!fname)
+		goto leave;
+
+	load_file_into_tar(&ctx->storage, &ctx->size, ctx->prefix, fname, NULL, "haproxy-libs-dump");
+
+	/* try to load equivalent debug symbols for absolute paths  */
+	if (*fname == '/') {
+		char dbg[PATH_MAX];
+
+		snprintf(dbg, sizeof(dbg), "/usr/lib/debug%s", fname);
+		load_file_into_tar(&ctx->storage, &ctx->size, ctx->prefix, dbg, NULL, "haproxy-libs-dump");
+	}
+
+	/* check if we're loading libpthread or libc, and if so, keep a copy of its path */
+	if (!ctx->libpthread_path[0]) {
+		const char *basename = strrchr(fname, '/');
+
+		if (basename &&
+		    (strncmp(basename, "/libpthread.so", 14) == 0 ||
+		     strncmp(basename, "/libc.so", 8) == 0)) {
+			/* Note: this will trim the trailing slash */
+			strncpy(ctx->libpthread_path, fname,
+			        MIN(basename - fname, sizeof(ctx->libpthread_path)));
+		}
+	}
+ leave:
+	/* increment the object's number */
+	ctx->pos++;
+	return 0;
+}
+
+/* dumps lib names and optionally address ranges */
+void collect_libs(void)
+{
+	struct dl_collect_ctx ctx = { .storage = NULL, .size = 0, .pos = 0, .libpthread_path = "" };
+	const char *libthr_paths[] = { ctx.libpthread_path, "/usr/lib64", "/lib64", "/usr/lib", "/lib", NULL };
+	ulong pagesize = sysconf(_SC_PAGESIZE);
+	char dir_name[16];
+	size_t new_size;
+	void *page;
+	int i;
+
+	/* already done */
+	if (lib_storage)
+		return;
+
+	/* prepend a directory named after the starting pid */
+	snprintf(dir_name, sizeof(dir_name), "core-%u", getpid());
+	ctx.prefix = dir_name;
+
+	/* callbacks will (re-)allocate ctx->storage */
+	dl_iterate_phdr(dl_collect_libs_cb, &ctx);
+
+	/* if we've found libpthread, there's likely a libthread_db.so.1 next
+	 * to it, for use with gdb, and ctx.libpthread_path will point to it,
+	 * and with it, libthr_paths[0]. Otherwise we search in a few other
+	 * common paths.
+	 */
+	for (i = 0; libthr_paths[i]; i++) {
+		char path[PATH_MAX];
+
+		if (!*libthr_paths[i])
+			continue;
+
+		snprintf(path, sizeof(path), "%s/libthread_db.so.1", DISGUISE(libthr_paths[i]));
+		if (load_file_into_tar(&ctx.storage, &ctx.size, ctx.prefix, path, NULL, "haproxy-libs-dump") == 0)
+			break;
+	}
+
+	/* now that the archive is complete, we need to close it by appending
+	 * two empty 512B blocks. We'll also place it aligned in an isolated
+	 * mapped area so that it uses its own segment in a core dump for
+	 * easier locating. In order to do this, we'll allocate two extra
+	 * pages and will punch holes around.
+	 */
+	new_size = (ctx.size + 2*512 + 2*pagesize + pagesize - 1) & -pagesize;
+	page = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	if (page != MAP_FAILED) {
+		/* punch holes around that won't go into the core */
+		mprotect(page, pagesize, PROT_NONE);
+		mprotect(page + new_size - pagesize, pagesize, PROT_NONE);
+		new_size -= 2*pagesize;
+		page += pagesize;
+		/* copy and make read-only */
+		memcpy(page, ctx.storage, ctx.size);
+		mprotect(page, new_size, PROT_READ);
+		vma_set_name(page, new_size, "archive", "boot-libs");
+
+		lib_storage = page;
+		lib_size = new_size;
+	}
+
+	/* don't need the temporary storage anymore */
+	ha_free(&ctx.storage);
+}
+
+/* release memory associated to collected libs */
+void free_collected_libs(void)
+{
+	if (!lib_storage || !lib_size)
+		return;
+	munmap(lib_storage, lib_size);
+	lib_storage = NULL;
+	lib_size = 0;
+}
+
+/* Prepare the archive in RAM and copy it to a target file. Returns <0 upon error. */
+int copy_libs_to_file(void)
+{
+	ssize_t len;
+	int ret = -1;
+	int fd = -1;
+
+	fd = open(lib_output_file, O_CREAT | O_WRONLY, S_IRWXU);
+	if (fd < 0) {
+		ha_alert("Cannot create output file to dump dependencies: %s.\n", strerror(errno));
+		goto fail;
+	}
+
+	collect_libs();
+	if (!lib_storage || !lib_size) {
+		ha_alert("Failed to collect dependencies.\n");
+		goto fail;
+	}
+
+	len = write(fd, lib_storage, lib_size);
+	if (len != lib_size) {
+		ha_alert("Failed to write dependencies to output file: %s.\n", strerror(errno));
+		goto fail;
+	}
+
+	/* OK done */
+	ret = 0;
+ fail:
+	if (fd >= 0)
+		close(fd);
+	return ret;
+}
+
 # else // no DL_ITERATE_PHDR
 #  error "No dump_libs() function for this platform"
 # endif
@@ -5839,6 +6208,22 @@ int dump_libs(struct buffer *output, int with_addr)
 int dump_libs(struct buffer *output, int with_addr)
 {
 	return 0;
+}
+
+/* unsupported platform: do not collect anything */
+void collect_libs(void)
+{
+}
+
+/* unsupported platform: nothing to free */
+void free_collected_libs(void)
+{
+}
+
+/* unsupported platform: do not copy anything */
+int copy_libs_to_file(void)
+{
+	return -1;
 }
 
 #endif // HA_HAVE_DUMP_LIBS
@@ -5909,48 +6294,106 @@ int varint_bytes(uint64_t v)
 	return len;
 }
 
+/* secret used for XXH hash involved in PRNG */
+static char ha_random_xxh_secret[XXH3_SECRET_DEFAULT_SIZE] ALIGNED(64);
 
-/* Random number generator state, see below */
-static uint64_t ha_random_state[2] ALIGNED(2*sizeof(uint64_t));
-
-/* This is a thread-safe implementation of xoroshiro128** described below:
- *     http://prng.di.unimi.it/
- * It features a 2^128 long sequence, returns 64 high-quality bits on each call,
- * supports fast jumps and passes all common quality tests. It is thread-safe,
- * uses a double-cas on 64-bit architectures supporting it, and falls back to a
- * local lock on other ones.
+/* 2^256 sequnce thread-local PRNG state known as "XOSHIRO256**".
+ * See details here:
+ *   https://prng.di.unimi.it/
+ *   https://prng.di.unimi.it/xoshiro256starstar.c
+ * It features a 2^256 long sequence, returns 64 high-quality bits on each call,
+ * supports fast jumps and passes all common quality tests. Supporting 128-bit
+ * jumps, it allows to run thread-local with non-overlapping sequences. It must
+ * be seeded otherwise the ratio of zeroes is a bit high initially.
  */
-uint64_t ha_random64()
+static THREAD_LOCAL uint64_t ha_random_state[4];
+
+/* Returns the next 64-bit PRNG number from the thread-local 256-bit state and
+ * makes the internal state progress by one step. This is meant to be used by
+ * other local functions. Since its discloses the PRNG's internal state, it
+ * must not be called to produce externally visible randoms.
+ */
+static inline uint64_t _ha_random64_internal(void)
 {
-	uint64_t old[2] ALIGNED(2*sizeof(uint64_t));
-	uint64_t new[2] ALIGNED(2*sizeof(uint64_t));
+	const uint64_t result = rotl64(ha_random_state[1] * 5, 7) * 9;
+	const uint64_t t = ha_random_state[1] << 17;
 
-#if defined(USE_THREAD) && (!defined(HA_CAS_IS_8B) || !defined(HA_HAVE_CAS_DW))
-	static HA_SPINLOCK_T rand_lock;
+	ha_random_state[2] ^= ha_random_state[0];
+	ha_random_state[3] ^= ha_random_state[1];
+	ha_random_state[1] ^= ha_random_state[2];
+	ha_random_state[0] ^= ha_random_state[3];
+	ha_random_state[2] ^= t;
+	ha_random_state[3] = rotl64(ha_random_state[3], 45);
+	return result;
+}
 
-	HA_SPIN_LOCK(OTHER_LOCK, &rand_lock);
-#endif
+/* Returns the next 64-bit PRNG number from the thread-local 256-bit state and
+ * makes the internal state progress by one step. Since its discloses the PRNG's
+ * internal state, it must not be called to produce externally visible randoms.
+ */
+uint64_t ha_random64_internal(void)
+{
+	return _ha_random64_internal();
+}
 
-	old[0] = ha_random_state[0];
-	old[1] = ha_random_state[1];
+/* This function uses a pre-calculated jump table to of 4 uint64_t to perform a
+ * jump equivalent to multiple calls to ha_random_next(). It shouldn't be
+ * used directly but only from the next functions.
+ */
+static void _ha_random_jump(const uint64_t *table)
+{
+	uint64_t s0, s1, s2, s3;
+	uint i, j;
 
-#if defined(USE_THREAD) && defined(HA_CAS_IS_8B) && defined(HA_HAVE_CAS_DW)
-	do {
-#endif
-		new[1] = old[0] ^ old[1];
-		new[0] = rotl64(old[0], 24) ^ new[1] ^ (new[1] << 16); // a, b
-		new[1] = rotl64(new[1], 37); // c
+	s0 = s1 = s2 = s3 = 0;
+	for (i = 0; i < 4; i++) {
+		for (j = 0; j < 64; j++) {
+			if (table[i] & (1ULL << j)) {
+				s0 ^= ha_random_state[0];
+				s1 ^= ha_random_state[1];
+				s2 ^= ha_random_state[2];
+				s3 ^= ha_random_state[3];
+			}
+			ha_random64_internal();
+		}
+	}
 
-#if defined(USE_THREAD) && defined(HA_CAS_IS_8B) && defined(HA_HAVE_CAS_DW)
-	} while (unlikely(!_HA_ATOMIC_DWCAS(ha_random_state, old, new)));
-#else
-	ha_random_state[0] = new[0];
-	ha_random_state[1] = new[1];
-#if defined(USE_THREAD)
-	HA_SPIN_UNLOCK(OTHER_LOCK, &rand_lock);
-#endif
-#endif
-	return rotl64(old[0] * 5, 7) * 9;
+	ha_random_state[0] = s0;
+	ha_random_state[1] = s1;
+	ha_random_state[2] = s2;
+	ha_random_state[3] = s3;
+}
+
+/* This function is equivalent to calling <dist> times 2^128 calls to
+ * ha_random_next(). It can be used to generate 2^128 non-overlapping
+ * sequences. The <dist> argument is the distance to jump to and is used
+ * in a loop so it rather not be too large if the processing time is a
+ * concern. It only applies to the current thread. Note that <dist> may
+ * not be zero.
+ */
+void ha_random_jump128(uint32_t dist)
+{
+	static const uint64_t table[] = { 0x180ec6d33cfd0aba, 0xd5a61266f0c9392c, 0xa9582618e03fc9aa, 0x39abdc4529b1661c };
+
+	BUG_ON(!dist);
+	while (dist--)
+		_ha_random_jump(table);
+}
+
+/* This function is equivalent to calling <dist> times 2^192 calls to
+ * ha_random_next(). It can be used to generate 2^64 non-overlapping
+ * sequences. The <dist> argument is the distance to jump to and is used
+ * in a loop so it rather not be too large if the processing time is a
+ * concern. It only applies to the current thread. Note that <dist> may
+ * not be zero.
+ */
+void ha_random_jump192(uint32_t dist)
+{
+	static const uint64_t table[] = { 0x76e15d3efefdcbbf, 0xc5004e441c522fb3, 0x77710069854ee241, 0x39109bb02acbe635 };
+
+	BUG_ON(!dist);
+	while (dist--)
+		_ha_random_jump(table);
 }
 
 /* seeds the random state using up to <len> bytes from <seed>, starting with
@@ -5980,43 +6423,49 @@ void ha_random_seed(const unsigned char *seed, size_t len)
 		len = sizeof(ha_random_state);
 
 	memcpy(ha_random_state, seed, len);
+
+	/* also initialize the secret table used by XXH3 */
+	XXH3_generateSecret(ha_random_xxh_secret, sizeof(ha_random_xxh_secret), seed, len);
 }
 
-/* This causes a jump to (dist * 2^96) places in the pseudo-random sequence,
- * and is equivalent to calling ha_random64() as many times. It is used to
- * provide non-overlapping sequences of 2^96 numbers (~7*10^28) to up to 2^32
- * different generators (i.e. different processes after a fork). The <dist>
- * argument is the distance to jump to and is used in a loop so it rather not
- * be too large if the processing time is a concern.
- *
- * BEWARE: this function is NOT thread-safe and must not be called during
- * concurrent accesses to ha_random64().
- */
-void ha_random_jump96(uint32_t dist)
+/* Seed the PRNG for the current thread */
+void ha_random_seed_thread(void)
 {
-	while (dist--) {
-		uint64_t s0 = 0;
-		uint64_t s1 = 0;
-		int b;
+	/* seed already done for first thread, but jump still necessary */
+	if (tid > 0)
+		ha_random_seed(boot_seed, sizeof(boot_seed));
+	ha_random_jump192(tid + 1);
+}
 
-		for (b = 0; b < 64; b++) {
-			if ((0xd2a98b26625eee7bULL >> b) & 1) {
-				s0 ^= ha_random_state[0];
-				s1 ^= ha_random_state[1];
-			}
-			ha_random64();
-		}
+/* Returns a uint64_t random hashed so as not to disclose the internal PRNG
+ * state. The function uses a local XXH secret that is created at boot, and
+ * now_ns as the seed to limit remote analysis.
+ */
+uint64_t ha_random64(void)
+{
+	uint64_t ret;
 
-		for (b = 0; b < 64; b++) {
-			if ((0xdddf9b1090aa7ac1ULL >> b) & 1) {
-				s0 ^= ha_random_state[0];
-				s1 ^= ha_random_state[1];
-			}
-			ha_random64();
-		}
-		ha_random_state[0] = s0;
-		ha_random_state[1] = s1;
-	}
+	ret = _ha_random64_internal();
+	return XXH3_64bits_withSecretandSeed(&ret, sizeof(ret),
+	                                     ha_random_xxh_secret, sizeof(ha_random_xxh_secret),
+	                                     now_ns);
+}
+
+/* Returns a pair of uint64_t randoms hashed so as not to disclose the internal
+ * PRNG state. This function shouldn't be used directly, better use the public
+ * ha_random64_pair_hashed() which calls it. The function uses a local XXH
+ * secret that is created at boot, and now_ns as the seed to limit remote
+ * analysis.
+ */
+struct uint64_pair _ha_random64_pair_hashed(void)
+{
+	XXH128_hash_t ret;
+	ret = XXH3_128bits_withSecretandSeed(ha_random_state, 2*sizeof(uint64_t),
+					     ha_random_xxh_secret, sizeof(ha_random_xxh_secret),
+					     now_ns);
+	/* update the internal state */
+	_ha_random64_internal();
+       return (struct uint64_pair){ .l = ret.low64, .h = ret.high64 };
 }
 
 /* Generates an RFC 9562 version 4 UUID into chunk
@@ -6024,23 +6473,15 @@ void ha_random_jump96(uint32_t dist)
  */
 void ha_generate_uuid_v4(struct buffer *output)
 {
-	uint32_t rnd[4];
-	uint64_t last;
+	uint64_t l, h;
 
-	last = ha_random64();
-	rnd[0] = last;
-	rnd[1] = last >> 32;
-
-	last = ha_random64();
-	rnd[2] = last;
-	rnd[3] = last >> 32;
-
+	ha_random64_pair_hashed(&l, &h);
 	chunk_printf(output, "%8.8x-%4.4x-%4.4x-%4.4x-%12.12llx",
-	             rnd[0],
-	             rnd[1] & 0xFFFF,
-	             ((rnd[1] >> 16u) & 0xFFF) | 0x4000,  // highest 4 bits indicate the uuid version
-	             (rnd[2] & 0x3FFF) | 0x8000,  // the highest 2 bits indicate the UUID variant (10),
-	             (long long)((rnd[2] >> 14u) | ((uint64_t) rnd[3] << 18u)) & 0xFFFFFFFFFFFFull);
+	             (uint)l,
+	             (uint)(l >> 32) & 0xFFFF,
+	             (uint)((l >> 48) & 0xFFF) | 0x4000,  // highest 4 bits indicate the uuid version
+	             (uint)(h & 0x3FFF) | 0x8000,  // the highest 2 bits indicate the UUID variant (10),
+	             (long long)(rotl64(h, 50) & 0xFFFFFFFFFFFFull));
 }
 
 /* Generates an RFC 9562 version 7 UUID into chunk
@@ -6048,24 +6489,18 @@ void ha_generate_uuid_v4(struct buffer *output)
  */
 void ha_generate_uuid_v7(struct buffer *output)
 {
-	uint32_t rnd[3];
-	uint64_t last;
+	uint64_t l, h;
 	uint64_t time;
 
 	time = (date.tv_sec * 1000) + (date.tv_usec / 1000);
-	last = ha_random64();
-	rnd[0] = last;
-	rnd[1] = last >> 32;
 
-	last = ha_random64();
-	rnd[2] = last;
-
+	ha_random64_pair_hashed(&l, &h);
 	chunk_printf(output, "%8.8x-%4.4x-%4.4x-%4.4x-%12.12llx",
 	             (uint)(time >> 16u),
 	             (uint)(time & 0xFFFF),
-	             ((rnd[0] >> 16u) & 0xFFF) | 0x7000,  // highest 4 bits indicate the uuid version
-	             (rnd[1] & 0x3FFF) | 0x8000,  // the highest 2 bits indicate the UUID variant (10),
-	             (long long)((rnd[1] >> 14u) | ((uint64_t) rnd[2] << 18u)) & 0xFFFFFFFFFFFFull);
+	             (uint)((l >> 16) & 0xFFF) | 0x7000,  // highest 4 bits indicate the uuid version
+	             (uint)(h & 0x3FFF) | 0x8000,  // the highest 2 bits indicate the UUID variant (10),
+	             (long long)(rotl64(h, 50) & 0xFFFFFFFFFFFFull));
 }
 
 
@@ -6582,6 +7017,9 @@ ssize_t read_line_to_trash(const char *path_fmt, ...)
 			trash.data--;
 		trash.area[trash.data] = 0;
 		ret = trash.data; // success
+	} else if (feof(file)) {
+		/* empty file is allowed */
+		ret = 0;
 	}
 
 	fclose(file);
@@ -6646,11 +7084,10 @@ void update_word_fingerprint_with_len(uint8_t *fp, struct ist word)
 	int c;
 
 	from = 28; // begin
-	for (p = word.ptr; p < word.ptr + word.len; p++) {
+	for (p = word.ptr; p < istend(word); p++) {
 		c = tolower((unsigned char)*p);
 		switch(c) {
 		case 'a'...'z': to = c - 'a' + 1; break;
-		case 'A'...'Z': to = tolower((unsigned char )c) - 'a' + 1; break;
 		case '0'...'9': to = 27; break;
 		default:        to = 28; break;
 		}
@@ -6748,9 +7185,8 @@ const char *hash_ipanon(uint32_t scramble, char *ipstring, int hasport)
 	int port;
 
 	index_hash++;
-        if (index_hash == NB_L_HASH_WORD) {
-                index_hash = 0;
-	}
+	if (index_hash == NB_L_HASH_WORD)
+		index_hash = 0;
 
 	if (scramble == 0) {
 		return ipstring;
@@ -6831,7 +7267,7 @@ const char *hash_ipanon(uint32_t scramble, char *ipstring, int hasport)
 /* Initialize array <fp> with the fingerprint of word <word> by counting the
  * transitions between characters. <fp> is a 1024-entries array indexed as
  * 32*from+to. Positions for 'from' and 'to' are:
- *   0..25=letter, 26=digit, 27=other, 28=begin, 29=end, others unused.
+ *   1..26=letter, 27=digit, 28=other/begin/end.
  */
 void make_word_fingerprint(uint8_t *fp, const char *word)
 {
@@ -6842,7 +7278,7 @@ void make_word_fingerprint(uint8_t *fp, const char *word)
 /* Initialize array <fp> with the fingerprint of word <word> by counting the
  * transitions between characters. <fp> is a 1024-entries array indexed as
  * 32*from+to. Positions for 'from' and 'to' are:
- *   0..25=letter, 26=digit, 27=other, 28=begin, 29=end, others unused.
+ *   1..26=letter, 27=digit, 28=other/begin/end.
  */
 void make_word_fingerprint_with_len(uint8_t *fp, struct ist word)
 {
@@ -7182,7 +7618,7 @@ REGISTER_PER_THREAD_INIT(init_tools_per_thread);
  */
 char *fgets_from_mem(char* buf, int size, const char **position, const char *end)
 {
-	char *new_pos;
+	const char *new_pos;
 	int len = 0;
 
 	/* keep fgets behaviour */
@@ -7238,6 +7674,12 @@ int backup_env(void)
 		if (*tmp == NULL) {
 			ha_alert("Cannot allocate memory to backup env variable '%s'.\n",
 				 *env);
+			tmp = init_env;
+			while (*tmp) {
+				free(*tmp);
+				tmp++;
+			}
+			ha_free(&init_env);
 			return -1;
 		}
 		tmp++;
@@ -7432,11 +7874,89 @@ void ha_freearray(char ***array)
 	char **r = *array;
 
 	for (i = 0; r && r[i]; i++) {
-		free(r[i]);
-		r[i] = NULL;
+		ha_free(&r[i]);
 	}
 	*array = NULL;
 }
+
+/*
+ * Secure implementation of memset that cannot be optimized away.
+ */
+void ha_memset_s(void *s, int c, size_t n)
+{
+	memset(s, c, n);
+	__asm__ __volatile__("" : : "r"(s) : "memory");
+}
+
+/* Optionally appends the thread execution context as a string to the output,
+ * prefixed with <pfx> and suffixed with <sfx> if not NULL and only when the
+ * context type is not TH_EX_CTX_NONE. Otherwise it does nothing and leaves the
+ * chunk untouched.
+ */
+void chunk_append_thread_ctx(struct buffer *output, const struct thread_exec_ctx *ctx, const char *pfx, const char *sfx)
+{
+	if (!ctx->type)
+		return;
+
+	chunk_appendf(output,"%s", pfx ? pfx : "");
+
+	switch (ctx->type) {
+	case TH_EX_CTX_INITCALL: {
+		const char *file = ctx->initcall->loc_file;
+		const char *slash = strrchr(file, '/');
+		slash = slash ? slash + 1 : file;
+		chunk_appendf(output,"ctx registered at %s:%d", slash, ctx->initcall->loc_line);
+		break;
+	}
+	case TH_EX_CTX_CALLER: {
+		const char *file = ctx->ha_caller->file;
+		const char *slash = strrchr(file, '/');
+		slash = slash ? slash + 1 : file;
+		chunk_appendf(output,"ctx registered at %s@%s:%d", ctx->ha_caller->func, slash, ctx->ha_caller->line);
+		break;
+	}
+	case TH_EX_CTX_SMPF:
+		chunk_appendf(output,"smpf kwl starting with '%s'", ctx->smpf_kwl->kw[0].kw);
+		break;
+	case TH_EX_CTX_CONV:
+		chunk_appendf(output,"conv kwl starting with '%s'", ctx->conv_kwl->kw[0].kw);
+		break;
+	case TH_EX_CTX_FUNC:
+		resolve_sym_name(output, "func '", ctx->pointer);
+		chunk_appendf(output,"'");
+		break;
+	case TH_EX_CTX_ACTION:
+		chunk_appendf(output,"act kwl starting with '%s'", ctx->action_kwl->kw[0].kw);
+		break;
+	case TH_EX_CTX_FLT:
+		chunk_appendf(output,"flt '%s'", ctx->flt_conf->id);
+		break;
+	case TH_EX_CTX_MUX:
+		chunk_appendf(output,"mux '%s'", ctx->mux_ops->name);
+		break;
+	case TH_EX_CTX_TASK:
+		resolve_sym_name(output, "task '", ctx->task);
+		chunk_appendf(output,"'");
+		break;
+	case TH_EX_CTX_APPLET:
+		chunk_appendf(output,"applet '%s'", ctx->applet->name);
+		break;
+	case TH_EX_CTX_CLI_KWL:
+		chunk_appendf(output,"cli kwl starting with '%s %s %s %s %s'",
+			      ctx->cli_kwl->kw[0].str_kw[0],
+			      ctx->cli_kwl->kw[0].str_kw[1] ? ctx->cli_kwl->kw[0].str_kw[1] : "",
+			      ctx->cli_kwl->kw[0].str_kw[2] ? ctx->cli_kwl->kw[0].str_kw[2] : "",
+			      ctx->cli_kwl->kw[0].str_kw[3] ? ctx->cli_kwl->kw[0].str_kw[3] : "",
+			      ctx->cli_kwl->kw[0].str_kw[4] ? ctx->cli_kwl->kw[0].str_kw[4] : "");
+		break;
+	default:
+		chunk_appendf(output,"other ctx %p", ctx->pointer);
+		break;
+	}
+
+	chunk_appendf(output,"%s", sfx ? sfx : "");
+}
+
 
 /*
  * Local variables:

@@ -29,8 +29,11 @@ struct show_prof_ctx {
 	int dump_step;  /* 0,1,2,4,5,6; see cli_iohandler_show_profiling() */
 	int linenum;    /* next line to be dumped (starts at 0) */
 	int maxcnt;     /* max line count per step (0=not set)  */
-	int by_what;    /* 0=sort by usage, 1=sort by address, 2=sort by time */
+	int by_what;    /* 0=sort by usage, 1=sort by address, 2=sort by time, 3=sort by ctx */
 	int aggr;       /* 0=dump raw, 1=aggregate on callee    */
+	/* 4-byte hole here */
+	struct sched_activity *tmp_activity; /* dynamically allocated during dumps */
+	struct memprof_stats *tmp_memstats; /* dynamically allocated during dumps */
 };
 
 /* CLI context for the "show activity" command */
@@ -60,10 +63,10 @@ uint64_t prof_mem_start_ns = 0;
 uint64_t prof_mem_stop_ns = 0;
 
 /* One struct per thread containing all collected measurements */
-struct activity activity[MAX_THREADS] __attribute__((aligned(64))) = { };
+struct activity activity[MAX_THREADS] = { };
 
 /* One struct per function pointer hash entry (SCHED_ACT_HASH_BUCKETS values, 0=collision) */
-struct sched_activity sched_activity[SCHED_ACT_HASH_BUCKETS] __attribute__((aligned(64))) = { };
+struct sched_activity sched_activity[SCHED_ACT_HASH_BUCKETS] = { };
 
 
 #ifdef USE_MEMORY_PROFILING
@@ -77,7 +80,10 @@ static const char *const memprof_methods[MEMPROF_METH_METHODS] = {
 struct memprof_stats memprof_stats[MEMPROF_HASH_BUCKETS + 1] = { };
 
 /* used to detect recursive calls */
-static THREAD_LOCAL int in_memprof = 0;
+#define MEMPROF_IN_INIT (1U << 0)
+#define MEMPROF_IN_HANDLER (1U << 1)
+
+static THREAD_LOCAL uint in_memprof = 0;  // arithmetic OR of MEMPROF_IN_*
 
 /* These ones are used by glibc and will be called early. They are in charge of
  * initializing the handlers with the original functions.
@@ -134,7 +140,7 @@ static __attribute__((noreturn)) void memprof_die(const char *msg)
  */
 static void memprof_init()
 {
-	in_memprof++;
+	in_memprof |= MEMPROF_IN_INIT;
 	memprof_malloc_handler  = get_sym_next_addr("malloc");
 	if (!memprof_malloc_handler)
 		memprof_die("FATAL: malloc() function not found.\n");
@@ -165,7 +171,7 @@ static void memprof_init()
 	memprof_aligned_alloc_handler  = get_sym_next_addr("aligned_alloc");
 	memprof_posix_memalign_handler = get_sym_next_addr("posix_memalign");
 
-	in_memprof--;
+	in_memprof &= ~MEMPROF_IN_INIT;
 }
 
 /* the initial handlers will initialize all regular handlers and will call the
@@ -174,7 +180,7 @@ static void memprof_init()
  */
 static void *memprof_malloc_initial_handler(size_t size)
 {
-	if (in_memprof) {
+	if (in_memprof & MEMPROF_IN_INIT) {
 		/* it's likely that dlsym() needs malloc(), let's fail */
 		return NULL;
 	}
@@ -185,7 +191,7 @@ static void *memprof_malloc_initial_handler(size_t size)
 
 static void *memprof_calloc_initial_handler(size_t nmemb, size_t size)
 {
-	if (in_memprof) {
+	if (in_memprof & MEMPROF_IN_INIT) {
 		/* it's likely that dlsym() needs calloc(), let's fail */
 		return NULL;
 	}
@@ -195,7 +201,7 @@ static void *memprof_calloc_initial_handler(size_t nmemb, size_t size)
 
 static void *memprof_realloc_initial_handler(void *ptr, size_t size)
 {
-	if (in_memprof) {
+	if (in_memprof & MEMPROF_IN_INIT) {
 		/* it's likely that dlsym() needs realloc(), let's fail */
 		return NULL;
 	}
@@ -206,7 +212,7 @@ static void *memprof_realloc_initial_handler(void *ptr, size_t size)
 
 static char *memprof_strdup_initial_handler(const char *s)
 {
-	if (in_memprof) {
+	if (in_memprof & MEMPROF_IN_INIT) {
 		/* probably that dlsym() needs strdup(), let's fail */
 		return NULL;
 	}
@@ -225,7 +231,7 @@ static void  memprof_free_initial_handler(void *ptr)
 
 static char *memprof_strndup_initial_handler(const char *s, size_t n)
 {
-	if (in_memprof) {
+	if (in_memprof & MEMPROF_IN_INIT) {
 		/* probably that dlsym() needs strndup(), let's fail */
 		return NULL;
 	}
@@ -236,7 +242,7 @@ static char *memprof_strndup_initial_handler(const char *s, size_t n)
 
 static void *memprof_valloc_initial_handler(size_t sz)
 {
-	if (in_memprof) {
+	if (in_memprof & MEMPROF_IN_INIT) {
 		/* probably that dlsym() needs valloc(), let's fail */
 		return NULL;
 	}
@@ -247,7 +253,7 @@ static void *memprof_valloc_initial_handler(size_t sz)
 
 static void *memprof_pvalloc_initial_handler(size_t sz)
 {
-	if (in_memprof) {
+	if (in_memprof & MEMPROF_IN_INIT) {
 		/* probably that dlsym() needs pvalloc(), let's fail */
 		return NULL;
 	}
@@ -258,7 +264,7 @@ static void *memprof_pvalloc_initial_handler(size_t sz)
 
 static void *memprof_memalign_initial_handler(size_t al, size_t sz)
 {
-	if (in_memprof) {
+	if (in_memprof & MEMPROF_IN_INIT) {
 		/* probably that dlsym() needs memalign(), let's fail */
 		return NULL;
 	}
@@ -269,7 +275,7 @@ static void *memprof_memalign_initial_handler(size_t al, size_t sz)
 
 static void *memprof_aligned_alloc_initial_handler(size_t al, size_t sz)
 {
-	if (in_memprof) {
+	if (in_memprof & MEMPROF_IN_INIT) {
 		/* probably that dlsym() needs aligned_alloc(), let's fail */
 		return NULL;
 	}
@@ -280,7 +286,7 @@ static void *memprof_aligned_alloc_initial_handler(size_t al, size_t sz)
 
 static int memprof_posix_memalign_initial_handler(void **ptr, size_t al, size_t sz)
 {
-	if (in_memprof) {
+	if (in_memprof & MEMPROF_IN_INIT) {
 		/* probably that dlsym() needs posix_memalign(), let's fail */
 		return ENOMEM;
 	}
@@ -299,13 +305,18 @@ struct memprof_stats *memprof_get_bin(const void *ra, enum memprof_method meth)
 	int retries = 16; // up to 16 consecutive entries may be tested.
 	const void *old;
 	unsigned int bin;
+	ullong hash;
 
 	if (unlikely(!ra)) {
 		bin = MEMPROF_HASH_BUCKETS;
 		goto leave;
 	}
-	bin = ptr_hash(ra, MEMPROF_HASH_BITS);
-	for (; memprof_stats[bin].caller != ra; bin = (bin + 1) & (MEMPROF_HASH_BUCKETS - 1)) {
+	hash = _ptr2_hash_arg(ra, th_ctx->exec_ctx.pointer, th_ctx->exec_ctx.type);
+	for (bin = _ptr_hash_reduce(hash, MEMPROF_HASH_BITS);
+	     memprof_stats[bin].caller != ra ||
+	       memprof_stats[bin].exec_ctx.type != th_ctx->exec_ctx.type ||
+	       memprof_stats[bin].exec_ctx.pointer != th_ctx->exec_ctx.pointer;
+	     bin = (bin + (hash | 1)) & (MEMPROF_HASH_BUCKETS - 1)) {
 		if (!--retries) {
 			bin = MEMPROF_HASH_BUCKETS;
 			break;
@@ -314,6 +325,7 @@ struct memprof_stats *memprof_get_bin(const void *ra, enum memprof_method meth)
 		old = NULL;
 		if (!memprof_stats[bin].caller &&
 		    HA_ATOMIC_CAS(&memprof_stats[bin].caller, &old, ra)) {
+			memprof_stats[bin].exec_ctx = th_ctx->exec_ctx;
 			memprof_stats[bin].method = meth;
 			break;
 		}
@@ -335,11 +347,13 @@ void *malloc(size_t size)
 	struct memprof_stats *bin;
 	void *ret;
 
-	if (likely(!(profiling & HA_PROF_MEMORY)))
+	if (likely(!(profiling & HA_PROF_MEMORY) || (in_memprof & MEMPROF_IN_HANDLER)))
 		return memprof_malloc_handler(size);
 
+	in_memprof |= MEMPROF_IN_HANDLER;
 	ret = memprof_malloc_handler(size);
 	size = malloc_usable_size(ret) + sizeof(void *);
+	in_memprof &= ~MEMPROF_IN_HANDLER;
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_MALLOC);
 	if (unlikely(th_ctx->lock_level & 0x7F))
@@ -362,11 +376,13 @@ void *calloc(size_t nmemb, size_t size)
 	struct memprof_stats *bin;
 	void *ret;
 
-	if (likely(!(profiling & HA_PROF_MEMORY)))
+	if (likely(!(profiling & HA_PROF_MEMORY) || (in_memprof & MEMPROF_IN_HANDLER)))
 		return memprof_calloc_handler(nmemb, size);
 
+	in_memprof |= MEMPROF_IN_HANDLER;
 	ret = memprof_calloc_handler(nmemb, size);
 	size = malloc_usable_size(ret) + sizeof(void *);
+	in_memprof &= ~MEMPROF_IN_HANDLER;
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_CALLOC);
 	if (unlikely(th_ctx->lock_level & 0x7F))
@@ -392,12 +408,14 @@ void *realloc(void *ptr, size_t size)
 	size_t size_before;
 	void *ret;
 
-	if (likely(!(profiling & HA_PROF_MEMORY)))
+	if (likely(!(profiling & HA_PROF_MEMORY) || (in_memprof & MEMPROF_IN_HANDLER)))
 		return memprof_realloc_handler(ptr, size);
 
+	in_memprof |= MEMPROF_IN_HANDLER;
 	size_before = malloc_usable_size(ptr);
 	ret = memprof_realloc_handler(ptr, size);
 	size = malloc_usable_size(ret);
+	in_memprof &= ~MEMPROF_IN_HANDLER;
 
 	/* only count the extra link for new allocations */
 	if (!ptr)
@@ -430,11 +448,13 @@ char *strdup(const char *s)
 	size_t size;
 	char *ret;
 
-	if (likely(!(profiling & HA_PROF_MEMORY)))
+	if (likely(!(profiling & HA_PROF_MEMORY) || (in_memprof & MEMPROF_IN_HANDLER)))
 		return memprof_strdup_handler(s);
 
+	in_memprof |= MEMPROF_IN_HANDLER;
 	ret = memprof_strdup_handler(s);
 	size = malloc_usable_size(ret) + sizeof(void *);
+	in_memprof &= ~MEMPROF_IN_HANDLER;
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_STRDUP);
 	if (unlikely(th_ctx->lock_level & 0x7F))
@@ -460,13 +480,15 @@ void free(void *ptr)
 	struct memprof_stats *bin;
 	size_t size_before;
 
-	if (likely(!(profiling & HA_PROF_MEMORY) || !ptr)) {
+	if (likely(!(profiling & HA_PROF_MEMORY) || !ptr || (in_memprof & MEMPROF_IN_HANDLER))) {
 		memprof_free_handler(ptr);
 		return;
 	}
 
+	in_memprof |= MEMPROF_IN_HANDLER;
 	size_before = malloc_usable_size(ptr) + sizeof(void *);
 	memprof_free_handler(ptr);
+	in_memprof &= ~MEMPROF_IN_HANDLER;
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_FREE);
 	if (unlikely(th_ctx->lock_level & 0x7F))
@@ -486,10 +508,13 @@ char *strndup(const char *s, size_t size)
 		return NULL;
 
 	ret = memprof_strndup_handler(s, size);
-	if (likely(!(profiling & HA_PROF_MEMORY)))
+	if (likely(!(profiling & HA_PROF_MEMORY) || (in_memprof & MEMPROF_IN_HANDLER)))
 		return ret;
 
+	in_memprof |= MEMPROF_IN_HANDLER;
 	size = malloc_usable_size(ret) + sizeof(void *);
+	in_memprof &= ~MEMPROF_IN_HANDLER;
+
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_STRNDUP);
 	if (unlikely(th_ctx->lock_level & 0x7F))
 		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
@@ -507,10 +532,13 @@ void *valloc(size_t size)
 		return NULL;
 
 	ret = memprof_valloc_handler(size);
-	if (likely(!(profiling & HA_PROF_MEMORY)))
+	if (likely(!(profiling & HA_PROF_MEMORY) || (in_memprof & MEMPROF_IN_HANDLER)))
 		return ret;
 
+	in_memprof |= MEMPROF_IN_HANDLER;
 	size = malloc_usable_size(ret) + sizeof(void *);
+	in_memprof &= ~MEMPROF_IN_HANDLER;
+
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_VALLOC);
 	if (unlikely(th_ctx->lock_level & 0x7F))
 		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
@@ -528,10 +556,13 @@ void *pvalloc(size_t size)
 		return NULL;
 
 	ret = memprof_pvalloc_handler(size);
-	if (likely(!(profiling & HA_PROF_MEMORY)))
+	if (likely(!(profiling & HA_PROF_MEMORY) || (in_memprof & MEMPROF_IN_HANDLER)))
 		return ret;
 
+	in_memprof |= MEMPROF_IN_HANDLER;
 	size = malloc_usable_size(ret) + sizeof(void *);
+	in_memprof &= ~MEMPROF_IN_HANDLER;
+
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_PVALLOC);
 	if (unlikely(th_ctx->lock_level & 0x7F))
 		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
@@ -549,10 +580,13 @@ void *memalign(size_t align, size_t size)
 		return NULL;
 
 	ret = memprof_memalign_handler(align, size);
-	if (likely(!(profiling & HA_PROF_MEMORY)))
+	if (likely(!(profiling & HA_PROF_MEMORY) || (in_memprof & MEMPROF_IN_HANDLER)))
 		return ret;
 
+	in_memprof |= MEMPROF_IN_HANDLER;
 	size = malloc_usable_size(ret) + sizeof(void *);
+	in_memprof &= ~MEMPROF_IN_HANDLER;
+
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_MEMALIGN);
 	if (unlikely(th_ctx->lock_level & 0x7F))
 		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
@@ -570,10 +604,13 @@ void *aligned_alloc(size_t align, size_t size)
 		return NULL;
 
 	ret = memprof_aligned_alloc_handler(align, size);
-	if (likely(!(profiling & HA_PROF_MEMORY)))
+	if (likely(!(profiling & HA_PROF_MEMORY) || (in_memprof & MEMPROF_IN_HANDLER)))
 		return ret;
 
+	in_memprof |= MEMPROF_IN_HANDLER;
 	size = malloc_usable_size(ret) + sizeof(void *);
+	in_memprof &= ~MEMPROF_IN_HANDLER;
+
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_ALIGNED_ALLOC);
 	if (unlikely(th_ctx->lock_level & 0x7F))
 		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
@@ -591,13 +628,16 @@ int posix_memalign(void **ptr, size_t align, size_t size)
 		return ENOMEM;
 
 	ret = memprof_posix_memalign_handler(ptr, align, size);
-	if (likely(!(profiling & HA_PROF_MEMORY)))
+	if (likely(!(profiling & HA_PROF_MEMORY) || (in_memprof & MEMPROF_IN_HANDLER)))
 		return ret;
 
 	if (ret != 0) // error
 		return ret;
 
+	in_memprof |= MEMPROF_IN_HANDLER;
 	size = malloc_usable_size(*ptr) + sizeof(void *);
+	in_memprof &= ~MEMPROF_IN_HANDLER;
+
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_POSIX_MEMALIGN);
 	if (unlikely(th_ctx->lock_level & 0x7F))
 		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
@@ -659,8 +699,20 @@ void activity_count_runtime(uint32_t run_time)
 	if (!(_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)) {
 		if (unlikely((profiling & HA_PROF_TASKS_MASK) == HA_PROF_TASKS_ON ||
 		             ((profiling & HA_PROF_TASKS_MASK) == HA_PROF_TASKS_AON &&
-		             swrate_avg(run_time, TIME_STATS_SAMPLES) >= up)))
+			      swrate_avg(run_time, TIME_STATS_SAMPLES) >= up))) {
+
+			if (profiling & HA_PROF_TASKS_LOCK)
+				_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_TASK_PROFILING_L);
+			else
+				_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_TASK_PROFILING_L);
+
+			if (profiling & HA_PROF_TASKS_MEM)
+				_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_TASK_PROFILING_M);
+			else
+				_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_TASK_PROFILING_M);
+
 			_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_TASK_PROFILING);
+		}
 	} else {
 		if (unlikely((profiling & HA_PROF_TASKS_MASK) == HA_PROF_TASKS_OFF ||
 		             ((profiling & HA_PROF_TASKS_MASK) == HA_PROF_TASKS_AOFF &&
@@ -692,26 +744,41 @@ static int cfg_parse_prof_memory(char **args, int section_type, struct proxy *cu
 }
 #endif // USE_MEMORY_PROFILING
 
-/* config parser for global "profiling.tasks", accepts "on" or "off" */
+/* config parser for global "profiling.tasks", accepts "on", "off", 'auto",
+ * "lock", "no-lock", "memory", "no-memory".
+ */
 static int cfg_parse_prof_tasks(char **args, int section_type, struct proxy *curpx,
                                 const struct proxy *defpx, const char *file, int line,
                                 char **err)
 {
-	if (too_many_args(1, args, err, NULL))
-		return -1;
+	int arg;
 
-	if (strcmp(args[1], "on") == 0) {
-		profiling = (profiling & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_ON;
-		HA_ATOMIC_STORE(&prof_task_start_ns, now_ns);
+	for (arg = 1; *args[arg]; arg++) {
+		if (strcmp(args[arg], "on") == 0) {
+			profiling = (profiling & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_ON;
+			HA_ATOMIC_STORE(&prof_task_start_ns, now_ns);
+		}
+		else if (strcmp(args[arg], "auto") == 0) {
+			profiling = (profiling & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_AOFF;
+			HA_ATOMIC_STORE(&prof_task_start_ns, now_ns);
+		}
+		else if (strcmp(args[arg], "off") == 0)
+			profiling = (profiling & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_OFF;
+		else if (strcmp(args[arg], "lock") == 0)
+			profiling |= HA_PROF_TASKS_LOCK;
+		else if (strcmp(args[arg], "no-lock") == 0)
+			profiling &= ~HA_PROF_TASKS_LOCK;
+		else if (strcmp(args[arg], "memory") == 0)
+			profiling |= HA_PROF_TASKS_MEM;
+		else if (strcmp(args[arg], "no-memory") == 0)
+			profiling &= ~HA_PROF_TASKS_MEM;
+		else
+			break;
 	}
-	else if (strcmp(args[1], "auto") == 0) {
-		profiling = (profiling & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_AOFF;
-		HA_ATOMIC_STORE(&prof_task_start_ns, now_ns);
-	}
-	else if (strcmp(args[1], "off") == 0)
-		profiling = (profiling & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_OFF;
-	else {
-		memprintf(err, "'%s' expects either 'on', 'auto', or 'off' but got '%s'.", args[0], args[1]);
+
+	/* either no arg or invalid arg */
+	if (arg == 1 || *args[arg]) {
+		memprintf(err, "'%s' expects a combination of either 'on', 'auto', 'off', 'lock', 'no-lock', 'memory', or 'no-memory', but got '%s'.", args[0], args[arg]);
 		return -1;
 	}
 	return 0;
@@ -720,6 +787,8 @@ static int cfg_parse_prof_tasks(char **args, int section_type, struct proxy *cur
 /* parse a "set profiling" command. It always returns 1. */
 static int cli_parse_set_profiling(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	int arg;
+
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
 
@@ -765,52 +834,66 @@ static int cli_parse_set_profiling(char **args, char *payload, struct appctx *ap
 	if (strcmp(args[2], "tasks") != 0)
 		return cli_err(appctx, "Expects either 'tasks' or 'memory'.\n");
 
-	if (strcmp(args[3], "on") == 0) {
-		unsigned int old = profiling;
-		int i;
+	for (arg = 3; *args[arg]; arg++) {
+		if (strcmp(args[arg], "on") == 0) {
+			unsigned int old = profiling;
+			int i;
 
-		while (!_HA_ATOMIC_CAS(&profiling, &old, (old & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_ON))
-			;
+			while (!_HA_ATOMIC_CAS(&profiling, &old, (old & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_ON))
+				;
 
-		HA_ATOMIC_STORE(&prof_task_start_ns, now_ns);
-		HA_ATOMIC_STORE(&prof_task_stop_ns, 0);
+			HA_ATOMIC_STORE(&prof_task_start_ns, now_ns);
+			HA_ATOMIC_STORE(&prof_task_stop_ns, 0);
 
-		/* also flush current profiling stats */
-		for (i = 0; i < SCHED_ACT_HASH_BUCKETS; i++) {
-			HA_ATOMIC_STORE(&sched_activity[i].calls, 0);
-			HA_ATOMIC_STORE(&sched_activity[i].cpu_time, 0);
-			HA_ATOMIC_STORE(&sched_activity[i].lat_time, 0);
-			HA_ATOMIC_STORE(&sched_activity[i].lkw_time, 0);
-			HA_ATOMIC_STORE(&sched_activity[i].lkd_time, 0);
-			HA_ATOMIC_STORE(&sched_activity[i].mem_time, 0);
-			HA_ATOMIC_STORE(&sched_activity[i].func, NULL);
-			HA_ATOMIC_STORE(&sched_activity[i].caller, NULL);
+			/* also flush current profiling stats */
+			for (i = 0; i < SCHED_ACT_HASH_BUCKETS; i++) {
+				HA_ATOMIC_STORE(&sched_activity[i].calls, 0);
+				HA_ATOMIC_STORE(&sched_activity[i].cpu_time, 0);
+				HA_ATOMIC_STORE(&sched_activity[i].lat_time, 0);
+				HA_ATOMIC_STORE(&sched_activity[i].lkw_time, 0);
+				HA_ATOMIC_STORE(&sched_activity[i].lkd_time, 0);
+				HA_ATOMIC_STORE(&sched_activity[i].mem_time, 0);
+				HA_ATOMIC_STORE(&sched_activity[i].func, NULL);
+				HA_ATOMIC_STORE(&sched_activity[i].caller, NULL);
+			}
 		}
-	}
-	else if (strcmp(args[3], "auto") == 0) {
-		unsigned int old = profiling;
-		unsigned int new;
+		else if (strcmp(args[arg], "auto") == 0) {
+			unsigned int old = profiling;
+			unsigned int new;
 
-		do {
-			if ((old & HA_PROF_TASKS_MASK) >= HA_PROF_TASKS_AON)
-				new = (old & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_AON;
-			else
-				new = (old & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_AOFF;
-		} while (!_HA_ATOMIC_CAS(&profiling, &old, new));
+			do {
+				if ((old & HA_PROF_TASKS_MASK) >= HA_PROF_TASKS_AON)
+					new = (old & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_AON;
+				else
+					new = (old & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_AOFF;
+			} while (!_HA_ATOMIC_CAS(&profiling, &old, new));
 
-		HA_ATOMIC_STORE(&prof_task_start_ns, now_ns);
-		HA_ATOMIC_STORE(&prof_task_stop_ns, 0);
-	}
-	else if (strcmp(args[3], "off") == 0) {
-		unsigned int old = profiling;
-		while (!_HA_ATOMIC_CAS(&profiling, &old, (old & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_OFF))
-			;
+			HA_ATOMIC_STORE(&prof_task_start_ns, now_ns);
+			HA_ATOMIC_STORE(&prof_task_stop_ns, 0);
+		}
+		else if (strcmp(args[arg], "off") == 0) {
+			unsigned int old = profiling;
+			while (!_HA_ATOMIC_CAS(&profiling, &old, (old & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_OFF))
+				;
 
-		if (HA_ATOMIC_LOAD(&prof_task_start_ns))
-			HA_ATOMIC_STORE(&prof_task_stop_ns, now_ns);
+			if (HA_ATOMIC_LOAD(&prof_task_start_ns))
+				HA_ATOMIC_STORE(&prof_task_stop_ns, now_ns);
+		}
+		else if (strcmp(args[arg], "lock") == 0)
+			HA_ATOMIC_OR(&profiling, HA_PROF_TASKS_LOCK);
+		else if (strcmp(args[arg], "no-lock") == 0)
+			HA_ATOMIC_AND(&profiling, ~HA_PROF_TASKS_LOCK);
+		else if (strcmp(args[arg], "memory") == 0)
+			HA_ATOMIC_OR(&profiling, HA_PROF_TASKS_MEM);
+		else if (strcmp(args[arg], "no-memory") == 0)
+			HA_ATOMIC_AND(&profiling, ~HA_PROF_TASKS_MEM);
+		else
+			break; // unknown arg
 	}
-	else
-		return cli_err(appctx, "Expects 'on', 'auto', or 'off'.\n");
+
+	/* either no arg or invalid one */
+	if (arg == 3 || *args[arg])
+		return cli_err(appctx, "Expects a combination of either 'on', 'auto', 'off', 'lock', 'no-lock', 'memory' or 'no-memory'.\n");
 
 	return 1;
 }
@@ -875,6 +958,14 @@ static int cmp_memprof_stats(const void *a, const void *b)
 		return -1;
 	else if (l->alloc_tot + l->free_tot < r->alloc_tot + r->free_tot)
 		return 1;
+	else if (l->exec_ctx.type > r->exec_ctx.type)
+		return -1;
+	else if (l->exec_ctx.type < r->exec_ctx.type)
+		return 1;
+	else if (l->exec_ctx.pointer > r->exec_ctx.pointer)
+		return -1;
+	else if (l->exec_ctx.pointer < r->exec_ctx.pointer)
+		return 1;
 	else
 		return 0;
 }
@@ -885,6 +976,47 @@ static int cmp_memprof_addr(const void *a, const void *b)
 	const struct memprof_stats *r = (const struct memprof_stats *)b;
 
 	if (l->caller > r->caller)
+		return -1;
+	else if (l->caller < r->caller)
+		return 1;
+	else if (l->exec_ctx.type > r->exec_ctx.type)
+		return -1;
+	else if (l->exec_ctx.type < r->exec_ctx.type)
+		return 1;
+	else if (l->exec_ctx.pointer > r->exec_ctx.pointer)
+		return -1;
+	else if (l->exec_ctx.pointer < r->exec_ctx.pointer)
+		return 1;
+	else
+		return 0;
+}
+
+static int cmp_memprof_ctx(const void *a, const void *b)
+{
+	const struct memprof_stats *l = (const struct memprof_stats *)a;
+	const struct memprof_stats *r = (const struct memprof_stats *)b;
+	const void *ptrl = l->exec_ctx.pointer;
+	const void *ptrr = r->exec_ctx.pointer;
+
+	/* in case of a mux, we'll use the always-present ->subscribe()
+	 * function as a sorting key so that mux-ops and other mux functions
+	 * appear grouped together.
+	 */
+	if (l->exec_ctx.type == TH_EX_CTX_MUX)
+		ptrl = l->exec_ctx.mux_ops->subscribe;
+
+	if (r->exec_ctx.type == TH_EX_CTX_MUX)
+		ptrr = r->exec_ctx.mux_ops->subscribe;
+
+	if (ptrl > ptrr)
+		return -1;
+	else if (ptrl < ptrr)
+		return 1;
+	else if (l->exec_ctx.type > r->exec_ctx.type)
+		return -1;
+	else if (l->exec_ctx.type < r->exec_ctx.type)
+		return 1;
+	else if (l->caller > r->caller)
 		return -1;
 	else if (l->caller < r->caller)
 		return 1;
@@ -949,9 +1081,9 @@ struct sched_activity *sched_activity_entry(struct sched_activity *array, const 
 static int cli_io_handler_show_profiling(struct appctx *appctx)
 {
 	struct show_prof_ctx *ctx = appctx->svcctx;
-	struct sched_activity tmp_activity[SCHED_ACT_HASH_BUCKETS] __attribute__((aligned(64)));
+	struct sched_activity *tmp_activity = ctx->tmp_activity;
 #ifdef USE_MEMORY_PROFILING
-	struct memprof_stats tmp_memstats[MEMPROF_HASH_BUCKETS + 1];
+	struct memprof_stats *tmp_memstats = ctx->tmp_memstats;
 	unsigned long long tot_alloc_calls, tot_free_calls;
 	unsigned long long tot_alloc_bytes, tot_free_bytes;
 #endif
@@ -992,7 +1124,20 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 	if ((ctx->dump_step & 3) != 1)
 		goto skip_tasks;
 
-	memcpy(tmp_activity, sched_activity, sizeof(tmp_activity));
+	if (tmp_activity)
+		goto tasks_resume;
+
+	/* first call for show profiling tasks: we have to allocate a tmp
+	 * array for sorting and processing, and possibly perform some
+	 * sorting and aggregation.
+	 */
+	tmp_activity = ha_aligned_alloc(__alignof__(*tmp_activity), sizeof(sched_activity));
+	if (!tmp_activity)
+		goto end_tasks;
+
+	ctx->tmp_activity = tmp_activity;
+	memcpy(tmp_activity, sched_activity, sizeof(sched_activity));
+
 	/* for addr sort and for callee aggregation we have to first sort by address */
 	if (ctx->aggr || ctx->by_what == 1) // sort by addr
 		qsort(tmp_activity, SCHED_ACT_HASH_BUCKETS, sizeof(tmp_activity[0]), cmp_sched_activity_addr);	
@@ -1017,6 +1162,7 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 	else if (ctx->by_what == 2) // by cpu_tot
 		qsort(tmp_activity, SCHED_ACT_HASH_BUCKETS, sizeof(tmp_activity[0]), cmp_sched_activity_cpu);
 
+ tasks_resume:
 	if (!ctx->linenum)
 		chunk_appendf(&trash, "Tasks activity over %.3f sec till %.3f sec ago:\n"
 		                      "  function                      calls   cpu_tot   cpu_avg   lkw_avg   lkd_avg   mem_avg   lat_avg\n",
@@ -1080,6 +1226,8 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 		return 0;
 	}
 
+ end_tasks:
+	ha_free(&ctx->tmp_activity);
 	ctx->linenum = 0; // reset first line to dump
 	if ((ctx->dump_step & 4) == 0)
 		ctx->dump_step++; // next step
@@ -1090,16 +1238,57 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 	if ((ctx->dump_step & 3) != 2)
 		goto skip_mem;
 
-	memcpy(tmp_memstats, memprof_stats, sizeof(tmp_memstats));
-	if (ctx->by_what)
+	if (tmp_memstats)
+		goto memstats_resume;
+
+	/* first call for show profiling memory: we have to allocate a tmp
+	 * array for sorting and processing, and possibly perform some sorting
+	 * and aggregation.
+	 */
+	tmp_memstats = ha_aligned_alloc(__alignof__(*tmp_memstats), sizeof(memprof_stats));
+	if (!tmp_memstats)
+		goto end_memstats;
+
+	ctx->tmp_memstats = tmp_memstats;
+	memcpy(tmp_memstats, memprof_stats, sizeof(memprof_stats));
+
+	if (ctx->by_what == 1)
 		qsort(tmp_memstats, MEMPROF_HASH_BUCKETS+1, sizeof(tmp_memstats[0]), cmp_memprof_addr);
+	else if (ctx->by_what == 3)
+		qsort(tmp_memstats, MEMPROF_HASH_BUCKETS+1, sizeof(tmp_memstats[0]), cmp_memprof_ctx);
 	else
 		qsort(tmp_memstats, MEMPROF_HASH_BUCKETS+1, sizeof(tmp_memstats[0]), cmp_memprof_stats);
 
+	if (ctx->aggr) {
+		/* merge entries for the same caller and reset the exec_ctx */
+		for (i = j = 0; i < MEMPROF_HASH_BUCKETS; i++) {
+			if ((tmp_memstats[i].alloc_calls | tmp_memstats[i].free_calls) == 0)
+				continue;
+			for (j = i + 1; j < MEMPROF_HASH_BUCKETS; j++) {
+				if ((tmp_memstats[j].alloc_calls | tmp_memstats[j].free_calls) == 0)
+					continue;
+				if (tmp_memstats[j].caller != tmp_memstats[i].caller ||
+				    tmp_memstats[j].method != tmp_memstats[i].method ||
+				    tmp_memstats[j].info   != tmp_memstats[i].info)
+					continue;
+				tmp_memstats[i].locked_calls  += tmp_memstats[j].locked_calls;
+				tmp_memstats[i].alloc_calls   += tmp_memstats[j].alloc_calls;
+				tmp_memstats[i].free_calls    += tmp_memstats[j].free_calls;
+				tmp_memstats[i].alloc_tot     += tmp_memstats[j].alloc_tot;
+				tmp_memstats[i].free_tot      += tmp_memstats[j].free_tot;
+				/* don't dump the ctx */
+				tmp_memstats[i].exec_ctx.type = 0;
+				/* don't dump the merged entry */
+				tmp_memstats[j].alloc_calls = tmp_memstats[j].free_calls = 0;
+			}
+		}
+	}
+
+ memstats_resume:
 	if (!ctx->linenum)
 		chunk_appendf(&trash,
 		              "Alloc/Free statistics by call place over %.3f sec till %.3f sec ago:\n"
-		              "         Calls         |         Tot Bytes           |       Caller and method\n"
+		              "         Calls         |         Tot Bytes           |       Caller, method, extra info\n"
 		              "<- alloc -> <- free  ->|<-- alloc ---> <-- free ---->|\n",
 			      (prof_mem_start_ns ? (prof_mem_stop_ns ? prof_mem_stop_ns : now_ns) - prof_mem_start_ns : 0) / 1000000000.0,
 			      (prof_mem_stop_ns ? now_ns - prof_mem_stop_ns : 0) / 1000000000.0);
@@ -1157,6 +1346,7 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 				      (int)((1000ULL * entry->locked_calls / tot_calls) % 10));
 		}
 
+		chunk_append_thread_ctx(&trash, &entry->exec_ctx, " [via ", "]");
 		chunk_appendf(&trash, "\n");
 
 		if (applet_putchk(appctx, &trash) == -1)
@@ -1266,9 +1456,15 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 		      tot_alloc_calls - tot_free_calls,
 		      tot_alloc_bytes - tot_free_bytes);
 
+	/* release optional buffer name */
+	for (i = 0; i < max; i++)
+		ha_free(&tmp_memstats[i].info);
+
 	if (applet_putchk(appctx, &trash) == -1)
 		return 0;
 
+ end_memstats:
+	ha_free(&ctx->tmp_memstats);
 	ctx->linenum = 0; // reset first line to dump
 	if ((ctx->dump_step & 4) == 0)
 		ctx->dump_step++; // next step
@@ -1277,6 +1473,15 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 #endif // USE_MEMORY_PROFILING
 
 	return 1;
+}
+
+/* release structs allocated by "show profiling" */
+static void cli_release_show_profiling(struct appctx *appctx)
+{
+	struct show_prof_ctx *ctx = appctx->svcctx;
+
+	ha_free(&ctx->tmp_activity);
+	ha_free(&ctx->tmp_memstats);
 }
 
 /* parse a "show profiling" command. It returns 1 on failure, 0 if it starts to dump.
@@ -1311,6 +1516,9 @@ static int cli_parse_show_profiling(char **args, char *payload, struct appctx *a
 		else if (strcmp(args[arg], "bytime") == 0) {
 			ctx->by_what = 2; // sort output by total time instead of usage
 		}
+		else if (strcmp(args[arg], "byctx") == 0) {
+			ctx->by_what = 3; // sort output by caller context instead of usage
+		}
 		else if (strcmp(args[arg], "aggr") == 0) {
 			ctx->aggr = 1;    // aggregate output by callee
 		}
@@ -1318,7 +1526,7 @@ static int cli_parse_show_profiling(char **args, char *payload, struct appctx *a
 			ctx->maxcnt = atoi(args[arg]); // number of entries to dump
 		}
 		else
-			return cli_err(appctx, "Expects either 'all', 'status', 'tasks', 'memory', 'byaddr', 'bytime', 'aggr' or a max number of output lines.\n");
+			return cli_err(appctx, "Expects either 'all', 'status', 'tasks', 'memory', 'byaddr', 'bytime', 'byctx', 'aggr' or a max number of output lines.\n");
 	}
 	return 0;
 }
@@ -1329,7 +1537,7 @@ static int cli_parse_show_profiling(char **args, char *payload, struct appctx *a
  */
 static int cli_io_handler_show_tasks(struct appctx *appctx)
 {
-	struct sched_activity tmp_activity[SCHED_ACT_HASH_BUCKETS] __attribute__((aligned(64)));
+	struct sched_activity tmp_activity[SCHED_ACT_HASH_BUCKETS];
 	struct buffer *name_buffer = get_trash_chunk();
 	struct sched_activity *entry;
 	const struct tasklet *tl;
@@ -1662,7 +1870,7 @@ INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 static struct cli_kw_list cli_kws = {{ },{
 	{ { "set",  "profiling", NULL }, "set profiling <what> {auto|on|off}      : enable/disable resource profiling (tasks,memory)", cli_parse_set_profiling,  NULL },
 	{ { "show", "activity", NULL },  "show activity [-1|0|thread_num]         : show per-thread activity stats (for support/developers)", cli_parse_show_activity, cli_io_handler_show_activity, NULL },
-	{ { "show", "profiling", NULL }, "show profiling [<what>|<#lines>|<opts>]*: show profiling state (all,status,tasks,memory)",   cli_parse_show_profiling, cli_io_handler_show_profiling, NULL },
+	{ { "show", "profiling", NULL }, "show profiling [<what>|<#lines>|<opts>]*: show profiling state (all,status,tasks,memory)",   cli_parse_show_profiling, cli_io_handler_show_profiling, cli_release_show_profiling },
 	{ { "show", "tasks", NULL },     "show tasks                              : show running tasks",                               NULL, cli_io_handler_show_tasks,     NULL },
 	{{},}
 }};

@@ -1,6 +1,6 @@
 /*
  * HAProxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2025 Willy Tarreau <willy@haproxy.org>.
+ * Copyright 2000-2026 Willy Tarreau <willy@haproxy.org>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -117,7 +117,6 @@
 #include <haproxy/sock_inet.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stats-file.h>
-#include <haproxy/stats-t.h>
 #include <haproxy/stream.h>
 #include <haproxy/systemd.h>
 #include <haproxy/task.h>
@@ -150,8 +149,13 @@ char **init_env;		/* to keep current process env variables backup */
 int  pidfd = -1;		/* FD to keep PID */
 int daemon_fd[2] = {-1, -1};	/* pipe to communicate with parent process */
 int devnullfd = -1;
+int fileless_mode;
+struct cfgfile fileless_cfg;
+extern __attribute__((weak)) void haproxy_init_args(int argc, char **argv);
+extern __attribute__((weak)) char **copy_argv(int argc, char **argv);
 
-static unsigned long stopping_tgroup_mask; /* Thread groups acknowledging stopping */
+static int stopped_tgroups;
+static int stop_detected;
 
 /* global options */
 struct global global = {
@@ -178,6 +182,7 @@ struct global global = {
 		.options = GTUNE_LISTENER_MQ_OPT,
 		.bufsize = (BUFSIZE + 2*sizeof(void *) - 1) & -(2*sizeof(void *)),
 		.bufsize_small = BUFSIZE_SMALL,
+		.bufsize_large = 0,
 		.maxrewrite = MAXREWRITE,
 		.reserved_bufs = RESERVED_BUFS,
 		.pattern_cache = DEFAULT_PAT_LRU_SIZE,
@@ -196,6 +201,7 @@ struct global global = {
 #endif
 		.nb_stk_ctr = MAX_SESS_STKCTR,
 		.default_shards = -2, /* by-group */
+		.cli_max_payload_sz = 128 * 1024,
 	},
 #ifdef USE_OPENSSL
 #ifdef DEFAULT_MAXSSLCONN
@@ -264,6 +270,11 @@ unsigned int tainted = 0;
 
 unsigned int experimental_directives_allowed = 0;
 unsigned int deprecated_directives_allowed = 0;
+
+/* mapped storage for collected libs */
+void *lib_storage = NULL;
+size_t lib_size = 0;
+char *lib_output_file = NULL;
 
 int check_kw_experimental(struct cfg_keyword *kw, const char *file, int linenum,
                           char **errmsg)
@@ -602,6 +613,48 @@ void display_version()
 	}
 }
 
+/* compare a feature string, ignoring the first character (-/+)
+   used for qsort */
+static int feat_cmp(const void *a, const void *b)
+{
+	const struct ist *ia = a;
+	const struct ist *ib = b;
+
+	struct ist sa = istadv(*ia, 1);
+	struct ist sb = istadv(*ib, 1);
+
+	return istdiff(sa, sb);
+}
+
+/* split the feature list into an allocated sorted array of ist
+   the return ptr must be freed by the caller */
+static struct ist *split_feature_list()
+{
+	struct ist *out;
+	struct ist tmp = ist(build_features);
+
+	int n = 1; /* last element don't have a ' ' */
+	int i = 0;
+
+	for (i = 0; build_features[i] != '\0'; i++) {
+		if (build_features[i] == ' ')
+			n++;
+	}
+	out = calloc(n + 1, sizeof(*out)); // last elem is NULL
+	if (!out)
+		goto end;
+
+	i = 0;
+	while (tmp.len)
+		out[i++] = istsplit(&tmp, ' ');
+
+	qsort(out, n, sizeof(struct ist), feat_cmp);
+
+end:
+
+	return out;
+}
+
 /* display_mode:
  * 0 = short version (e.g., "3.3.1")
  * 1 = full version (e.g., "3.3.1-dev5-1bb975-71")
@@ -641,14 +694,23 @@ void display_version_plain(int display_mode)
 static void display_build_opts()
 {
 	const char **opt;
+	struct ist *feat_list = NULL, *tmp;
 
-	printf("Build options : %s"
-	       "\n\nFeature list : %s"
-	       "\n\nDefault settings :"
+	feat_list = split_feature_list();
+
+	printf("Build options : %s", build_opts_string);
+	printf("\n\nFeature list :");
+	for (tmp = feat_list;tmp->ptr;tmp++)
+		if (!isttest(istist(*tmp, ist("HAVE_WORKING_"))))
+			printf(" %.*s", (int)tmp->len, tmp->ptr);
+	printf("\nDetected feature list :");
+	for (tmp = feat_list;tmp->ptr;tmp++)
+		if (isttest(istist(*tmp, ist("HAVE_WORKING_"))))
+			printf(" %.*s", (int)tmp->len, tmp->ptr);
+	printf("\n\nDefault settings :"
 	       "\n  bufsize = %d, maxrewrite = %d, maxpollevents = %d"
 	       "\n\n",
-	       build_opts_string,
-	       build_features, BUFSIZE, MAXREWRITE, MAX_POLL_EVENTS);
+	       BUFSIZE, MAXREWRITE, MAX_POLL_EVENTS);
 
 	for (opt = NULL; (opt = hap_get_next_build_opt(opt)); puts(*opt))
 		;
@@ -667,6 +729,7 @@ static void display_build_opts()
 	putchar('\n');
 	list_filters(stdout);
 	putchar('\n');
+	ha_free(&feat_list);
 }
 
 /*
@@ -722,6 +785,9 @@ static void usage(char *name)
 #if defined(HA_HAVE_DUMP_LIBS)
 		"        -dL dumps loaded object files after config checks\n"
 #endif
+#if defined(HA_HAVE_DUMP_LIBS) && defined(HA_HAVE_DL_ITERATE_PHDR)
+		"        -dA[file] collects libs into a tar file at <file>\n"
+#endif
 #if defined(USE_CPU_AFFINITY)
 		"        -dc dumps the list of selected and evicted CPUs\n"
 #endif
@@ -764,7 +830,7 @@ int tell_old_pids(int sig)
 }
 
 /*
- * remove a pid forom the olpid array and decrease nb_oldpids
+ * remove a pid from the olpid array and decrease nb_oldpids
  * return 1 pid was found otherwise return 0
  */
 
@@ -1059,6 +1125,8 @@ static int read_cfg()
 	setenv("HAPROXY_HTTPS_LOG_FMT", default_https_log_format, 1);
 	setenv("HAPROXY_TCP_LOG_FMT", default_tcp_log_format, 1);
 	setenv("HAPROXY_TCP_CLF_LOG_FMT", clf_tcp_log_format, 1);
+	setenv("HAPROXY_KEYLOG_FC_LOG_FMT", keylog_format_fc, 1);
+	setenv("HAPROXY_KEYLOG_BC_LOG_FMT", keylog_format_bc, 1);
 	setenv("HAPROXY_BRANCH", PRODUCT_BRANCH, 1);
 	list_for_each_entry(cfg, &cfg_cfgfiles, list) {
 		int ret;
@@ -1117,7 +1185,7 @@ err:
  * Return an allocated copy of argv
  */
 
-static char **copy_argv(int argc, char **argv)
+char **copy_argv(int argc, char **argv)
 {
 	char **newargv, **retargv;
 
@@ -1434,59 +1502,20 @@ static void init_early(int argc, char **argv)
 	len = strlen(progname);
 	progname = strdup(progname);
 	if (!progname) {
-		ha_alert("Cannot allocate memory for log_tag.\n");
+		ha_alert("Cannot allocate memory for progname.\n");
 		exit(EXIT_FAILURE);
 	}
 
 	chunk_initlen(&global.log_tag, strdup(progname), len, len);
-}
-
-/* handles program arguments. Very minimal parsing is performed, variables are
- * fed with some values, and lists are completed with other ones. In case of
- * error, it will exit.
- */
-static void init_args(int argc, char **argv)
-{
-	char *err_msg = NULL;
-
-	/* pre-fill in the global tuning options before we let the cmdline
-	 * change them.
-	 */
-	global.tune.options |= GTUNE_USE_SELECT;  /* select() is always available */
-#if defined(USE_POLL)
-	global.tune.options |= GTUNE_USE_POLL;
-#endif
-#if defined(USE_EPOLL)
-	global.tune.options |= GTUNE_USE_EPOLL;
-#endif
-#if defined(USE_KQUEUE)
-	global.tune.options |= GTUNE_USE_KQUEUE;
-#endif
-#if defined(USE_EVPORTS)
-	global.tune.options |= GTUNE_USE_EVPORTS;
-#endif
-#if defined(USE_LINUX_SPLICE)
-	global.tune.options |= GTUNE_USE_SPLICE;
-#endif
-#if defined(USE_GETADDRINFO)
-	global.tune.options |= GTUNE_USE_GAI;
-#endif
-#ifdef USE_THREAD
-	global.tune.options |= GTUNE_IDLE_POOL_SHARED;
-#endif
-	global.tune.options |= GTUNE_STRICT_LIMITS;
-
-	global.tune.options |= GTUNE_USE_FAST_FWD; /* Use fast-forward by default */
-
-	/* Use zero-copy forwarding by default */
-	global.tune.no_zero_copy_fwd = 0;
-
-	/* keep a copy of original arguments for the master process */
-	old_argv = copy_argv(argc, argv);
-	if (!old_argv) {
-		ha_alert("failed to copy argv.\n");
+	if (b_orig(&global.log_tag) == NULL) {
+		ha_alert("Cannot allocate memory for log_tag.\n");
 		exit(EXIT_FAILURE);
 	}
+}
+
+void haproxy_init_args(int argc, char **argv)
+{
+	char *err_msg = NULL;
 
 	/* skip program name and start */
 	argc--; argv++;
@@ -1602,6 +1631,16 @@ static void init_args(int argc, char **argv)
 #if defined(HA_HAVE_DUMP_LIBS)
 			else if (*flag == 'd' && flag[1] == 'L')
 				arg_mode |= MODE_DUMP_LIBS;
+# if defined(HA_HAVE_DL_ITERATE_PHDR)
+			else if (*flag == 'd' && flag[1] == 'A') {
+				lib_output_file = flag + 2;
+				if (!*lib_output_file) {
+					ha_alert("-dA: missing output file name\n");
+					exit(1);
+				}
+				arg_mode |= MODE_DUMP_LIBS; // stop on libs dump
+			}
+# endif /* HA_HAVE_DL_ITERATE_PHDR */
 #endif
 			else if (*flag == 'd' && flag[1] == 'K') {
 				arg_mode |= MODE_DUMP_KWD;
@@ -1616,18 +1655,11 @@ static void init_args(int argc, char **argv)
 					argc--; argv++;
 				}
 
-				ret = trace_parse_cmd(arg, &err_msg);
-				if (ret <= -1) {
-					if (ret < -1) {
-						ha_alert("-dt: %s.\n", err_msg);
-						ha_free(&err_msg);
-						exit(EXIT_FAILURE);
-					}
-					else {
-						printf("%s\n", err_msg);
-						ha_free(&err_msg);
-						exit(0);
-					}
+				ret = trace_add_cmd(arg, &err_msg);
+				if (ret) {
+					ha_alert("-dt: %s.\n", err_msg);
+					ha_free(&err_msg);
+					exit(EXIT_FAILURE);
 				}
 			}
 #ifdef HA_USE_KTLS
@@ -1694,7 +1726,7 @@ static void init_args(int argc, char **argv)
 					oldpids_sig = SIGTERM; /* terminate immediately */
 				while (argc > 1 && argv[1][0] != '-') {
 					char * endptr = NULL;
-					oldpids = realloc(oldpids, (nb_oldpids + 1) * sizeof(int));
+					oldpids = realloc(oldpids, array_size_or_fail(nb_oldpids + 1, sizeof(int)));
 					if (!oldpids) {
 						ha_alert("Cannot allocate old pid : out of memory.\n");
 						exit(1);
@@ -1791,6 +1823,54 @@ static void init_args(int argc, char **argv)
 	free(err_msg);
 }
 
+/* handles program arguments. Very minimal parsing is performed, variables are
+ * fed with some values, and lists are completed with other ones. In case of
+ * error, it will exit.
+ */
+static void init_args(int argc, char **argv)
+{
+	/* pre-fill in the global tuning options before we let the cmdline
+	 * change them.
+	 */
+	global.tune.options |= GTUNE_USE_SELECT;  /* select() is always available */
+#if defined(USE_POLL)
+	global.tune.options |= GTUNE_USE_POLL;
+#endif
+#if defined(USE_EPOLL)
+	global.tune.options |= GTUNE_USE_EPOLL;
+#endif
+#if defined(USE_KQUEUE)
+	global.tune.options |= GTUNE_USE_KQUEUE;
+#endif
+#if defined(USE_EVPORTS)
+	global.tune.options |= GTUNE_USE_EVPORTS;
+#endif
+#if defined(USE_LINUX_SPLICE)
+	global.tune.options |= GTUNE_USE_SPLICE;
+#endif
+#if defined(USE_GETADDRINFO)
+	global.tune.options |= GTUNE_USE_GAI;
+#endif
+#ifdef USE_THREAD
+	global.tune.options |= GTUNE_IDLE_POOL_SHARED;
+#endif
+	global.tune.options |= GTUNE_STRICT_LIMITS;
+
+	global.tune.options |= GTUNE_USE_FAST_FWD; /* Use fast-forward by default */
+
+	/* Use zero-copy forwarding by default */
+	global.tune.no_zero_copy_fwd = 0;
+
+	/* keep a copy of original arguments for the master process */
+	old_argv = copy_argv(argc, argv);
+	if (!old_argv) {
+		ha_alert("failed to copy argv.\n");
+		exit(EXIT_FAILURE);
+	}
+
+	haproxy_init_args(argc, argv);
+}
+
 /* call the various keyword dump functions based on the comma-delimited list of
  * classes in kwd_dump.
  */
@@ -1859,20 +1939,30 @@ static void dump_registered_keywords(void)
 
 /* Generate a random cluster-secret in case the setting is not provided in the
  * configuration. This allows to use features which rely on it albeit with some
- * limitations.
+ * limitations. The function prefers RAND_bytes() if available, otherwise falls
+ * back to ha_random64_pair_hashed().
  */
 static void generate_random_cluster_secret()
 {
 	/* used as a default random cluster-secret if none defined. */
-	uint64_t rand;
+	union {
+		uint64_t by64[2];
+		uchar    by8[16];
+	} rand;
 
 	/* The caller must not overwrite an already defined secret. */
 	BUG_ON(cluster_secret_isset);
+	BUG_ON(sizeof(global.cluster_secret) != sizeof(rand));
 
-	rand = ha_random64();
+#ifdef USE_OPENSSL
+	if (RAND_bytes(rand.by8, sizeof(rand.by8)) != 1)
+#endif
+	{
+		/* no SSL or not working, fall back to other sources */
+		ha_random64_pair_hashed(&rand.by64[0], &rand.by64[1]);
+	}
+
 	memcpy(global.cluster_secret, &rand, sizeof(rand));
-	rand = ha_random64();
-	memcpy(global.cluster_secret + sizeof(rand), &rand, sizeof(rand));
 	cluster_secret_isset = 1;
 }
 
@@ -2062,9 +2152,6 @@ static void step_init_1()
 	if (init_acl() != 0)
 		exit(1);
 
-	/* Initialise lua. */
-	hlua_init();
-
 	/* set modes given from cmdline */
 	global.mode |= (arg_mode & (MODE_DAEMON | MODE_MWORKER | MODE_FOREGROUND | MODE_VERBOSE
 				    | MODE_QUIET | MODE_CHECK | MODE_DEBUG | MODE_ZERO_WARNING
@@ -2097,8 +2184,20 @@ static void step_init_2(int argc, char** argv)
 	struct pre_check_fct *prcf;
 	const char *cc, *cflags, *opts;
 
-	/* destroy unreferenced defaults proxies  */
-	proxy_destroy_all_unref_defaults();
+	/* Free last defaults if it is unnamed and unreferenced. */
+	if (last_defproxy && last_defproxy->id[0] == '\0' &&
+	    !last_defproxy->conf.def_ref) {
+		defaults_px_destroy(last_defproxy);
+	}
+	last_defproxy = NULL; /* This variable is not used after parsing. */
+
+	if (global.tune.options & GTUNE_PURGE_DEFAULTS) {
+		/* destroy unreferenced defaults proxies  */
+		defaults_px_destroy_all_unref();
+	}
+	else {
+		defaults_px_ref_all();
+	}
 
 	list_for_each_entry(prcf, &pre_check_list, list) {
 		err_code |= prcf->fct();
@@ -2227,6 +2326,17 @@ static void step_init_2(int argc, char** argv)
 
 #if defined(HA_HAVE_DUMP_LIBS)
 	if (global.mode & MODE_DUMP_LIBS && !master) {
+# if defined(HA_HAVE_DL_ITERATE_PHDR)
+		if (lib_output_file) {
+			/* we'll dump everything to lib_output_file */
+			if (copy_libs_to_file() < 0)
+				deinit_and_exit(1);
+			/* release memory if no longer needed */
+			if ((global.tune.options & (GTUNE_SET_DUMPABLE | GTUNE_COLLECT_LIBS)) !=
+			    (GTUNE_SET_DUMPABLE | GTUNE_COLLECT_LIBS))
+				free_collected_libs();
+		}
+# endif
 		qfprintf(stdout, "List of loaded object files:\n");
 		chunk_reset(&trash);
 		if (dump_libs(&trash, ((arg_mode & (MODE_QUIET|MODE_VERBOSE)) == MODE_VERBOSE)))
@@ -2277,7 +2387,8 @@ static void step_init_2(int argc, char** argv)
 		deinit_and_exit(0);
 
 	/* now we know the buffer size, we can initialize the channels and buffers */
-	init_buffer();
+	if (!init_buffer())
+		exit(1); // error already reported
 
 	list_for_each_entry(pcf, &post_check_list, list) {
 		err_code |= pcf->fct();
@@ -2443,6 +2554,10 @@ static void step_init_2(int argc, char** argv)
 	chunk_appendf(&trash, "TARGET='%s'", pm_target_opts);
 
 	post_mortem_add_component("haproxy", haproxy_version, cc, cflags, opts, argv[0]);
+
+	if ((global.tune.options & (GTUNE_SET_DUMPABLE | GTUNE_COLLECT_LIBS)) ==
+	    (GTUNE_SET_DUMPABLE | GTUNE_COLLECT_LIBS))
+		collect_libs();
 }
 
 /* This is a third part of the late init sequence, where we register signals for
@@ -2695,6 +2810,7 @@ void deinit(void)
 	struct cfg_postparser *pprs, *pprsb;
 	char **tmp = init_env;
 	int cur_fd;
+	int i;
 
 	/* the user may want to skip this phase */
 	if (global.tune.options & GTUNE_QUICK_EXIT)
@@ -2734,15 +2850,16 @@ void deinit(void)
 	while (p) {
 		p0 = p;
 		p = p->next;
-		free_proxy(p0);
+		proxy_drop(p0);
 	}/* end while(p) */
 
 	/* we don't need to free sink_proxies_list nor cfg_log_forward proxies since
 	 * they are respectively cleaned up in sink_deinit() and deinit_log_forward()
 	 */
 
-	/* destroy all referenced defaults proxies  */
-	proxy_destroy_all_unref_defaults();
+	/* If named defaults were preserved, ensure <def_ref> count is reset. */
+	if (!(global.tune.options & GTUNE_PURGE_DEFAULTS))
+		defaults_px_unref_all();
 
 	userlist_free(userlist);
 
@@ -2752,6 +2869,11 @@ void deinit(void)
 
 	list_for_each_entry(pdf, &post_deinit_list, list)
 		pdf->fct();
+
+	/* All proxies are removed now, so every defaults should also be freed
+	 * when their <def_ref> count reached zero.
+	 */
+	BUG_ON(!LIST_ISEMPTY(&defaults_list));
 
 	ha_free(&global.log_send_hostname);
 	chunk_destroy(&global.log_tag);
@@ -2765,8 +2887,10 @@ void deinit(void)
 	ha_free(&global.server_state_base);
 	ha_free(&global.server_state_file);
 	ha_free(&global.stats_file);
-	task_destroy(idle_conn_task);
-	idle_conn_task = NULL;
+	for (i = 0; i < global.nbthread; i++) {
+		task_destroy(idle_conn_task[i]);
+		idle_conn_task[i] = NULL;
+	}
 
 	list_for_each_entry_safe(log, logb, &global.loggers, list) {
 		LIST_DEL_INIT(&log->list);
@@ -2860,7 +2984,7 @@ void deinit(void)
 		free(init_env);
 	}
 	free(progname);
-
+	free_collected_libs();
 } /* end deinit() */
 
 __attribute__((noreturn)) void deinit_and_exit(int status)
@@ -2900,9 +3024,11 @@ void run_poll_loop()
 		if (thread_has_tasks())
 			activity[tid].wake_tasks++;
 		else {
-			_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_SLEEPING);
-			_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_NOTIFIED);
-			__ha_barrier_atomic_store();
+			unsigned int flags = _HA_ATOMIC_LOAD(&th_ctx->flags);
+
+			while (unlikely(!HA_ATOMIC_CAS(&th_ctx->flags, &flags, (flags | TH_FL_SLEEPING) & ~TH_FL_NOTIFIED)))
+				__ha_cpu_relax();
+
 			if (thread_has_tasks()) {
 				activity[tid].wake_tasks++;
 				_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_SLEEPING);
@@ -2922,14 +3048,24 @@ void run_poll_loop()
 			int i;
 
 			if (stopping) {
+				int old_detected;
+
 				/* stop muxes/quic-conns before acknowledging stopping */
 				if (!(tg_ctx->stopping_threads & ti->ltid_bit)) {
 					task_wakeup(mux_stopping_data[tid].task, TASK_WOKEN_OTHER);
 					wake = 1;
 				}
 
-				if (_HA_ATOMIC_OR_FETCH(&tg_ctx->stopping_threads, ti->ltid_bit) == ti->ltid_bit &&
-				    _HA_ATOMIC_OR_FETCH(&stopping_tgroup_mask, tg->tgid_bit) == tg->tgid_bit) {
+				old_detected = stop_detected;
+
+				/*
+				 * Check if we're the first to detect the
+				 * stop
+				 */
+				while (old_detected == 0 &&
+				       !_HA_ATOMIC_CAS(&stop_detected, &old_detected, 1));
+
+				if (old_detected == 0) {
 					/* first one to detect it, notify all threads that stopping was just set */
 					for (i = 0; i < global.nbthread; i++) {
 						if (_HA_ATOMIC_LOAD(&ha_thread_info[i].tg->threads_enabled) &
@@ -2938,28 +3074,26 @@ void run_poll_loop()
 							wake_thread(i);
 					}
 				}
+				if (!(tg_ctx->stopping_threads & ti->ltid_bit) &&
+				    _HA_ATOMIC_OR_FETCH(&tg_ctx->stopping_threads,
+							ti->ltid_bit) == tg->threads_enabled) {
+					/*
+					 * All threads from the thread group
+					 * are stopped, let it been known.
+					 */
+					_HA_ATOMIC_INC(&stopped_tgroups);
+				}
 			}
 
 			/* stop when there's nothing left to do */
 			if ((jobs - unstoppable_jobs) == 0 &&
-			    (_HA_ATOMIC_LOAD(&stopping_tgroup_mask) & all_tgroups_mask) == all_tgroups_mask) {
-				/* check that all threads are aware of the stopping status */
-				for (i = 0; i < global.nbtgroups; i++)
-					if ((_HA_ATOMIC_LOAD(&ha_tgroup_ctx[i].stopping_threads) &
-					     _HA_ATOMIC_LOAD(&ha_tgroup_info[i].threads_enabled)) !=
-					    _HA_ATOMIC_LOAD(&ha_tgroup_info[i].threads_enabled))
-						break;
+			    (_HA_ATOMIC_LOAD(&stopped_tgroups) == global.nbtgroups)) {
 #ifdef USE_THREAD
-				if (i == global.nbtgroups) {
-					/* all are OK, let's wake them all and stop */
-					for (i = 0; i < global.nbthread; i++)
-						if (i != tid && _HA_ATOMIC_LOAD(&ha_thread_info[i].tg->threads_enabled) & ha_thread_info[i].ltid_bit)
-							wake_thread(i);
-					break;
-				}
-#else
-				break;
+				for (i = 0; i < global.nbthread; i++)
+					if (i != tid && _HA_ATOMIC_LOAD(&ha_thread_info[i].tg->threads_enabled) & ha_thread_info[i].ltid_bit)
+						wake_thread(i);
 #endif
+				break;
 			}
 		}
 
@@ -2988,6 +3122,7 @@ void *run_thread_poll_loop(void *data)
 	ha_set_thread(data);
 	set_thread_cpu_affinity();
 	clock_set_local_source();
+	ha_random_seed_thread();
 
 #ifdef USE_THREAD
 	ha_thread_info[tid].pth_id = ha_get_pthread_id(tid);
@@ -3118,10 +3253,8 @@ void *run_thread_poll_loop(void *data)
 		ptff->fct();
 
 #ifdef USE_THREAD
-	if (!_HA_ATOMIC_AND_FETCH(&ha_tgroup_info[ti->tgid-1].threads_enabled, ~ti->ltid_bit))
-		_HA_ATOMIC_AND(&all_tgroups_mask, ~tg->tgid_bit);
-	if (!_HA_ATOMIC_AND_FETCH(&tg_ctx->stopping_threads, ~ti->ltid_bit))
-		_HA_ATOMIC_AND(&stopping_tgroup_mask, ~tg->tgid_bit);
+	_HA_ATOMIC_AND(&ha_tgroup_info[ti->tgid-1].threads_enabled, ~ti->ltid_bit);
+	_HA_ATOMIC_AND_FETCH(&tg_ctx->stopping_threads, ~ti->ltid_bit);
 	if (tid > 0)
 		pthread_exit(NULL);
 #endif
@@ -3166,6 +3299,123 @@ static void set_identity(const char *program_name)
 		exit(1);
 	}
 #endif
+}
+
+#if defined(CLONE_NEWUSER)
+/* Setup the user namespace after a successful unshare(CLONE_NEWUSER). We do not
+ * return a value because this is best-effort; it is only useful in very rare
+ * situations (see below), and if it fails, we let subsequent setuid() and/or
+ * setgid() calls fail later.
+ */
+static void setup_user_ns(uid_t euid, gid_t egid)
+{
+	char buf[64];
+	int n, ret, fd;
+
+	/* Creating uid_map and gid_map files is required for some specific
+	 * situations where we attempt to setuid()/setgid() to the user/group
+	 * we are already running as after a successful unshare(CLONE_NEWUSER).
+	 * While these directives would effectively be no-ops, we still support
+	 * them because it is possible that such setups exist in the wild. For
+	 * instance, if haproxy is run through a systemd file containing
+	 * "User=someuser" while the configuration file has "user someuser", we
+	 * would be in this situation, and a user enabling "chroot auto" in this
+	 * case would end up with seemingly unrelated setuid() failures.
+	 *
+	 * See user_namespaces(7) for more information.
+	 */
+	if (global.uid > 0) {
+		n = snprintf(buf, sizeof(buf), "%u %u 1\n", euid, euid);
+		fd = open("/proc/self/uid_map", O_WRONLY);
+		if (fd == -1)
+			return;
+
+		ret = write(fd, buf, n);
+		close(fd);
+		if (ret != n)
+			return;
+	}
+
+	if (global.gid > 0) {
+		/* In order to write to the gid_map file, we first need to write
+		 * "deny" to the setgroups file. We allow for failure because
+		 * older kernels do not support the setgroups file.
+		 */
+		fd = open("/proc/self/setgroups", O_WRONLY);
+		if (fd != -1) {
+			ret = write(fd, "deny", 4);
+			close(fd);
+			if (ret != 4)
+				return;
+		}
+
+		n = snprintf(buf, sizeof(buf), "%u %u 1\n", egid, egid);
+		fd = open("/proc/self/gid_map", O_WRONLY);
+		if (fd == -1)
+			return;
+
+		ret = write(fd, buf, n);
+		close(fd);
+		if (ret != n)
+			return;
+	}
+}
+#endif
+
+static int do_chroot(const char *prog, const char *path)
+{
+	const char *dir, *chroot_dir;
+	int error, chroot_error;
+
+	error = chroot_error = 0;
+	dir = chroot_dir = path;
+	if (strcmp(path, "auto") == 0) {
+		/* When "chroot auto" is used, we attempt to chroot to an
+		 * anonymous and read-only directory.
+		 */
+		char tmpdir[] = "/tmp/haproxy.XXXXXX";
+		dir = mkdtemp(tmpdir);
+		if (dir == NULL) {
+			ha_alert("[%s.main()] Cannot create(%s) for chroot auto.\n",
+			         prog, tmpdir);
+			return -1;
+		}
+		error = chdir(tmpdir);
+		/* We can call rmdir() here; we hold a reference to the
+		 * directory since it is our CWD (and if chdir() failed we still
+		 * want to remove the directory).
+		 */
+		DISGUISE(rmdir(tmpdir));
+		chroot_dir = ".";
+		if (!error)
+			chroot_error = chroot(".");
+	} else if (strcmp(path, "/") != 0) {
+		chroot_error = chroot(path);
+	}
+#ifdef CLONE_NEWUSER
+	/* If the chroot failed because of insufficient privileges and
+	 * unshare(CLONE_NEWUSER) is available, we attempt it to gain the
+	 * abilty to chroot as an unprivileged user. If that worked, we
+	 * try the chroot again.
+	 */
+	if (chroot_error && errno == EPERM) {
+		uid_t euid = geteuid();
+		gid_t egid = getegid();
+		if (unshare(CLONE_NEWUSER) == 0) {
+			setup_user_ns(euid, egid);
+			chroot_error = chroot(chroot_dir);
+		}
+	}
+#endif
+	if (!error && !chroot_error)
+		error = chdir("/");
+
+	if (error || chroot_error) {
+		ha_alert("[%s.main()] Cannot chroot(%s).\n", prog, dir);
+		return -1;
+	}
+
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -3290,8 +3540,16 @@ int main(int argc, char **argv)
 	if (backup_env() != 0)
 		exit(EXIT_FAILURE);
 
-	/* parse conf in discovery mode and set modes from config */
-	read_cfg_in_discovery_mode(argc, argv);
+	if (!fileless_mode)
+		/* parse conf in discovery mode and set modes from config */
+		read_cfg_in_discovery_mode(argc, argv);
+	else {
+		int ret;
+
+		ret = parse_cfg(&fileless_cfg);
+		if (ret != 0)
+			exit(EXIT_FAILURE);
+	}
 
 	/* From this stage all runtime modes are known. So let's do below some
 	 * preparation steps and then let's apply all discovered modes.
@@ -3333,8 +3591,10 @@ int main(int argc, char **argv)
 		mworker_apply_master_worker_mode();
 	}
 
-	/* Worker, daemon, foreground modes read the rest of the config */
-	if (!master) {
+	/* Worker, daemon, foreground, configuration with files modes read the rest
+	 * of the config.
+	 */
+	if (!master && !fileless_mode) {
 		usermsgs_clr("config");
 		if (global.mode & MODE_MWORKER) {
 			if (clean_env() != 0) {
@@ -3374,6 +3634,7 @@ int main(int argc, char **argv)
 		list_for_each_entry_safe(cfg, cfg_tmp, &cfg_cfgfiles, list)
 			ha_free(&cfg->content);
 
+		trace_parse_cmds();
 		usermsgs_clr(NULL);
 	}
 
@@ -3384,7 +3645,7 @@ int main(int argc, char **argv)
 	step_init_2(argc, argv);
 
 	RUN_INITCALLS(STG_INIT_2);
-	/* Late init step: register signals for worker and standalon modes, apply
+	/* Late init step: register signals for worker and standalone modes, apply
 	 * nofile and memory limits, apply capabilities from binary, if any.
 	 */
 	step_init_3();
@@ -3473,16 +3734,34 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* privileged users should use chroot whenever possible; use chroot /
+	 * if really not wanted.
+	 */
+
+	if (!global.chroot) {
+		int chroot_permitted = geteuid() == 0;
+
+#if defined(USE_PRCTL) && defined(PR_CAPBSET_READ) && defined(CAP_SYS_CHROOT)
+		chroot_permitted &= (prctl(PR_CAPBSET_READ, CAP_SYS_CHROOT, 0, 0, 0) == 1);
+#endif
+		if (chroot_permitted) {
+			ha_warning("[%s.main()] HAProxy was started as root without any 'chroot' "
+				   "directive. A chroot limits filesystem access of an intruder "
+				   "to a single, preferably empty, directory. It is strongly recommended "
+				   "to enable this feature whenever possible (it's always possible when "
+				   "starting as root), via 'chroot auto' in the global section. If you "
+				   "think you have good reasons for running outside a chroot, explicitly "
+				   "configure 'chroot /' to silence this warning.\n", argv[0]);
+		}
+	}
+
 	/* Must chroot and setgid/setuid in the children */
 	/* chroot if needed */
-	if (global.chroot != NULL) {
-		if (chroot(global.chroot) == -1 || chdir("/") == -1) {
-			ha_alert("[%s.main()] Cannot chroot(%s).\n", argv[0], global.chroot);
-			if (nb_oldpids)
-				tell_old_pids(SIGTTIN);
-			protocol_unbind_all();
-			exit(1);
-		}
+	if (global.chroot != NULL && do_chroot(argv[0], global.chroot) != 0) {
+		if (nb_oldpids)
+			tell_old_pids(SIGTTIN);
+		protocol_unbind_all();
+		exit(1);
 	}
 
 	ha_free(&global.chroot);
@@ -3504,12 +3783,12 @@ int main(int argc, char **argv)
 
 	/* set_identity() above might have dropped LSTCHK_NETADM or/and
 	 * LSTCHK_SYSADM if it changed to a new UID while preserving enough
-	 * permissions to honnor LSTCHK_NETADM/LSTCHK_SYSADM.
+	 * permissions to honor LSTCHK_NETADM/LSTCHK_SYSADM.
 	 */
 	if ((global.last_checks & (LSTCHK_NETADM|LSTCHK_SYSADM)) && getuid()) {
 		/* If global.uid is present in config, it is already set as euid
 		 * and ruid by set_identity() just above, so it's better to
-		 * remind the user to fix uncoherent settings.
+		 * remind the user to fix incoherent settings.
 		 */
 		if (global.uid > 0) {
 			ha_alert("[%s.main()] Some configuration options require full "
@@ -3667,6 +3946,7 @@ int main(int argc, char **argv)
 		char *msg = NULL;
 		char c;
 		int r __maybe_unused;
+		struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
 
 		if (socketpair(PF_UNIX, SOCK_STREAM, 0, sock_pair) == -1) {
 			ha_alert("[%s.main()] Cannot create socketpair to update the new worker state\n",
@@ -3676,9 +3956,11 @@ int main(int argc, char **argv)
 		}
 
 		list_for_each_entry(proc, &proc_list, list) {
-			if (proc->pid == -1)
+			if (proc->pid == -1 && proc->options & PROC_O_TYPE_WORKER)
 				break;
 		}
+
+		BUG_ON(!(proc->options & PROC_O_TYPE_WORKER));
 
 		if (send_fd_uxst(proc->ipc_fd[1], sock_pair[0]) == -1) {
 			ha_alert("[%s.main()] Cannot transfer connection fd %d over the sockpair@%d\n",
@@ -3703,6 +3985,7 @@ int main(int argc, char **argv)
 		 * we make sure that the fd is received correctly.
 		 */
 		shutdown(sock_pair[1], SHUT_WR);
+		setsockopt(sock_pair[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 		r = read(sock_pair[1], &c, 1);
 		close(sock_pair[1]);
 		close(sock_pair[0]);

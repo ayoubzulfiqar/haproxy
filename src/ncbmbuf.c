@@ -143,6 +143,8 @@ static struct itbmap itbmap_next(const struct ncbmbuf *buf,
 	if (off_next == ncbmb_size(buf)) {
 		next.b = NULL;
 		next.off = off_next;
+		next.mask = 0;
+		next.bits = 0;
 	}
 	else {
 		itbmap_load(&next, prev->off + prev->bits, buf);
@@ -368,6 +370,12 @@ void test_ncbmb(void)
 	char *data = calloc(16384, 1);
 	struct ncbmbuf buf;
 
+	if (!area || !data) {
+		free(area);
+		free(data);
+		return;
+	}
+
 	memset(data, 0x11, 16384);
 
 	/* 7 bytes data // 1 byte bitmap (0xfe) */
@@ -540,6 +548,12 @@ void test_ngtcp2_crypto(void)
 	char *area = calloc(16384, 1);
 	char *data = calloc(16384, 1);
 	struct ncbmbuf buf;
+
+	if (!area || !data) {
+		free(area);
+		free(data);
+		return;
+	}
 
 	memset(data, 0x11, 16384);
 

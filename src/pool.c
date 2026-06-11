@@ -27,7 +27,6 @@
 #include <haproxy/pool.h>
 #include <haproxy/pool-os.h>
 #include <haproxy/sc_strm.h>
-#include <haproxy/stats-t.h>
 #include <haproxy/stconn.h>
 #include <haproxy/thread.h>
 #include <haproxy/tools.h>
@@ -302,7 +301,7 @@ static int mem_should_fail(const struct pool_head *pool)
  * registration struct. Use create_pool() instead which does it for free.
  * The alignment will be stored as-is in the registration.
  */
-struct pool_head *create_pool_with_loc(const char *name, unsigned int size,
+struct pool_head *create_pool_with_loc(const char *name, ullong size,
 				       unsigned int align, unsigned int flags,
 				       const char *file, unsigned int line)
 {
@@ -335,7 +334,8 @@ struct pool_head *create_pool_from_reg(const char *name, struct pool_registratio
 {
 	unsigned int extra_mark, extra_caller, extra;
 	unsigned int flags = reg->flags;
-	unsigned int size = reg->size;
+	ullong reg_size = reg->size; // copy of the originally requested size
+	ullong size = reg_size;
 	unsigned int alignment = reg->align;
 	struct pool_head *pool = NULL;
 	struct pool_head *entry;
@@ -370,9 +370,19 @@ struct pool_head *create_pool_from_reg(const char *name, struct pool_registratio
 		return NULL;
 	}
 
+	if (invalid_char(name)) {
+		ha_alert("Pool '%s' declared at %s:%u contains invalid chars in its name and "
+			 "cannot be registered. Please report to developers. Aborting.\n",
+			 name, reg->file, reg->line);
+		return NULL;
+	}
+
 	extra_mark = (pool_debugging & POOL_DBG_TAG) ? POOL_EXTRA_MARK : 0;
 	extra_caller = (pool_debugging & POOL_DBG_CALLER) ? POOL_EXTRA_CALLER : 0;
 	extra = extra_mark + extra_caller;
+
+	if (size > 0xFFFFFFFFULL || (size + extra) > 0xFFFFFFFFULL || (uint)(size + extra) < (uint)reg_size)
+		goto ovf;
 
 	if (!(pool_debugging & POOL_DBG_NO_CACHE)) {
 		/* we'll store two lists there, we need the room for this. Let's
@@ -392,7 +402,7 @@ struct pool_head *create_pool_from_reg(const char *name, struct pool_registratio
 	 */
 	if (!(flags & MEM_F_EXACT)) {
 		align = (pool_debugging & POOL_DBG_TAG) ? sizeof(void *) : 16;
-		size  = ((size + align - 1) & -align);
+		size  = ((size + align - 1) & -(ullong)align);
 	}
 
 	if (pool_debugging & POOL_DBG_BACKUP) {
@@ -401,6 +411,9 @@ struct pool_head *create_pool_from_reg(const char *name, struct pool_registratio
 		 */
 		extra += size;
 	}
+
+	if (size > 0xFFFFFFFFULL || (size + extra) > 0xFFFFFFFFULL || (uint)(size + extra) < (uint)reg_size)
+		goto ovf;
 
 	/* TODO: thread: we do not lock pool list for now because all pools are
 	 * created during HAProxy startup (so before threads creation) */
@@ -496,6 +509,11 @@ struct pool_head *create_pool_from_reg(const char *name, struct pool_registratio
 
  fail:
 	return pool;
+ ovf:
+	ha_alert("Failed to create pool '%s' of size '%llu': overflow detected due to too large "
+	         "a configured size and/or configured pool options. Aborting.\n",
+	         name, reg_size);
+	return NULL;
 }
 
 /* Tries to allocate an object for the pool <pool> using the system's allocator
@@ -794,7 +812,8 @@ void pool_put_to_cache(struct pool_head *pool, void *ptr, const void *caller)
 	if (unlikely(pool_cache_bytes > global.tune.pool_cache_size * 3 / 4)) {
 		uint64_t mem_wait_start = 0;
 
-		if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING))
+		if (unlikely((th_ctx->flags & (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_M)) ==
+		             (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_M)))
 			mem_wait_start = now_mono_time();
 
 		if (ph->count >= 16 + pool_cache_count / 8 + CONFIG_HAP_POOL_CLUSTER_SIZE)
@@ -957,7 +976,8 @@ void pool_gc(struct pool_head *pool_ctx)
 	uint64_t mem_wait_start = 0;
 	int isolated = thread_isolated();
 
-	if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING))
+	if (unlikely((th_ctx->flags & (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_M)) ==
+	             (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_M)))
 		mem_wait_start = now_mono_time();
 
 	if (!isolated)
@@ -1019,7 +1039,8 @@ void *__pool_alloc(struct pool_head *pool, unsigned int flags)
 		/* count allocation time only for cache misses */
 		uint64_t mem_wait_start = 0;
 
-		if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING))
+		if (unlikely((th_ctx->flags & (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_M)) ==
+	                     (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_M)))
 			mem_wait_start = now_mono_time();
 
 		p = pool_alloc_nocache(pool, caller);
@@ -1097,7 +1118,8 @@ void __pool_free(struct pool_head *pool, void *ptr)
 		     global.tune.pool_cache_size < pool->size)) {
 		uint64_t mem_wait_start = 0;
 
-		if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING))
+		if (unlikely((th_ctx->flags & (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_M)) ==
+	                     (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_M)))
 			mem_wait_start = now_mono_time();
 
 		pool_free_nocache(pool, ptr);
@@ -1428,7 +1450,7 @@ int dump_pools_info(struct appctx *appctx)
 			struct pool_registration *reg;
 
 			list_for_each_entry(reg, &ctx->pool_info[i].entry->regs, list) {
-				chunk_appendf(&trash, "      >  %-12s: size=%u flags=%#x align=%u", reg->name, reg->size, reg->flags, reg->align);
+				chunk_appendf(&trash, "      >  %-12s: size=%llu flags=%#x align=%u", reg->name, reg->size, reg->flags, reg->align);
 				if (reg->file && reg->line)
 					chunk_appendf(&trash, " [%s:%u]", reg->file, reg->line);
 				chunk_appendf(&trash, "\n");
@@ -1651,7 +1673,7 @@ void create_pool_callback(struct pool_head **ptr, char *name, struct pool_regist
 {
 	*ptr = create_pool_from_reg(name, reg);
 	if (!*ptr) {
-		ha_alert("Failed to allocate pool '%s' of size %u : %s. Aborting.\n",
+		ha_alert("Failed to allocate pool '%s' of size %llu : %s. Aborting.\n",
 			 name, reg->size, strerror(errno));
 		exit(1);
 	}

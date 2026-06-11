@@ -15,7 +15,7 @@ enum stfile_domain {
 };
 
 #define SHM_STATS_FILE_VER_MAJOR         1
-#define SHM_STATS_FILE_VER_MINOR         1
+#define SHM_STATS_FILE_VER_MINOR         2
 
 #define SHM_STATS_FILE_HEARTBEAT_TIMEOUT 60 /* passed this delay (seconds) process which has not
                                              * sent heartbeat will be considered down
@@ -36,7 +36,7 @@ struct shm_stats_file_hdr {
 	/* 2 bytes hole */
 	uint global_now_ms;   /* global monotonic date (ms) common to all processes using the shm */
 	ullong global_now_ns; /* global monotonic date (ns) common to all processes using the shm */
-	llong now_offset;     /* offset applied to global monotonic date on startup */
+	ALWAYS_PAD(8); // 8 bytes hole
 	/* each process uses one slot and is identified using its pid, max 64 in order
 	 * to be able to use bitmask to refer to a process and then look its pid in the
 	 * "slots.pid" map
@@ -47,7 +47,7 @@ struct shm_stats_file_hdr {
 	 */
 	struct {
 		pid_t pid;
-		int heartbeat; // last activity of this process + heartbeat timeout, in ticks
+		uint heartbeat; // last activity of this process + heartbeat timeout, in ticks
 	} slots[64];
 	int objects; /* actual number of objects stored in the shm */
 	int objects_slots; /* total available objects slots unless map is resized */
@@ -64,9 +64,9 @@ struct shm_stats_file_hdr {
  */
 struct shm_stats_file_object {
 	char guid[GUID_MAX_LEN + 1];
-	uint8_t tgid; // thread group ID from 1 to 64
+	uint16_t tgid; // thread group ID
 	uint8_t type; // SHM_STATS_FILE_OBJECT_TYPE_* to know how to handle object.data
-	ALWAYS_PAD(6); // 6 bytes hole, ensure it remains the same size 32 vs 64 bits arch
+	ALWAYS_PAD(5); // 5 bytes hole, ensure it remains the same size 32 vs 64 bits arch
 	uint64_t users; // bitfield that corresponds to users of the object (see shm_stats_file_hdr slots)
 	/* as the struct may hold any of the types described here, let's make it
 	 * so it may store up to the heaviest one using an union

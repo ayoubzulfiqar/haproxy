@@ -437,7 +437,7 @@ static void fwlc_srv_reposition(struct server *s)
 		tree_elt = fwlc_alloc_tree_elt(s->proxy, allocated_elt);
 		if (tree_elt == NULL) {
 			/* We failed to allocate memory, just try again later */
-			HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &s->proxy->lbprm.lock);
+			HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &s->proxy->lbprm.lock);
 			_HA_ATOMIC_STORE(&s->lb_lock, 0);
 			if (s->requeue_tasklet)
 				tasklet_wakeup(s->requeue_tasklet);
@@ -709,19 +709,10 @@ static void fwlc_update_server_weight(struct server *srv)
  * weighted least-conns. It also sets p->lbprm.wdiv to the eweight to
  * uweight ratio. Both active and backup groups are initialized.
  */
-void fwlc_init_server_tree(struct proxy *p)
+static int fwlc_init_server_tree(struct proxy *p)
 {
 	struct server *srv;
 	struct eb_root init_head = EB_ROOT;
-
-	p->lbprm.set_server_status_up   = fwlc_set_server_status_up;
-	p->lbprm.set_server_status_down = fwlc_set_server_status_down;
-	p->lbprm.update_server_eweight  = fwlc_update_server_weight;
-	p->lbprm.server_take_conn = fwlc_srv_reposition;
-	p->lbprm.server_drop_conn = fwlc_srv_reposition;
-	p->lbprm.server_requeue   = fwlc_srv_reposition;
-	p->lbprm.server_deinit    = fwlc_server_deinit;
-	p->lbprm.proxy_deinit     = fwlc_proxy_deinit;
 
 	p->lbprm.wdiv = BE_WEIGHT_SCALE;
 	for (srv = p->srv; srv; srv = srv->next) {
@@ -744,6 +735,7 @@ void fwlc_init_server_tree(struct proxy *p)
 		srv->lb_tree = (srv->flags & SRV_F_BACKUP) ? &p->lbprm.fwlc.bck : &p->lbprm.fwlc.act;
 		fwlc_queue_srv(srv, srv->next_eweight);
 	}
+	return 0;
 }
 
 /* Return next server from the FWLC tree in backend <p>. If the tree is empty,
@@ -886,6 +878,24 @@ redo:
 	return srv;
 }
 
+static struct lb_ops lb_fwlc_ops = {ILH,
+	.map = {
+		{ .mask = BE_LB_KIND | BE_LB_PARM, .match = BE_LB_KIND_CB | BE_LB_CB_LC },
+		{ 0, 0 }
+	},
+	.algo_prop              = BE_LB_LKUP_LCTREE | BE_LB_PROP_DYN,
+	.proxy_init             = fwlc_init_server_tree,
+	.set_server_status_up   = fwlc_set_server_status_up,
+	.set_server_status_down = fwlc_set_server_status_down,
+	.update_server_eweight  = fwlc_update_server_weight,
+	.server_take_conn       = fwlc_srv_reposition,
+	.server_drop_conn       = fwlc_srv_reposition,
+	.server_requeue         = fwlc_srv_reposition,
+	.server_deinit          = fwlc_server_deinit,
+	.proxy_deinit           = fwlc_proxy_deinit,
+};
+
+INITCALL1(STG_REGISTER, lb_ops_register, &lb_fwlc_ops);
 
 /*
  * Local variables:
