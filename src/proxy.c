@@ -22,6 +22,7 @@
 #include <haproxy/acl.h>
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
+#include <haproxy/backend.h>
 #include <haproxy/capture-t.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/cli.h>
@@ -29,6 +30,7 @@
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/filters.h>
+#include <haproxy/frontend.h>
 #include <haproxy/global.h>
 #include <haproxy/guid.h>
 #include <haproxy/http_ana.h>
@@ -37,8 +39,15 @@
 #include <haproxy/http_rules.h>
 #include <haproxy/mailers.h>
 #include <haproxy/listener.h>
+#include <haproxy/lb_chash.h>
+#include <haproxy/lb_fas.h>
+#include <haproxy/lb_fwlc.h>
+#include <haproxy/lb_fwrr.h>
+#include <haproxy/lb_map.h>
+#include <haproxy/lb_ss.h>
 #include <haproxy/log.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/openssl-compat.h> /* required for TLSEXT_TYPE_application_layer_protocol_negotiation */
 #include <haproxy/peers.h>
 #include <haproxy/pool.h>
 #include <haproxy/protocol.h>
@@ -46,17 +55,21 @@
 #include <haproxy/proxy.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/quic_tp.h>
+#include <haproxy/quic_tune.h>
 #include <haproxy/server-t.h>
 #include <haproxy/signal.h>
-#include <haproxy/stats-t.h>
+#include <haproxy/stats.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
+#include <haproxy/thread.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <haproxy/uri_auth.h>
 
+/* Lock to ensure multiple backends deletion concurrently is safe */
+__decl_spinlock(proxies_del_lock);
 
 int listeners;	/* # of proxy listeners, set by cfgparse */
 struct proxy *proxies_list  = NULL;     /* list of main proxies */
@@ -64,8 +77,10 @@ struct list proxies = LIST_HEAD_INIT(proxies); /* list of all proxies */
 struct ceb_root *used_proxy_id = NULL; /* list of proxy IDs in use */
 struct ceb_root *proxy_by_name = NULL; /* tree of proxies sorted by name */
 struct ceb_root *defproxy_by_name = NULL; /* tree of default proxies sorted by name (dups possible) */
-struct proxy *orphaned_default_proxies = NULL; /* deleted ones with refcount != 0 */
+struct list defaults_list = LIST_HEAD_INIT(defaults_list); /* list of all defaults proxies */
 unsigned int error_snapshot_id = 0;     /* global ID assigned to each error then incremented */
+
+unsigned int dynpx_next_id = 0; /* lowest ID assigned to dynamic proxies */
 
 /* CLI context used during "show servers {state|conn}" */
 struct show_srv_ctx {
@@ -216,10 +231,15 @@ static inline void proxy_free_common(struct proxy *px)
 	struct logger *log, *logb;
 	struct lf_expr *lf, *lfb;
 
+	/* First release from global elements under lock protection. */
+	HA_SPIN_LOCK(PROXIES_DEL_LOCK, &proxies_del_lock);
 	/* note that the node's key points to p->id */
 	cebis_item_delete((px->cap & PR_CAP_DEF) ? &defproxy_by_name : &proxy_by_name, conf.name_node, id, px);
-	ha_free(&px->id);
 	LIST_DEL_INIT(&px->global_list);
+	HA_SPIN_UNLOCK(PROXIES_DEL_LOCK, &proxies_del_lock);
+
+	/* Now release internal proxy elements. */
+	ha_free(&px->id);
 	drop_file_name(&px->conf.file);
 	counters_fe_shared_drop(&px->fe_counters.shared);
 	counters_be_shared_drop(&px->be_counters.shared);
@@ -320,6 +340,12 @@ void deinit_proxy(struct proxy *p)
 	EXTRA_COUNTERS_FREE(p->extra_counters_fe);
 	EXTRA_COUNTERS_FREE(p->extra_counters_be);
 
+	list_for_each_entry_safe(rule, ruleb, &p->persist_rules, list) {
+		LIST_DELETE(&rule->list);
+		free_acl_cond(rule->cond);
+		free(rule);
+	}
+
 	free_server_rules(&p->server_rules);
 
 	list_for_each_entry_safe(rule, ruleb, &p->switching_rules, list) {
@@ -366,8 +392,8 @@ void deinit_proxy(struct proxy *p)
 		list_for_each_entry(srvdf, &server_deinit_list, list)
 			srvdf->fct(s);
 
-		if (p->lbprm.server_deinit)
-			p->lbprm.server_deinit(s);
+		if (p->lbprm.ops && p->lbprm.ops->server_deinit)
+			p->lbprm.ops->server_deinit(s);
 
 		s = srv_drop(s);
 	}/* end while(s) */
@@ -380,8 +406,8 @@ void deinit_proxy(struct proxy *p)
 		srv_free(&p->defsrv);
 	}
 
-	if (p->lbprm.proxy_deinit)
-		p->lbprm.proxy_deinit(p);
+	if (p->lbprm.ops && p->lbprm.ops->proxy_deinit)
+		p->lbprm.ops->proxy_deinit(p);
 
 	list_for_each_entry_safe(l, l_next, &p->conf.listeners, by_fe) {
 		guid_remove(&l->guid);
@@ -412,9 +438,6 @@ void deinit_proxy(struct proxy *p)
 		free(bind_conf->rhttp_srvname);
 		free(bind_conf->tcp_md5sig);
 		free(bind_conf->cc_algo);
-#ifdef USE_QUIC
-		free(bind_conf->quic_cc_algo);
-#endif
 		free(bind_conf);
 	}
 
@@ -440,9 +463,19 @@ void deinit_proxy(struct proxy *p)
 	proxy_unref_defaults(p);
 }
 
-/* deinit and free <p> proxy */
-void free_proxy(struct proxy *p)
+/* Decrement <p> refcount and free it if null. For a default proxy instance,
+ * refcount is ignored and free is immediately performed.
+ */
+void proxy_drop(struct proxy *p)
 {
+	if (!p)
+		return;
+
+	if (!(p->cap & PR_CAP_DEF)) {
+		if (HA_ATOMIC_SUB_FETCH(&p->refcount, 1))
+			return;
+	}
+
 	deinit_proxy(p);
 	ha_free(&p);
 }
@@ -488,6 +521,21 @@ const char *proxy_mode_str(int mode) {
 		return "spop";
 	else
 		return "unknown";
+}
+
+/* Convert <mode> string into proxy mode type. PR_MODES is returned for unknown values. */
+enum pr_mode str_to_proxy_mode(const char *mode)
+{
+	if (strcmp(mode, "http") == 0)
+		return PR_MODE_HTTP;
+	else if (strcmp(mode, "tcp") == 0)
+		return PR_MODE_TCP;
+	else if (strcmp(mode, "log") == 0)
+		return PR_MODE_SYSLOG;
+	else if (strcmp(mode, "spop") == 0)
+		return PR_MODE_SPOP;
+
+	return PR_MODES;
 }
 
 /* try to find among known options the one that looks closest to <word> by
@@ -855,7 +903,7 @@ static int proxy_parse_declare(char **args, int section, struct proxy *curpx,
 		len = strtol(args[4], &error, 10);
 		if (*error != '\0') {
 			memprintf(err, "'%s %s': cannot parse the length '%s'.",
-			          args[0], args[1], args[3]);
+			          args[0], args[1], args[4]);
 			return -1;
 		}
 
@@ -875,6 +923,11 @@ static int proxy_parse_declare(char **args, int section, struct proxy *curpx,
 		hdr->namelen = 0;
 		hdr->len = len;
 		hdr->pool = create_pool("caphdr", hdr->len + 1, MEM_F_SHARED);
+		if (!hdr->pool) {
+			memprintf(err, "out of memory");
+			free(hdr);
+			return -1;
+		}
 
 		if (strcmp(args[2], "request") == 0) {
 			hdr->next = curpx->req_cap;
@@ -953,7 +1006,7 @@ proxy_parse_retry_on(char **args, int section, struct proxy *curpx,
 					     PR_RE_JUNK_REQUEST;
 		else if (strcmp(args[i], "none") == 0) {
 			if (i != 1 || *args[i + 1]) {
-				memprintf(err, "'%s' 'none' keyworld only usable alone", args[0]);
+				memprintf(err, "'%s' 'none' keyword only usable alone", args[0]);
 				return -1;
 			}
 		} else {
@@ -1156,6 +1209,56 @@ static int proxy_parse_tcpka_intvl(char **args, int section, struct proxy *proxy
 	return retval;
 }
 #endif
+
+static int proxy_parse_force_be_switch(char **args, int section_type, struct proxy *curpx,
+                                       const struct proxy *defpx, const char *file, int line,
+                                       char **err)
+{
+	struct acl_cond *cond = NULL;
+	struct persist_rule *rule;
+
+	if (curpx->cap & PR_CAP_DEF) {
+		memprintf(err, "'%s' not allowed in 'defaults' section.", args[0]);
+		goto err;
+	}
+
+	if (!(curpx->cap & PR_CAP_FE)) {
+		memprintf(err, "'%s' only available in frontend or listen section.", args[0]);
+		goto err;
+	}
+
+	if (strcmp(args[1], "if") != 0 && strcmp(args[1], "unless") != 0) {
+		memprintf(err, "'%s' requires either 'if' or 'unless' followed by a condition.", args[0]);
+		goto err;
+	}
+
+	if (!(cond = build_acl_cond(file, line, &curpx->acl, curpx, (const char **)args + 1, err))) {
+		memprintf(err, "'%s' : %s.", args[0], *err);
+		goto err;
+	}
+
+	if (warnif_cond_conflicts(cond, SMP_VAL_FE_REQ_CNT, err)) {
+		memprintf(err, "'%s' : %s.", args[0], *err);
+		goto err;
+	}
+
+	rule = calloc(1, sizeof(*rule));
+	if (!rule) {
+		memprintf(err, "'%s' : out of memory.", args[0]);
+		goto err;
+	}
+
+	rule->cond = cond;
+	rule->type = PERSIST_TYPE_BE_SWITCH;
+	LIST_INIT(&rule->list);
+	LIST_APPEND(&curpx->persist_rules, &rule->list);
+
+	return 0;
+
+ err:
+	free_acl_cond(cond);
+	return -1;
+}
 
 static int proxy_parse_guid(char **args, int section_type, struct proxy *curpx,
                             const struct proxy *defpx, const char *file, int line,
@@ -1438,15 +1541,16 @@ int proxy_cfg_ensure_no_log(struct proxy *curproxy)
 	return 0;
 }
 
-/* Perform the most basic initialization of a proxy :
- * memset(), list_init(*), reset_timeouts(*).
- * Any new proxy or peer should be initialized via this function.
+/* Perform the most basic initialization of <p> proxy and define some common
+ * default parameters values. Any new proxy or peer should be initialized via
+ * this function.
  */
 void init_new_proxy(struct proxy *p)
 {
 	memset(p, 0, sizeof(struct proxy));
 	p->obj_type = OBJ_TYPE_PROXY;
 	LIST_INIT(&p->global_list);
+	LIST_INIT(&p->el);
 	LIST_INIT(&p->acl);
 	LIST_INIT(&p->http_req_rules);
 	LIST_INIT(&p->http_res_rules);
@@ -1473,7 +1577,9 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->conf.args.list);
 	LIST_INIT(&p->conf.lf_checks);
 	LIST_INIT(&p->filter_configs);
-	LIST_INIT(&p->tcpcheck_rules.preset_vars);
+	LIST_INIT(&p->tcpcheck.preset_vars);
+	LIST_INIT(&p->filter_sequence.req);
+	LIST_INIT(&p->filter_sequence.res);
 
 	MT_LIST_INIT(&p->lbprm.lb_free_list);
 
@@ -1491,15 +1597,35 @@ void init_new_proxy(struct proxy *p)
 	/* Default to only allow L4 retries */
 	p->retry_type = PR_RE_CONN_FAILED;
 
+	p->stream_new_from_sc = stream_new;
 	guid_init(&p->guid);
+	MT_LIST_INIT(&p->watcher_list);
 
 	p->extra_counters_fe = NULL;
 	p->extra_counters_be = NULL;
 
 	HA_RWLOCK_INIT(&p->lock);
 
-	/* initialize the default settings */
-	proxy_preset_defaults(p);
+	lf_expr_init(&p->logformat);
+	lf_expr_init(&p->logformat_sd);
+	lf_expr_init(&p->format_unique_id);
+	lf_expr_init(&p->logformat_error);
+
+	/* initialize parameters to common default values */
+	p->mode = PR_MODE_TCP;
+	p->options |= PR_O_REUSE_SAFE;
+	p->max_out_conns = MAX_SRV_LIST;
+	p->email_alert.level = LOG_ALERT;
+	p->load_server_state_from_file = PR_SRV_STATE_FILE_UNSPEC;
+
+	if (!(p->cap & PR_CAP_INT)) {
+		p->maxconn = cfg_maxpconn;
+		p->conn_retries = CONN_RETRIES;
+	}
+	else {
+		p->options2 |= PR_O2_INDEPSTR;
+		p->timeout.connect = 5000;
+	}
 }
 
 /* Initialize per-thread proxy fields */
@@ -1514,39 +1640,1306 @@ int proxy_init_per_thr(struct proxy *px)
 	return 0;
 }
 
-/* Preset default settings onto proxy <defproxy>. */
-void proxy_preset_defaults(struct proxy *defproxy)
+int proxy_finalize(struct proxy *px, int *err_code)
 {
-	defproxy->mode = PR_MODE_TCP;
-	defproxy->flags = 0;
-	if (!(defproxy->cap & PR_CAP_INT)) {
-		defproxy->maxconn = cfg_maxpconn;
-		defproxy->conn_retries = CONN_RETRIES;
+	struct bind_conf *bind_conf;
+	struct server *newsrv;
+	struct switching_rule *rule;
+	struct server_rule *srule;
+	struct sticking_rule *mrule;
+	struct logger *tmplogger;
+	struct lb_ops *ops;
+	unsigned int next_id;
+	int cfgerr = 0;
+	char *err = NULL;
+	int i;
+
+	/* check and reduce the bind-proc of each listener */
+	list_for_each_entry(bind_conf, &px->conf.bind, by_fe) {
+		int mode = conn_pr_mode_to_proto_mode(px->mode);
+		const struct mux_proto_list *mux_ent;
+		int ret;
+
+		/* Check the mux protocols, if any; before the check the ALPN */
+		if (bind_conf->xprt && bind_conf->xprt == xprt_get(XPRT_QUIC)) {
+			if (!bind_conf->mux_proto) {
+				/* No protocol was specified. If we're using QUIC at the transport
+				 * layer, we'll instantiate it as a mux as well. If QUIC is not
+				 * compiled in, this will remain NULL.
+				 */
+				bind_conf->mux_proto = get_mux_proto(ist("quic"));
+			}
+			if (bind_conf->options & BC_O_ACC_PROXY) {
+				ha_alert("Binding [%s:%d] for %s %s: QUIC protocol does not support PROXY protocol yet."
+				         " 'accept-proxy' option cannot be used with a QUIC listener.\n",
+				         bind_conf->file, bind_conf->line,
+				         proxy_type_str(px), px->id);
+				cfgerr++;
+			}
+		}
+
+		if (bind_conf->mux_proto) {
+			int is_quic;
+
+			if ((bind_conf->options & (BC_O_USE_SOCK_DGRAM | BC_O_USE_XPRT_STREAM)) == (BC_O_USE_SOCK_DGRAM | BC_O_USE_XPRT_STREAM))
+				is_quic = 1;
+			else
+				is_quic = 0;
+			/* it is possible that an incorrect mux was referenced
+			 * due to the proxy's mode not being taken into account
+			 * on first pass. Let's adjust it now.
+			 */
+			mux_ent = conn_get_best_mux_entry(bind_conf->mux_proto->mux_proto, IST_NULL, PROTO_SIDE_FE, is_quic, mode);
+
+			if (!mux_ent || !isteq(mux_ent->mux_proto, bind_conf->mux_proto->mux_proto)) {
+				ha_alert("%s '%s' : MUX protocol '%.*s' is not usable for 'bind %s' at [%s:%d].\n",
+				         proxy_type_str(px), px->id,
+				         (int)bind_conf->mux_proto->mux_proto.len,
+				         bind_conf->mux_proto->mux_proto.ptr,
+				         bind_conf->arg, bind_conf->file, bind_conf->line);
+				cfgerr++;
+			}
+			else {
+				if ((mux_ent->mux->flags & MX_FL_FRAMED) && !(bind_conf->options & BC_O_USE_SOCK_DGRAM)) {
+					ha_alert("%s '%s' : frame-based MUX protocol '%.*s' is incompatible with stream transport of 'bind %s' at [%s:%d].\n",
+					         proxy_type_str(px), px->id,
+					         (int)bind_conf->mux_proto->mux_proto.len,
+					         bind_conf->mux_proto->mux_proto.ptr,
+					         bind_conf->arg, bind_conf->file, bind_conf->line);
+					cfgerr++;
+				}
+				else if (!(mux_ent->mux->flags & MX_FL_FRAMED) && !(bind_conf->options & BC_O_USE_SOCK_STREAM)) {
+					ha_alert("%s '%s' : stream-based MUX protocol '%.*s' is incompatible with framed transport of 'bind %s' at [%s:%d].\n",
+					         proxy_type_str(px), px->id,
+					         (int)bind_conf->mux_proto->mux_proto.len,
+					         bind_conf->mux_proto->mux_proto.ptr,
+					         bind_conf->arg, bind_conf->file, bind_conf->line);
+					cfgerr++;
+				}
+			}
+
+			/* update the mux */
+			bind_conf->mux_proto = mux_ent;
+		}
+
+
+		/* HTTP frontends with "h2" as ALPN/NPN will work in
+		 * HTTP/2 and absolutely require buffers 16kB or larger.
+		 */
+#ifdef USE_OPENSSL
+		/* no-alpn ? If so, it's the right moment to remove it */
+		if (bind_conf->ssl_conf.alpn_str && !bind_conf->ssl_conf.alpn_len) {
+			ha_free(&bind_conf->ssl_conf.alpn_str);
+		}
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
+		else if (!bind_conf->ssl_conf.alpn_str && !bind_conf->ssl_conf.npn_str &&
+			 ((bind_conf->options & BC_O_USE_SSL) || bind_conf->xprt == xprt_get(XPRT_QUIC)) &&
+			 px->mode == PR_MODE_HTTP && global.tune.bufsize >= 16384) {
+
+			/* Neither ALPN nor NPN were explicitly set nor disabled, we're
+			 * in HTTP mode with an SSL or QUIC listener, we can enable ALPN.
+			 * Note that it's in binary form. First we try to set the ALPN from
+			 * mux proto if set. Otherwise rely on the default ALPN.
+			 */
+			if (bind_conf->mux_proto && bind_conf->mux_proto->alpn)
+				bind_conf->ssl_conf.alpn_str = strdup(bind_conf->mux_proto->alpn);
+			else if (bind_conf->xprt == xprt_get(XPRT_QUIC))
+				bind_conf->ssl_conf.alpn_str = strdup("\002h3");
+			else
+				bind_conf->ssl_conf.alpn_str = strdup("\002h2\010http/1.1");
+
+			if (!bind_conf->ssl_conf.alpn_str) {
+				ha_alert("Proxy '%s': out of memory while trying to allocate a default alpn string in 'bind %s' at [%s:%d].\n",
+				         px->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+				cfgerr++;
+				*err_code |= ERR_FATAL | ERR_ALERT;
+				goto out;
+			}
+			bind_conf->ssl_conf.alpn_len = strlen(bind_conf->ssl_conf.alpn_str);
+		}
+#endif /* TLSEXT_TYPE_application_layer_protocol_negotiation */
+
+
+		if (px->mode == PR_MODE_HTTP && global.tune.bufsize < 16384) {
+#ifdef OPENSSL_NPN_NEGOTIATED
+			/* check NPN */
+			if (bind_conf->ssl_conf.npn_str && strstr(bind_conf->ssl_conf.npn_str, "\002h2")) {
+				ha_alert("HTTP frontend '%s' enables HTTP/2 via NPN at [%s:%d], so global.tune.bufsize must be at least 16384 bytes (%d now).\n",
+				         px->id, bind_conf->file, bind_conf->line, global.tune.bufsize);
+				cfgerr++;
+			}
+#endif /* OPENSSL_NPN_NEGOTIATED */
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
+			/* check ALPN */
+			if (bind_conf->ssl_conf.alpn_str && strstr(bind_conf->ssl_conf.alpn_str, "\002h2")) {
+				ha_alert("HTTP frontend '%s' enables HTTP/2 via ALPN at [%s:%d], so global.tune.bufsize must be at least 16384 bytes (%d now).\n",
+				         px->id, bind_conf->file, bind_conf->line, global.tune.bufsize);
+				cfgerr++;
+			}
+#endif /* TLSEXT_TYPE_application_layer_protocol_negotiation */
+		} /* HTTP && bufsize < 16384 */
+
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
+		if (px->mode == PR_MODE_HTTP && !bind_conf->mux_proto &&
+		    bind_conf->ssl_conf.alpn_str &&
+		    strstr(bind_conf->ssl_conf.alpn_str, "\002h3")) {
+			if (!experimental_directives_allowed) {
+				ha_alert("HTTP/3 on TCP listed via ALPN on frontend '%s' at [%s:%d] relies on the experimental QMux protocol, "
+				         "must be allowed via a global 'expose-experimental-directives'.\n",
+				         px->id, bind_conf->file, bind_conf->line);
+				cfgerr++;
+			}
+
+			mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
+		}
+#endif /* TLSEXT_TYPE_application_layer_protocol_negotiation */
+
+#endif /* USE_OPENSSL */
+
+#ifdef USE_QUIC
+		if (bind_conf->xprt == xprt_get(XPRT_QUIC)) {
+			const struct quic_cc_algo *cc_algo = bind_conf->quic_cc_algo ?
+			  bind_conf->quic_cc_algo : default_quic_cc_algo;
+
+			if (!(cc_algo->flags & QUIC_CC_ALGO_FL_OPT_PACING) &&
+			    !(quic_tune.fe.fb_opts & QUIC_TUNE_FB_TX_PACING)) {
+				ha_warning("Binding [%s:%d] for %s %s: using the selected congestion algorithm without pacing may cause slowdowns or high loss rates during transfers.\n",
+				           bind_conf->file, bind_conf->line,
+				           proxy_type_str(px), px->id);
+				*err_code |= ERR_WARN;
+			}
+
+			if (bind_conf->ssl_conf.early_data && conn_calc_max_streams(1)) {
+				ha_notice("Binding [%s:%d] for %s %s: "
+				          "stream elasticity is ignored for initial connection settings as this is incompatible with 0-RTT.",
+				           bind_conf->file, bind_conf->line,
+				           proxy_type_str(px), px->id);
+			}
+		}
+#endif /* USE_QUIC */
+
+		/* finish the bind setup */
+		ret = bind_complete_thread_setup(bind_conf, err_code);
+		if (ret != 0) {
+			cfgerr += ret;
+			if (*err_code & ERR_FATAL)
+				goto out;
+		}
+
+		if (bind_generate_guid(bind_conf)) {
+			cfgerr++;
+			*err_code |= ERR_FATAL | ERR_ALERT;
+			goto out;
+		}
 	}
-	defproxy->redispatch_after = 0;
-	defproxy->options = PR_O_REUSE_SAFE;
-	if (defproxy->cap & PR_CAP_INT)
-		defproxy->options2 |= PR_O2_INDEPSTR;
-	defproxy->max_out_conns = MAX_SRV_LIST;
 
-	lf_expr_init(&defproxy->logformat);
-	lf_expr_init(&defproxy->logformat_sd);
-	lf_expr_init(&defproxy->format_unique_id);
-	lf_expr_init(&defproxy->logformat_error);
+	switch (px->mode) {
+	case PR_MODE_TCP:
+		cfgerr += proxy_cfg_ensure_no_http(px);
+		cfgerr += proxy_cfg_ensure_no_log(px);
+		break;
 
-	defproxy->email_alert.level = LOG_ALERT;
-	defproxy->load_server_state_from_file = PR_SRV_STATE_FILE_UNSPEC;
+	case PR_MODE_HTTP:
+		cfgerr += proxy_cfg_ensure_no_log(px);
+		px->http_needed = 1;
+		break;
 
-	if (defproxy->cap & PR_CAP_INT)
-		defproxy->timeout.connect = 5000;
+	case PR_MODE_CLI:
+		cfgerr += proxy_cfg_ensure_no_http(px);
+		cfgerr += proxy_cfg_ensure_no_log(px);
+		break;
+
+	case PR_MODE_SYSLOG:
+		/* this mode is initialized as the classic tcp proxy */
+		cfgerr += proxy_cfg_ensure_no_http(px);
+		break;
+
+	case PR_MODE_SPOP:
+		cfgerr += proxy_cfg_ensure_no_http(px);
+		cfgerr += proxy_cfg_ensure_no_log(px);
+		break;
+
+	case PR_MODE_PEERS:
+	case PR_MODES:
+		/* should not happen, bug gcc warn missing switch statement */
+		ha_alert("%s '%s' cannot initialize this proxy mode (peers) in this way. NOTE: PLEASE REPORT THIS TO DEVELOPERS AS YOU'RE NOT SUPPOSED TO BE ABLE TO CREATE A CONFIGURATION TRIGGERING THIS!\n",
+		         proxy_type_str(px), px->id);
+		cfgerr++;
+		break;
+	}
+
+	if (!(px->cap & PR_CAP_INT) && (px->cap & PR_CAP_FE) && LIST_ISEMPTY(&px->conf.listeners)) {
+		ha_warning("%s '%s' has no 'bind' directive. Please declare it as a backend if this was intended.\n",
+		           proxy_type_str(px), px->id);
+		*err_code |= ERR_WARN;
+	}
+
+	if (px->cap & PR_CAP_BE) {
+		if (px->lbprm.algo & BE_LB_KIND) {
+			if (px->options & PR_O_TRANSP) {
+				ha_alert("%s '%s' cannot use both transparent and balance mode.\n",
+				         proxy_type_str(px), px->id);
+				cfgerr++;
+			}
+			else if (px->options & PR_O_DISPATCH) {
+				ha_warning("dispatch address of %s '%s' will be ignored in balance mode.\n",
+				           proxy_type_str(px), px->id);
+				*err_code |= ERR_WARN;
+			}
+		}
+		else if (!(px->options & (PR_O_TRANSP | PR_O_DISPATCH))) {
+			/* If no LB algo is set in a backend, and we're not in
+			 * transparent mode, dispatch mode nor proxy mode, we
+			 * want to use balance random by default.
+			 */
+			px->lbprm.algo &= ~BE_LB_ALGO;
+			px->lbprm.algo |= BE_LB_ALGO_RND;
+		}
+	}
+
+	if (px->options & PR_O_DISPATCH)
+		px->options &= ~PR_O_TRANSP;
+	else if (px->options & PR_O_TRANSP)
+		px->options &= ~PR_O_DISPATCH;
+
+	if ((px->tcpcheck.flags & TCPCHK_FL_UNUSED_HTTP_RS)) {
+		ha_warning("%s '%s' uses http-check rules without 'option httpchk', so the rules are ignored.\n",
+		           proxy_type_str(px), px->id);
+		*err_code |= ERR_WARN;
+	}
+
+	if ((px->options2 & PR_O2_CHK_ANY) == PR_O2_EXT_CHK) {
+		if (!global.external_check) {
+			ha_alert("Proxy '%s' : '%s' unable to find required 'global.external-check'.\n",
+			         px->id, "option external-check");
+			cfgerr++;
+		}
+		if (!px->check_command) {
+			ha_alert("Proxy '%s' : '%s' unable to find required 'external-check command'.\n",
+			         px->id, "option external-check");
+			cfgerr++;
+		}
+		if (!(global.tune.options & GTUNE_INSECURE_FORK)) {
+			ha_warning("Proxy '%s' : 'insecure-fork-wanted' not enabled in the global section, '%s' will likely fail.\n",
+			           px->id, "option external-check");
+			*err_code |= ERR_WARN;
+		}
+	}
+
+	if (px->email_alert.flags & PR_EMAIL_ALERT_SET) {
+		if (!(px->email_alert.mailers.name && px->email_alert.from && px->email_alert.to)) {
+			ha_warning("'email-alert' will be ignored for %s '%s' (the presence any of "
+			           "'email-alert from', 'email-alert level' 'email-alert mailers', "
+			           "'email-alert myhostname', or 'email-alert to' "
+			           "requires each of 'email-alert from', 'email-alert mailers' and 'email-alert to' "
+			           "to be present).\n",
+			           proxy_type_str(px), px->id);
+			*err_code |= ERR_WARN;
+			free_email_alert(px);
+		}
+		if (!px->email_alert.myhostname)
+			px->email_alert.myhostname = strdup(hostname);
+	}
+
+	if (px->check_command) {
+		int clear = 0;
+		if ((px->options2 & PR_O2_CHK_ANY) != PR_O2_EXT_CHK) {
+			ha_warning("'%s' will be ignored for %s '%s' (requires 'option external-check').\n",
+			           "external-check command", proxy_type_str(px), px->id);
+			*err_code |= ERR_WARN;
+			clear = 1;
+		}
+		if (px->check_command[0] != '/' && !px->check_path) {
+			ha_alert("Proxy '%s': '%s' does not have a leading '/' and 'external-check path' is not set.\n",
+			         px->id, "external-check command");
+			cfgerr++;
+		}
+		if (clear) {
+			ha_free(&px->check_command);
+		}
+	}
+
+	if (px->check_path) {
+		if ((px->options2 & PR_O2_CHK_ANY) != PR_O2_EXT_CHK) {
+			ha_warning("'%s' will be ignored for %s '%s' (requires 'option external-check').\n",
+			           "external-check path", proxy_type_str(px), px->id);
+			*err_code |= ERR_WARN;
+			ha_free(&px->check_path);
+		}
+	}
+
+	/* if a default backend was specified, let's find it */
+	if (px->defbe.name) {
+		struct proxy *target;
+
+		target = proxy_be_by_name(px->defbe.name);
+		if (!target) {
+			ha_alert("Proxy '%s': unable to find required default_backend: '%s'.\n",
+			         px->id, px->defbe.name);
+			cfgerr++;
+		} else if (target == px) {
+			ha_alert("Proxy '%s': loop detected for default_backend: '%s'.\n",
+			         px->id, px->defbe.name);
+			cfgerr++;
+		} else if (target->mode != px->mode &&
+			   !(px->mode == PR_MODE_TCP && target->mode == PR_MODE_HTTP)) {
+
+			ha_alert("%s %s '%s' (%s:%d) tries to use incompatible %s %s '%s' (%s:%d) as its default backend (see 'mode').\n",
+			         proxy_mode_str(px->mode), proxy_type_str(px), px->id,
+			         px->conf.file, px->conf.line,
+			         proxy_mode_str(target->mode), proxy_type_str(target), target->id,
+			         target->conf.file, target->conf.line);
+			cfgerr++;
+		} else {
+			free(px->defbe.name);
+			px->defbe.be = target;
+			/* Emit a warning if this proxy also has some servers */
+			if (px->srv) {
+				ha_warning("In proxy '%s', the 'default_backend' rule always has precedence over the servers, which will never be used.\n",
+				           px->id);
+				*err_code |= ERR_WARN;
+			}
+			if (target->mode == PR_MODE_HTTP) {
+				/* at least one of the used backends will provoke an
+				 * HTTP upgrade
+				 */
+				px->options |= PR_O_HTTP_UPG;
+			}
+
+			target->flags |= PR_FL_NON_PURGEABLE;
+		}
+	}
+
+	/* find the target proxy for 'use_backend' rules */
+	list_for_each_entry(rule, &px->switching_rules, list) {
+		struct proxy *target;
+		struct logformat_node *node;
+		char *pxname;
+
+		/* Try to parse the string as a log format expression. If the result
+		 * of the parsing is only one entry containing a simple string, then
+		 * it's a standard string corresponding to a static rule, thus the
+		 * parsing is cancelled and be.name is restored to be resolved.
+		 */
+		pxname = rule->be.name;
+		lf_expr_init(&rule->be.expr);
+		px->conf.args.ctx = ARGC_UBK;
+		px->conf.args.file = rule->file;
+		px->conf.args.line = rule->line;
+		err = NULL;
+		if (!parse_logformat_string(pxname, px, &rule->be.expr, 0, SMP_VAL_FE_HRQ_HDR, &err)) {
+			ha_alert("Parsing [%s:%d]: failed to parse use_backend rule '%s' : %s.\n",
+			         rule->file, rule->line, pxname, err);
+			free(err);
+			cfgerr++;
+			continue;
+		}
+		node = LIST_NEXT(&rule->be.expr.nodes.list, struct logformat_node *, list);
+
+		if (!lf_expr_isempty(&rule->be.expr)) {
+			if (node->type != LOG_FMT_TEXT || node->list.n != &rule->be.expr.nodes.list) {
+				rule->dynamic = 1;
+				free(pxname);
+				/* backend is not yet known so we cannot assume its type,
+				 * thus we should consider that at least one of the used
+				 * backends may provoke HTTP upgrade
+				 */
+				px->options |= PR_O_HTTP_UPG;
+				continue;
+			}
+			/* Only one element in the list, a simple string: free the expression and
+			 * fall back to static rule
+			 */
+			lf_expr_deinit(&rule->be.expr);
+		}
+
+		rule->dynamic = 0;
+		rule->be.name = pxname;
+
+		target = proxy_be_by_name(rule->be.name);
+		if (!target) {
+			ha_alert("Proxy '%s': unable to find required use_backend: '%s'.\n",
+			         px->id, rule->be.name);
+			cfgerr++;
+		} else if (target == px) {
+			ha_alert("Proxy '%s': loop detected for use_backend: '%s'.\n",
+			         px->id, rule->be.name);
+			cfgerr++;
+		} else if (target->mode != px->mode &&
+			   !(px->mode == PR_MODE_TCP && target->mode == PR_MODE_HTTP)) {
+
+			ha_alert("%s %s '%s' (%s:%d) tries to use incompatible %s %s '%s' (%s:%d) in a 'use_backend' rule (see 'mode').\n",
+			         proxy_mode_str(px->mode), proxy_type_str(px), px->id,
+			         px->conf.file, px->conf.line,
+			         proxy_mode_str(target->mode), proxy_type_str(target), target->id,
+			         target->conf.file, target->conf.line);
+			cfgerr++;
+		} else {
+			ha_free(&rule->be.name);
+			rule->be.backend = target;
+			if (target->mode == PR_MODE_HTTP) {
+				/* at least one of the used backends will provoke an
+				 * HTTP upgrade
+				 */
+				px->options |= PR_O_HTTP_UPG;
+			}
+
+			target->flags |= PR_FL_NON_PURGEABLE;
+		}
+		*err_code |= warnif_tcp_http_cond(px, rule->cond);
+	}
+
+	/* find the target server for 'use_server' rules */
+	list_for_each_entry(srule, &px->server_rules, list) {
+		struct server *target;
+		struct logformat_node *node;
+		char *server_name;
+
+		/* We try to parse the string as a log format expression. If the result of the parsing
+		 * is only one entry containing a single string, then it's a standard string corresponding
+		 * to a static rule, thus the parsing is cancelled and we fall back to setting srv.ptr.
+		 */
+		server_name = srule->srv.name;
+		lf_expr_init(&srule->expr);
+		px->conf.args.ctx = ARGC_USRV;
+		err = NULL;
+		if (!parse_logformat_string(server_name, px, &srule->expr, 0, SMP_VAL_FE_HRQ_HDR, &err)) {
+			ha_alert("Parsing [%s:%d]; use-server rule failed to parse log-format '%s' : %s.\n",
+			         srule->file, srule->line, server_name, err);
+			free(err);
+			cfgerr++;
+			continue;
+		}
+		node = LIST_NEXT(&srule->expr.nodes.list, struct logformat_node *, list);
+
+		if (!lf_expr_isempty(&srule->expr)) {
+			if (node->type != LOG_FMT_TEXT || node->list.n != &srule->expr.nodes.list) {
+				srule->dynamic = 1;
+				free(server_name);
+				continue;
+			}
+			/* Only one element in the list, a simple string: free the expression and
+			 * fall back to static rule
+			 */
+			lf_expr_deinit(&srule->expr);
+		}
+
+		srule->dynamic = 0;
+		srule->srv.name = server_name;
+		target = server_find_by_name(px, srule->srv.name);
+		*err_code |= warnif_tcp_http_cond(px, srule->cond);
+
+		if (!target) {
+			ha_alert("%s '%s' : unable to find server '%s' referenced in a 'use-server' rule.\n",
+			         proxy_type_str(px), px->id, srule->srv.name);
+			cfgerr++;
+			continue;
+		}
+		ha_free(&srule->srv.name);
+		srule->srv.ptr = target;
+		target->flags |= SRV_F_NON_PURGEABLE;
+	}
+
+	/* find the target table for 'stick' rules */
+	list_for_each_entry(mrule, &px->sticking_rules, list) {
+		px->be_req_ana |= AN_REQ_STICKING_RULES;
+		if (mrule->flags & STK_IS_STORE)
+			px->be_rsp_ana |= AN_RES_STORE_RULES;
+
+		if (!resolve_stick_rule(px, mrule))
+			cfgerr++;
+
+		*err_code |= warnif_tcp_http_cond(px, mrule->cond);
+	}
+
+	/* find the target table for 'store response' rules */
+	list_for_each_entry(mrule, &px->storersp_rules, list) {
+		px->be_rsp_ana |= AN_RES_STORE_RULES;
+
+		if (!resolve_stick_rule(px, mrule))
+			cfgerr++;
+	}
+
+	/* check validity for 'tcp-request' layer 4/5/6/7 rules */
+	cfgerr += check_action_rules(&px->tcp_req.l4_rules, px, err_code);
+	cfgerr += check_action_rules(&px->tcp_req.l5_rules, px, err_code);
+	cfgerr += check_action_rules(&px->tcp_req.inspect_rules, px, err_code);
+	cfgerr += check_action_rules(&px->tcp_rep.inspect_rules, px, err_code);
+	cfgerr += check_action_rules(&px->http_req_rules, px, err_code);
+	cfgerr += check_action_rules(&px->http_res_rules, px, err_code);
+	cfgerr += check_action_rules(&px->http_after_res_rules, px, err_code);
+#ifdef USE_QUIC
+	cfgerr += check_action_rules(&px->quic_init_rules, px, err_code);
+#endif
+
+	/* Warn is a switch-mode http is used on a TCP listener with servers but no backend */
+	if (!px->defbe.name && LIST_ISEMPTY(&px->switching_rules) && px->srv) {
+		if ((px->options & PR_O_HTTP_UPG) && px->mode == PR_MODE_TCP)
+			ha_warning("Proxy '%s' : 'switch-mode http' configured for a %s %s with no backend. "
+			           "Incoming connections upgraded to HTTP cannot be routed to TCP servers\n",
+			           px->id, proxy_mode_str(px->mode), proxy_type_str(px));
+	}
+
+	if (px->table && px->table->peers.name) {
+		struct peers *curpeers;
+
+		for (curpeers = cfg_peers; curpeers; curpeers = curpeers->next) {
+			if (strcmp(curpeers->id, px->table->peers.name) == 0) {
+				ha_free(&px->table->peers.name);
+				px->table->peers.p = curpeers;
+				break;
+			}
+		}
+
+		if (!curpeers) {
+			ha_alert("Proxy '%s': unable to find sync peers '%s'.\n",
+			         px->id, px->table->peers.name);
+			ha_free(&px->table->peers.name);
+			px->table->peers.p = NULL;
+			cfgerr++;
+		}
+		else if (curpeers->disabled) {
+			/* silently disable this peers section */
+			px->table->peers.p = NULL;
+		}
+		else if (!curpeers->peers_fe) {
+			ha_alert("Proxy '%s': unable to find local peer '%s' in peers section '%s'.\n",
+			         px->id, localpeer, curpeers->id);
+			px->table->peers.p = NULL;
+			cfgerr++;
+		}
+	}
+
+
+	if (px->email_alert.mailers.name) {
+		struct mailers *curmailers = mailers;
+
+		for (curmailers = mailers; curmailers; curmailers = curmailers->next) {
+			if (strcmp(curmailers->id, px->email_alert.mailers.name) == 0)
+				break;
+		}
+		if (!curmailers) {
+			ha_alert("Proxy '%s': unable to find mailers '%s'.\n",
+			         px->id, px->email_alert.mailers.name);
+			free_email_alert(px);
+			cfgerr++;
+		}
+		else {
+			err = NULL;
+			if (init_email_alert(curmailers, px, &err)) {
+				ha_alert("Proxy '%s': %s.\n", px->id, err);
+				free(err);
+				cfgerr++;
+			}
+		}
+	}
+
+	if (px->uri_auth && !(px->uri_auth->flags & STAT_F_CONVDONE) &&
+	    !LIST_ISEMPTY(&px->uri_auth->http_req_rules) &&
+	    (px->uri_auth->userlist || px->uri_auth->auth_realm )) {
+		ha_alert("%s '%s': stats 'auth'/'realm' and 'http-request' can't be used at the same time.\n",
+		         "proxy", px->id);
+		cfgerr++;
+		goto out_uri_auth_compat;
+	}
+
+	if (px->uri_auth && px->uri_auth->userlist &&
+	    (!(px->uri_auth->flags & STAT_F_CONVDONE) ||
+	     LIST_ISEMPTY(&px->uri_auth->http_req_rules))) {
+		const char *uri_auth_compat_req[10];
+		struct act_rule *rule;
+		i = 0;
+
+		/* build the ACL condition from scratch. We're relying on anonymous ACLs for that */
+		uri_auth_compat_req[i++] = "auth";
+
+		if (px->uri_auth->auth_realm) {
+			uri_auth_compat_req[i++] = "realm";
+			uri_auth_compat_req[i++] = px->uri_auth->auth_realm;
+		}
+
+		uri_auth_compat_req[i++] = "unless";
+		uri_auth_compat_req[i++] = "{";
+		uri_auth_compat_req[i++] = "http_auth(.internal-stats-userlist)";
+		uri_auth_compat_req[i++] = "}";
+		uri_auth_compat_req[i++] = "";
+
+		rule = parse_http_req_cond(uri_auth_compat_req, "internal-stats-auth-compat", 0, px);
+		if (!rule) {
+			cfgerr++;
+			goto out;
+		}
+
+		LIST_APPEND(&px->uri_auth->http_req_rules, &rule->list);
+
+		if (px->uri_auth->auth_realm) {
+			ha_free(&px->uri_auth->auth_realm);
+		}
+		px->uri_auth->flags |= STAT_F_CONVDONE;
+	}
+ out_uri_auth_compat:
+
+	/* check whether we have a logger that uses RFC5424 log format */
+	list_for_each_entry(tmplogger, &px->loggers, list) {
+		if (tmplogger->format == LOG_FORMAT_RFC5424) {
+			if (!px->logformat_sd.str) {
+				/* set the default logformat_sd_string */
+				px->logformat_sd.str = default_rfc5424_sd_log_format;
+			}
+			break;
+		}
+	}
+
+	/* compile the log format */
+	if (!(px->cap & PR_CAP_FE)) {
+		lf_expr_deinit(&px->logformat);
+		lf_expr_deinit(&px->logformat_sd);
+	}
+
+	if (px->logformat.str) {
+		px->conf.args.ctx = ARGC_LOG;
+		px->conf.args.file = px->logformat.conf.file;
+		px->conf.args.line = px->logformat.conf.line;
+		err = NULL;
+		if (!lf_expr_compile(&px->logformat, &px->conf.args,
+		                            LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
+		                            SMP_VAL_FE_LOG_END, &err) ||
+		    !lf_expr_postcheck(&px->logformat, px, &err)) {
+			ha_alert("Parsing [%s:%d]: failed to parse log-format : %s.\n",
+			         px->logformat.conf.file, px->logformat.conf.line, err);
+			free(err);
+			cfgerr++;
+		}
+		px->conf.args.file = NULL;
+		px->conf.args.line = 0;
+	}
+
+	if (px->logformat_sd.str) {
+		px->conf.args.ctx = ARGC_LOGSD;
+		px->conf.args.file = px->logformat_sd.conf.file;
+		px->conf.args.line = px->logformat_sd.conf.line;
+		err = NULL;
+		if (!lf_expr_compile(&px->logformat_sd, &px->conf.args,
+		                            LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
+		                            SMP_VAL_FE_LOG_END, &err) ||
+		    !add_to_logformat_list(NULL, NULL, LF_SEPARATOR, &px->logformat_sd, &err) ||
+		    !lf_expr_postcheck(&px->logformat_sd, px, &err)) {
+			ha_alert("Parsing [%s:%d]: failed to parse log-format-sd : %s.\n",
+			         px->logformat_sd.conf.file, px->logformat_sd.conf.line, err);
+			free(err);
+			cfgerr++;
+		}
+		px->conf.args.file = NULL;
+		px->conf.args.line = 0;
+	}
+
+	if (px->format_unique_id.str) {
+		int where = 0;
+
+		px->conf.args.ctx = ARGC_UIF;
+		px->conf.args.file = px->format_unique_id.conf.file;
+		px->conf.args.line = px->format_unique_id.conf.line;
+		err = NULL;
+		if (px->cap & PR_CAP_FE)
+			where |= SMP_VAL_FE_HRQ_HDR;
+		if (px->cap & PR_CAP_BE)
+			where |= SMP_VAL_BE_HRQ_HDR;
+		if (!lf_expr_compile(&px->format_unique_id, &px->conf.args,
+		                            LOG_OPT_HTTP|LOG_OPT_MERGE_SPACES, where, &err) ||
+		    !lf_expr_postcheck(&px->format_unique_id, px, &err)) {
+			ha_alert("Parsing [%s:%d]: failed to parse unique-id : %s.\n",
+			         px->format_unique_id.conf.file, px->format_unique_id.conf.line, err);
+			free(err);
+			cfgerr++;
+		}
+		px->conf.args.file = NULL;
+		px->conf.args.line = 0;
+	}
+
+	if (px->logformat_error.str) {
+		px->conf.args.ctx = ARGC_LOG;
+		px->conf.args.file = px->logformat_error.conf.file;
+		px->conf.args.line = px->logformat_error.conf.line;
+		err = NULL;
+		if (!lf_expr_compile(&px->logformat_error, &px->conf.args,
+		                            LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
+		                            SMP_VAL_FE_LOG_END, &err) ||
+		    !lf_expr_postcheck(&px->logformat_error, px, &err)) {
+			ha_alert("Parsing [%s:%d]: failed to parse error-log-format : %s.\n",
+			         px->logformat_error.conf.file, px->logformat_error.conf.line, err);
+			free(err);
+			cfgerr++;
+		}
+		px->conf.args.file = NULL;
+		px->conf.args.line = 0;
+	}
+
+	/* "balance hash" needs to compile its expression
+	 * (log backends will handle this in proxy log postcheck)
+	 */
+	if (px->mode != PR_MODE_SYSLOG &&
+	    (px->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_SMP) {
+		int idx = 0;
+		const char *args[] = {
+			px->lbprm.arg_str,
+			NULL,
+		};
+
+		err = NULL;
+		px->conf.args.ctx = ARGC_USRV; // same context as use_server.
+		px->lbprm.expr =
+			sample_parse_expr((char **)args, &idx,
+					  px->conf.file, px->conf.line,
+					  &err, &px->conf.args, NULL);
+
+		if (!px->lbprm.expr) {
+			ha_alert("%s '%s' [%s:%d]: failed to parse 'balance hash' expression '%s' in : %s.\n",
+			         proxy_type_str(px), px->id,
+			         px->conf.file, px->conf.line,
+			         px->lbprm.arg_str, err);
+			ha_free(&err);
+			cfgerr++;
+		}
+		else if (!(px->lbprm.expr->fetch->val & SMP_VAL_BE_SET_SRV)) {
+			ha_alert("%s '%s' [%s:%d]: error detected while parsing 'balance hash' expression '%s' "
+			         "which requires information from %s, which is not available here.\n",
+			         proxy_type_str(px), px->id,
+			         px->conf.file, px->conf.line,
+			         px->lbprm.arg_str, sample_src_names(px->lbprm.expr->fetch->use));
+			cfgerr++;
+		}
+		else if (px->mode == PR_MODE_HTTP && (px->lbprm.expr->fetch->use & SMP_USE_L6REQ)) {
+			ha_warning("%s '%s' [%s:%d]: L6 sample fetch <%s> will be ignored in 'balance hash' expression in HTTP mode.\n",
+			           proxy_type_str(px), px->id,
+			           px->conf.file, px->conf.line,
+			           px->lbprm.arg_str);
+		}
+		else
+			px->http_needed |= !!(px->lbprm.expr->fetch->use & SMP_USE_HTTP_ANY);
+	}
+
+	/* only now we can check if some args remain unresolved.
+	 * This must be done after the users and groups resolution.
+	 */
+	err = NULL;
+	i = smp_resolve_args(px, &err);
+	cfgerr += i;
+	if (i) {
+		indent_msg(&err, 8);
+		ha_alert("%s%s\n", i > 1 ? "multiple argument resolution errors:" : "", err);
+		ha_free(&err);
+	} else
+		cfgerr += acl_find_targets(px);
+
+	if (!(px->cap & PR_CAP_INT) && (px->mode == PR_MODE_TCP || px->mode == PR_MODE_HTTP) &&
+	    (((px->cap & PR_CAP_FE) && !px->timeout.client) ||
+	     ((px->cap & PR_CAP_BE) && (px->srv) &&
+	      (!px->timeout.connect ||
+	       (!px->timeout.server && (px->mode == PR_MODE_HTTP || !px->timeout.tunnel)))))) {
+		ha_warning("missing timeouts for %s '%s'.\n"
+		           "   | While not properly invalid, you will certainly encounter various problems\n"
+		           "   | with such a configuration. To fix this, please ensure that all following\n"
+		           "   | timeouts are set to a non-zero value: 'client', 'connect', 'server'.\n",
+		           proxy_type_str(px), px->id);
+		*err_code |= ERR_WARN;
+	}
+
+	/* Historically, the tarpit and queue timeouts were inherited from contimeout.
+	 * We must still support older configurations, so let's find out whether those
+	 * parameters have been set or must be copied from contimeouts.
+	 */
+	if (!px->timeout.tarpit)
+		px->timeout.tarpit = px->timeout.connect;
+	if ((px->cap & PR_CAP_BE) && !px->timeout.queue)
+		px->timeout.queue = px->timeout.connect;
+
+	if (px->tcpcheck.flags & TCPCHK_FL_UNUSED_TCP_RS) {
+		ha_warning("%s '%s' uses tcp-check rules without 'option tcp-check', so the rules are ignored.\n",
+		           proxy_type_str(px), px->id);
+		*err_code |= ERR_WARN;
+	}
+
+	/* ensure that cookie capture length is not too large */
+	if (px->capture_len >= global.tune.cookie_len) {
+		ha_warning("truncating capture length to %d bytes for %s '%s'.\n",
+		           global.tune.cookie_len - 1, proxy_type_str(px), px->id);
+		*err_code |= ERR_WARN;
+		px->capture_len = global.tune.cookie_len - 1;
+	}
+
+	/* The small pools required for the capture lists */
+	if (px->nb_req_cap) {
+		px->req_cap_pool = create_pool("ptrcap",
+		                                     px->nb_req_cap * sizeof(char *),
+		                                     MEM_F_SHARED);
+	}
+
+	if (px->nb_rsp_cap) {
+		px->rsp_cap_pool = create_pool("ptrcap",
+		                                     px->nb_rsp_cap * sizeof(char *),
+		                                     MEM_F_SHARED);
+	}
+
+	switch (px->load_server_state_from_file) {
+		case PR_SRV_STATE_FILE_UNSPEC:
+			px->load_server_state_from_file = PR_SRV_STATE_FILE_NONE;
+			break;
+		case PR_SRV_STATE_FILE_GLOBAL:
+			if (!global.server_state_file) {
+				ha_warning("backend '%s' configured to load server state file from global section 'server-state-file' directive. Unfortunately, 'server-state-file' is not set!\n",
+				           px->id);
+				*err_code |= ERR_WARN;
+			}
+			break;
+	}
+
+	/* first, we will invert the servers list order */
+	newsrv = NULL;
+	while (px->srv) {
+		struct server *next;
+
+		next = px->srv->next;
+		px->srv->next = newsrv;
+		newsrv = px->srv;
+		if (!next)
+			break;
+		px->srv = next;
+	}
+
+	/* Check that no server name conflicts. This causes trouble in the stats.
+	 * We only emit an error for the first conflict affecting each server,
+	 * in order to avoid combinatory explosion if all servers have the same
+	 * name. Since servers names are stored in a tree before landing here,
+	 * we simply have to check for the current server's duplicates to spot
+	 * conflicts.
+	 */
+	for (newsrv = px->srv; newsrv; newsrv = newsrv->next) {
+		struct server *other_srv;
+
+		/* Note: internal servers are not always registered and
+		 * they do not conflict.
+		 */
+		if (!ceb_intree(&newsrv->conf.name_node))
+			continue;
+
+		if ((other_srv = cebis_item_prev_dup(&px->conf.used_server_name, conf.name_node, id, newsrv))) {
+			ha_alert("parsing [%s:%d] : %s '%s', another server named '%s' was already defined at line %d, please use distinct names.\n",
+			         newsrv->conf.file, newsrv->conf.line,
+			         proxy_type_str(px), px->id,
+			         newsrv->id, other_srv->conf.line);
+			cfgerr++;
+			continue;
+		}
+	}
+
+	/* assign automatic UIDs to servers which don't have one yet */
+	next_id = 1;
+	newsrv = px->srv;
+	while (newsrv != NULL) {
+		if (!newsrv->puid) {
+			/* server ID not set, use automatic numbering with first
+			 * spare entry starting with next_svid.
+			 */
+			next_id = server_get_next_id(px, next_id);
+			newsrv->puid = next_id;
+			server_index_id(px, newsrv);
+		}
+
+		next_id++;
+		newsrv = newsrv->next;
+	}
+
+	px->lbprm.wmult = 1; /* default weight multiplier */
+	px->lbprm.wdiv  = 1; /* default weight divider */
+
+	/*
+	 * If this server supports a maxconn parameter, it needs a dedicated
+	 * tasks to fill the emptied slots when a connection leaves.
+	 * Also, resolve deferred tracking dependency if needed.
+	 */
+	newsrv = px->srv;
+	while (newsrv != NULL) {
+		set_usermsgs_ctx(newsrv->conf.file, newsrv->conf.line, &newsrv->obj_type);
+
+		srv_minmax_conn_apply(newsrv);
+
+		*err_code |= check_server_tcpcheck(newsrv);
+		if (*err_code & (ERR_ABORT|ERR_FATAL))
+			goto out;
+
+		/* this will also properly set the transport layer for
+		 * prod and checks
+		 * if default-server have use_ssl, prerare ssl init
+		 * without activating it */
+		if (newsrv->use_ssl == 1 || newsrv->check.use_ssl == 1 ||
+		    (newsrv->check.tcpcheck->flags & TCPCHK_FL_USE_SSL) ||
+		    ((newsrv->flags & SRV_F_DEFSRV_USE_SSL) && newsrv->use_ssl != 1)) {
+			if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->prepare_srv)
+				cfgerr += xprt_get(XPRT_SSL)->prepare_srv(newsrv);
+			else if (xprt_get(XPRT_QUIC) && xprt_get(XPRT_QUIC)->prepare_srv)
+				cfgerr += xprt_get(XPRT_QUIC)->prepare_srv(newsrv);
+		}
+
+		/* In HTTP only, if the SNI is not set and we can rely on the
+		 * host header value, fill the sni expression accordingly
+		 */
+		if (newsrv->proxy->mode == PR_MODE_HTTP &&
+		    (newsrv->use_ssl == 1 || (newsrv->flags & SRV_F_DEFSRV_USE_SSL)) &&
+		    !newsrv->sni_expr && !(newsrv->ssl_ctx.options & SRV_SSL_O_NO_AUTO_SNI)) {
+			if (srv_configure_auto_sni(newsrv, err_code, &err)) {
+				ha_alert("parsing [%s:%d]: %s.\n",
+				         newsrv->conf.file, newsrv->conf.line, err);
+				ha_free(&err);
+				++cfgerr;
+				if (*err_code & ERR_ABORT)
+					goto out;
+				goto next_srv;
+			}
+		}
+
+
+		if ((newsrv->flags & SRV_F_FASTOPEN) &&
+		    ((px->retry_type & (PR_RE_DISCONNECTED | PR_RE_TIMEOUT)) !=
+		     (PR_RE_DISCONNECTED | PR_RE_TIMEOUT)))
+			ha_warning("server has tfo activated, the backend should be configured with at least 'conn-failure', 'empty-response' and 'response-timeout' or we wouldn't be able to retry the connection on failure.\n");
+
+		if (newsrv->trackit) {
+			if (srv_apply_track(newsrv, px)) {
+				++cfgerr;
+				goto next_srv;
+			}
+		}
+
+	next_srv:
+		reset_usermsgs_ctx();
+		newsrv = newsrv->next;
+	}
+
+	/*
+	 * Try to generate dynamic cookies for servers now.
+	 * It couldn't be done earlier, since at the time we parsed
+	 * the server line, we may not have known yet that we
+	 * should use dynamic cookies, or the secret key may not
+	 * have been provided yet.
+	 */
+	if (px->ck_opts & PR_CK_DYNAMIC) {
+		newsrv = px->srv;
+		while (newsrv != NULL) {
+			srv_set_dyncookie(newsrv);
+			newsrv = newsrv->next;
+		}
+
+	}
+	/* We have to initialize the server lookup mechanism depending
+	 * on what LB algorithm was chosen.
+	 */
+
+	px->lbprm.algo &= ~(BE_LB_LKUP | BE_LB_PROP_DYN);
+	list_for_each_entry(ops, &lb_ops_list, link) {
+		int i;
+		for (i = 0; ops->map[i].match != 0; i++) {
+			if ((px->lbprm.algo & ops->map[i].mask) == ops->map[i].match) {
+				px->lbprm.ops = ops;
+				break;
+			}
+		}
+
+		if (px->lbprm.ops) {
+			px->lbprm.algo |= px->lbprm.ops->algo_prop;
+			if (px->lbprm.ops->proxy_init && px->lbprm.ops->proxy_init(px) < 0)
+				cfgerr++;
+			break;
+		}
+	}
+
+	HA_RWLOCK_INIT(&px->lbprm.lock);
+
+	if (px->options & PR_O_LOGASAP)
+		px->to_log &= ~LW_BYTES;
+
+	if (!(px->cap & PR_CAP_INT) && (px->mode == PR_MODE_TCP || px->mode == PR_MODE_HTTP) &&
+	    (px->cap & PR_CAP_FE) && LIST_ISEMPTY(&px->loggers) &&
+	    (!lf_expr_isempty(&px->logformat) || !lf_expr_isempty(&px->logformat_sd))) {
+		ha_warning("log format ignored for %s '%s' since it has no log address.\n",
+		           proxy_type_str(px), px->id);
+		*err_code |= ERR_WARN;
+	}
+
+	*err_code |= proxy_check_http_errors(px);
+
+	if (px->mode != PR_MODE_HTTP && !(px->options & PR_O_HTTP_UPG)) {
+		int optnum;
+
+		if (px->uri_auth) {
+			ha_warning("'stats' statement ignored for %s '%s' as it requires HTTP mode.\n",
+			           proxy_type_str(px), px->id);
+			*err_code |= ERR_WARN;
+			stats_uri_auth_drop(px->uri_auth);
+			px->uri_auth = NULL;
+		}
+
+		if (px->capture_name) {
+			ha_warning("'capture' statement ignored for %s '%s' as it requires HTTP mode.\n",
+			           proxy_type_str(px), px->id);
+			*err_code |= ERR_WARN;
+		}
+
+		if (isttest(px->monitor_uri)) {
+			ha_warning("'monitor-uri' statement ignored for %s '%s' as it requires HTTP mode.\n",
+			           proxy_type_str(px), px->id);
+			*err_code |= ERR_WARN;
+		}
+
+		if (!LIST_ISEMPTY(&px->http_req_rules)) {
+			ha_warning("'http-request' rules ignored for %s '%s' as they require HTTP mode.\n",
+			           proxy_type_str(px), px->id);
+			*err_code |= ERR_WARN;
+		}
+
+		if (!LIST_ISEMPTY(&px->http_res_rules)) {
+			ha_warning("'http-response' rules ignored for %s '%s' as they require HTTP mode.\n",
+			           proxy_type_str(px), px->id);
+			*err_code |= ERR_WARN;
+		}
+
+		if (!LIST_ISEMPTY(&px->http_after_res_rules)) {
+			ha_warning("'http-after-response' rules ignored for %s '%s' as they require HTTP mode.\n",
+			           proxy_type_str(px), px->id);
+			*err_code |= ERR_WARN;
+		}
+
+		if (!LIST_ISEMPTY(&px->redirect_rules)) {
+			ha_warning("'redirect' rules ignored for %s '%s' as they require HTTP mode.\n",
+			           proxy_type_str(px), px->id);
+			*err_code |= ERR_WARN;
+		}
+
+		for (optnum = 0; cfg_opts[optnum].name; optnum++) {
+			if (cfg_opts[optnum].mode == PR_MODE_HTTP &&
+			    (px->cap & cfg_opts[optnum].cap) &&
+			    (px->options & cfg_opts[optnum].val)) {
+				ha_warning("'option %s' ignored for %s '%s' as it requires HTTP mode.\n",
+				           cfg_opts[optnum].name, proxy_type_str(px), px->id);
+				*err_code |= ERR_WARN;
+				px->options &= ~cfg_opts[optnum].val;
+			}
+		}
+
+		for (optnum = 0; cfg_opts2[optnum].name; optnum++) {
+			if (cfg_opts2[optnum].mode == PR_MODE_HTTP &&
+			    (px->cap & cfg_opts2[optnum].cap) &&
+			    (px->options2 & cfg_opts2[optnum].val)) {
+				ha_warning("'option %s' ignored for %s '%s' as it requires HTTP mode.\n",
+				           cfg_opts2[optnum].name, proxy_type_str(px), px->id);
+				*err_code |= ERR_WARN;
+				px->options2 &= ~cfg_opts2[optnum].val;
+			}
+		}
+
+#if defined(CONFIG_HAP_TRANSPARENT)
+		if (px->conn_src.bind_hdr_occ) {
+			px->conn_src.bind_hdr_occ = 0;
+			ha_warning("%s '%s' : ignoring use of header %s as source IP in non-HTTP mode.\n",
+			           proxy_type_str(px), px->id, px->conn_src.bind_hdr_name);
+			*err_code |= ERR_WARN;
+		}
+#endif /* CONFIG_HAP_TRANSPARENT */
+	}
+
+	/*
+	 * ensure that we're not cross-dressing a TCP server into HTTP.
+	 */
+	newsrv = px->srv;
+	while (newsrv != NULL) {
+		if ((px->mode != PR_MODE_HTTP) && newsrv->rdr_len) {
+			ha_alert("%s '%s' : server cannot have cookie or redirect prefix in non-HTTP mode.\n",
+			         proxy_type_str(px), px->id);
+			cfgerr++;
+		}
+
+		if ((px->mode != PR_MODE_HTTP) && newsrv->cklen) {
+			ha_warning("%s '%s' : ignoring cookie for server '%s' as HTTP mode is disabled.\n",
+			           proxy_type_str(px), px->id, newsrv->id);
+			*err_code |= ERR_WARN;
+		}
+
+		if ((newsrv->flags & SRV_F_MAPPORTS) && (px->options2 & PR_O2_RDPC_PRST)) {
+			ha_warning("%s '%s' : RDP cookie persistence will not work for server '%s' because it lacks an explicit port number.\n",
+			           proxy_type_str(px), px->id, newsrv->id);
+			*err_code |= ERR_WARN;
+		}
+
+#if defined(CONFIG_HAP_TRANSPARENT)
+		if (px->mode != PR_MODE_HTTP && newsrv->conn_src.bind_hdr_occ) {
+			newsrv->conn_src.bind_hdr_occ = 0;
+			ha_warning("%s '%s' : server %s cannot use header %s as source IP in non-HTTP mode.\n",
+			           proxy_type_str(px), px->id, newsrv->id, newsrv->conn_src.bind_hdr_name);
+			*err_code |= ERR_WARN;
+		}
+#endif /* CONFIG_HAP_TRANSPARENT */
+
+		if ((px->mode != PR_MODE_HTTP) && (px->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR)
+			px->options &= ~PR_O_REUSE_MASK;
+		if (px->mode == PR_MODE_SPOP)
+			px->options |= PR_O_REUSE_ALWS;
+
+		if ((px->mode != PR_MODE_HTTP) && newsrv->flags & SRV_F_RHTTP) {
+			ha_alert("%s '%s' : server %s uses reverse HTTP addressing which can only be used with HTTP mode.\n",
+			         proxy_type_str(px), px->id, newsrv->id);
+			cfgerr++;
+			*err_code |= ERR_FATAL | ERR_ALERT;
+			goto out;
+		}
+
+		newsrv = newsrv->next;
+	}
+
+	/* Check filter configuration, if any */
+	cfgerr += flt_check(px);
+
+	if (px->cap & PR_CAP_FE) {
+		if (!px->accept)
+			px->accept = frontend_accept;
+
+		if (!LIST_ISEMPTY(&px->tcp_req.inspect_rules) ||
+		    (px->defpx && !LIST_ISEMPTY(&px->defpx->tcp_req.inspect_rules)))
+			px->fe_req_ana |= AN_REQ_INSPECT_FE;
+
+		if (px->mode == PR_MODE_HTTP) {
+			px->fe_req_ana |= AN_REQ_WAIT_HTTP | AN_REQ_HTTP_PROCESS_FE;
+			px->fe_rsp_ana |= AN_RES_WAIT_HTTP | AN_RES_HTTP_PROCESS_FE;
+		}
+
+		if (px->mode == PR_MODE_CLI) {
+			px->fe_req_ana |= AN_REQ_WAIT_CLI;
+			px->fe_rsp_ana |= AN_RES_WAIT_CLI;
+		}
+
+		/* both TCP and HTTP must check switching rules */
+		px->fe_req_ana |= AN_REQ_SWITCHING_RULES;
+
+		/* Add filters analyzers if needed */
+		if (!LIST_ISEMPTY(&px->filter_configs)) {
+			px->fe_req_ana |= AN_REQ_FLT_START_FE | AN_REQ_FLT_XFER_DATA | AN_REQ_FLT_END;
+			px->fe_rsp_ana |= AN_RES_FLT_START_FE | AN_RES_FLT_XFER_DATA | AN_RES_FLT_END;
+		}
+	}
+
+	if (px->cap & PR_CAP_BE) {
+		if (!LIST_ISEMPTY(&px->tcp_req.inspect_rules) ||
+		    (px->defpx && !LIST_ISEMPTY(&px->defpx->tcp_req.inspect_rules)))
+			px->be_req_ana |= AN_REQ_INSPECT_BE;
+
+		if (!LIST_ISEMPTY(&px->tcp_rep.inspect_rules) ||
+		    (px->defpx && !LIST_ISEMPTY(&px->defpx->tcp_rep.inspect_rules)))
+                        px->be_rsp_ana |= AN_RES_INSPECT;
+
+		if (px->mode == PR_MODE_HTTP) {
+			px->be_req_ana |= AN_REQ_WAIT_HTTP | AN_REQ_HTTP_INNER | AN_REQ_HTTP_PROCESS_BE;
+			px->be_rsp_ana |= AN_RES_WAIT_HTTP | AN_RES_HTTP_PROCESS_BE;
+		}
+
+		/* If the backend does requires RDP cookie persistence, we have to
+		 * enable the corresponding analyser.
+		 */
+		if (px->options2 & PR_O2_RDPC_PRST)
+			px->be_req_ana |= AN_REQ_PRST_RDP_COOKIE;
+
+		/* Add filters analyzers if needed */
+		if (!LIST_ISEMPTY(&px->filter_configs)) {
+			px->be_req_ana |= AN_REQ_FLT_START_BE | AN_REQ_FLT_XFER_DATA | AN_REQ_FLT_END;
+			px->be_rsp_ana |= AN_RES_FLT_START_BE | AN_RES_FLT_XFER_DATA | AN_RES_FLT_END;
+		}
+	}
+
+	/* Check the mux protocols, if any, for each server attached to
+	 * the current proxy */
+	for (newsrv = px->srv; newsrv; newsrv = newsrv->next) {
+		int mode = conn_pr_mode_to_proto_mode(px->mode);
+		const struct mux_proto_list *mux_ent;
+
+		if (srv_is_quic(newsrv)) {
+			if (!newsrv->mux_proto) {
+				/* Force QUIC as mux-proto on server with quic addresses, similarly to bind on FE side. */
+				newsrv->mux_proto = get_mux_proto(ist("quic"));
+			}
+		}
+
+		if (!newsrv->mux_proto)
+			continue;
+
+		/* it is possible that an incorrect mux was referenced
+		 * due to the proxy's mode not being taken into account
+		 * on first pass. Let's adjust it now.
+		 */
+		mux_ent = conn_get_best_mux_entry(newsrv->mux_proto->mux_proto, IST_NULL, PROTO_SIDE_BE, srv_is_quic(newsrv), mode);
+
+		if (!mux_ent || !isteq(mux_ent->mux_proto, newsrv->mux_proto->mux_proto)) {
+			ha_alert("%s '%s' : MUX protocol '%.*s' is not usable for server '%s' at [%s:%d].\n",
+			         proxy_type_str(px), px->id,
+			         (int)newsrv->mux_proto->mux_proto.len,
+			         newsrv->mux_proto->mux_proto.ptr,
+			         newsrv->id, newsrv->conf.file, newsrv->conf.line);
+			cfgerr++;
+		}
+		else {
+			if ((mux_ent->mux->flags & MX_FL_FRAMED) && !srv_is_quic(newsrv)) {
+				ha_alert("%s '%s' : MUX protocol '%.*s' is incompatible with stream transport used by server '%s' at [%s:%d].\n",
+				         proxy_type_str(px), px->id,
+				         (int)newsrv->mux_proto->mux_proto.len,
+				         newsrv->mux_proto->mux_proto.ptr,
+				         newsrv->id, newsrv->conf.file, newsrv->conf.line);
+				cfgerr++;
+			}
+			else if (!(mux_ent->mux->flags & MX_FL_FRAMED) && srv_is_quic(newsrv)) {
+				ha_alert("%s '%s' : MUX protocol '%.*s' is incompatible with framed transport used by server '%s' at [%s:%d].\n",
+				         proxy_type_str(px), px->id,
+				         (int)newsrv->mux_proto->mux_proto.len,
+				         newsrv->mux_proto->mux_proto.ptr,
+				         newsrv->id, newsrv->conf.file, newsrv->conf.line);
+				cfgerr++;
+			}
+		}
+
+		/* update the mux */
+		newsrv->mux_proto = mux_ent;
+	}
+
+	/* Allocate default tcp-check rules for proxies without
+	 * explicit rules.
+	 */
+	if (px->cap & PR_CAP_BE) {
+		if (!(px->options2 & PR_O2_CHK_ANY)) {
+			struct tcpcheck_ruleset *rs = NULL;
+
+			px->options2 |= PR_O2_TCPCHK_CHK;
+
+			rs = find_tcpcheck_ruleset("*tcp-check");
+			if (!rs) {
+				rs = create_tcpcheck_ruleset("*tcp-check");
+				if (rs == NULL) {
+					ha_alert("config: %s '%s': out of memory.\n",
+					         proxy_type_str(px), px->id);
+					cfgerr++;
+				}
+			}
+			px->tcpcheck.rs = rs;
+			free_tcpcheck_vars(&px->tcpcheck.preset_vars);
+		}
+	}
+
+ out:
+	if (cfgerr)
+		*err_code |= ERR_ALERT | ERR_FATAL;
+
+	return cfgerr;
 }
 
 /* Frees all dynamic settings allocated on a default proxy that's about to be
  * destroyed. Note that most of the fields are not even reset, so extreme care
- * is required here, and calling proxy_preset_defaults() afterwards would be
- * safer.
+ * is required here.
  */
-void proxy_free_defaults(struct proxy *defproxy)
+static void defaults_px_free(struct proxy *defproxy)
 {
 	struct cap_hdr *h,*h_next;
 
@@ -1580,90 +2973,215 @@ void proxy_free_defaults(struct proxy *defproxy)
 	deinit_proxy_tcpcheck(defproxy);
 }
 
-/* delete a defproxy from the tree if still in it, frees its content and its
- * storage. Nothing is done if <px> is NULL or if it doesn't have PR_CAP_DEF
- * set, allowing to pass it the direct result of a lookup function.
+/* Removes <px> defaults instance from the name tree, free its content and
+ * storage. This must only be used if <px> is unreferenced.
+ *
+ * Uses PROXIES_DEL_LOCK to protect global tree/list accesses.
  */
-void proxy_destroy_defaults(struct proxy *px)
+void defaults_px_destroy(struct proxy *px)
 {
-	if (!px)
-		return;
-	if (!(px->cap & PR_CAP_DEF))
-		return;
-	BUG_ON(px->conf.refcount != 0);
-	cebis_item_delete((px->cap & PR_CAP_DEF) ? &defproxy_by_name : &proxy_by_name,
-			  conf.name_node, id, px);
-	proxy_free_defaults(px);
+	BUG_ON(!(px->cap & PR_CAP_DEF));
+	BUG_ON(px->conf.def_ref != 0);
+
+	HA_SPIN_LOCK(PROXIES_DEL_LOCK, &proxies_del_lock);
+	cebis_item_delete(&defproxy_by_name, conf.name_node, id, px);
+	LIST_DELETE(&px->el);
+	HA_SPIN_UNLOCK(PROXIES_DEL_LOCK, &proxies_del_lock);
+
+	defaults_px_free(px);
 	free(px);
 }
 
 /* delete all unreferenced default proxies. A default proxy is unreferenced if
- * its refcount is equal to zero.
+ * its <def_ref> count is equal to zero.
+ *
+ * Not thread safe - currently only used during init.
  */
-void proxy_destroy_all_unref_defaults()
+void defaults_px_destroy_all_unref(void)
 {
 	struct proxy *px, *nx;
 
 	for (px = cebis_item_first(&defproxy_by_name, conf.name_node, id, struct proxy); px; px = nx) {
 		BUG_ON(!(px->cap & PR_CAP_DEF));
 		nx = cebis_item_next(&defproxy_by_name, conf.name_node, id, px);
-		if (!px->conf.refcount)
-			proxy_destroy_defaults(px);
-	}
-
-	px = orphaned_default_proxies;
-	while (px) {
-		BUG_ON(!(px->cap & PR_CAP_DEF));
-		nx = px->next;
-		if (!px->conf.refcount)
-			proxy_destroy_defaults(px);
-		px = nx;
+		if (!HA_ATOMIC_LOAD(&px->conf.def_ref))
+			defaults_px_destroy(px);
 	}
 }
 
-/* Try to destroy a defaults section, or just unreference it if still
- * refcounted. In this case it's added to the orphaned_default_proxies list
- * so that it can later be found.
+/* Removes <px> defaults from the name tree. This operation is useful when a
+ * section is made invisible by a newer instance with the same name. If <px> is
+ * not referenced it is freed immediately, else it is kept in defaults_list.
+ *
+ * Not thread safe - currently only used during parsing.
  */
-void proxy_unref_or_destroy_defaults(struct proxy *px)
+void defaults_px_detach(struct proxy *px)
 {
-	if (!px || !(px->cap & PR_CAP_DEF))
-		return;
+	BUG_ON(!(px->cap & PR_CAP_DEF));
+	cebis_item_delete(&defproxy_by_name, conf.name_node, id, px);
+	if (!HA_ATOMIC_LOAD(&px->conf.def_ref))
+		defaults_px_destroy(px);
+	/* If not destroyed, <px> can still be accessed in <defaults_list>. */
+}
 
-	cebis_item_delete((px->cap & PR_CAP_DEF) ? &defproxy_by_name : &proxy_by_name, conf.name_node, id, px);
-	if (px->conf.refcount) {
-		/* still referenced just append it to the orphaned list */
-		px->next = orphaned_default_proxies;
-		orphaned_default_proxies = px;
-	} else
-		proxy_destroy_defaults(px);
+/* Increments by one defaults proxy reference of all defaults stored in tree name.
+ *
+ * Not thread safe - currently only used during init.
+ */
+void defaults_px_ref_all(void)
+{
+	struct proxy *px;
+
+	for (px = cebis_item_first(&defproxy_by_name, conf.name_node, id, struct proxy);
+	     px;
+	     px = cebis_item_next(&defproxy_by_name, conf.name_node, id, px)) {
+		HA_ATOMIC_INC(&px->conf.def_ref);
+	}
+}
+
+/* Decrements defaults proxy ref of all defaults. This is the reverse of
+ * defaults_px_ref_all().
+ *
+ * Not thread safe - currently only used during deinit.
+ */
+void defaults_px_unref_all(void)
+{
+	struct proxy *px, *nx;
+
+	for (px = cebis_item_first(&defproxy_by_name, conf.name_node, id, struct proxy); px; px = nx) {
+		nx = cebis_item_next(&defproxy_by_name, conf.name_node, id, px);
+
+		BUG_ON(!px->conf.def_ref);
+		if (!HA_ATOMIC_SUB_FETCH(&px->conf.def_ref, 1))
+			defaults_px_destroy(px);
+	}
 }
 
 /* Add a reference on the default proxy <defpx> for the proxy <px> Nothing is
  * done if <px> already references <defpx>. Otherwise, the default proxy
- * refcount is incremented by one. For now, this operation is not thread safe
- * and is perform during init stage only.
+ * <def_ref> count is incremented by one.
+ *
+ * Access on default proxy reference is thread safe thanks to atomic ops.
  */
-void proxy_ref_defaults(struct proxy *px, struct proxy *defpx)
+static inline void defaults_px_ref(struct proxy *defpx, struct proxy *px)
 {
 	if (px->defpx == defpx)
 		return;
-	BUG_ON(px->defpx != NULL);
+	/* <px> is already referencing another defaults. */
+	BUG_ON(px->defpx);
+
 	px->defpx = defpx;
-	defpx->conf.refcount++;
+	HA_ATOMIC_INC(&defpx->conf.def_ref);
+}
+
+/* Check that <px> can inherits from <defpx> default proxy. If some settings
+ * cannot be copied, <def_ref> count of the defaults instance is incremented.
+ * Inheritance may be impossible due to incompatibility issues. In this case,
+ * <errmsg> will be allocated to point to a textual description of the error.
+ *
+ * Returns ERR_NONE on success and a combination of ERR_CODE on failure
+ */
+int proxy_ref_defaults(struct proxy *px, struct proxy *defpx, char **errmsg)
+{
+	char defcap = defpx->cap & PR_CAP_LISTEN;
+	int err_code = ERR_NONE;
+
+	if ((px->cap & PR_CAP_BE) && (defpx->nb_req_cap || defpx->nb_rsp_cap)) {
+		memprintf(errmsg, "backend or defaults sections cannot inherit from a defaults section defining"
+		         " captures (defaults section at %s:%d)",
+		         defpx->conf.file, defpx->conf.line);
+		err_code |= ERR_ALERT | ERR_ABORT;
+		goto out;
+	}
+
+	/* If the current default proxy defines TCP/HTTP rules, the
+	 * current proxy will keep a reference on it. But some sanity
+	 * checks are performed first:
+	 *
+	 * - It cannot be used to init a defaults section
+	 * - It cannot be used to init a listen section
+	 * - It cannot be used to init backend and frontend sections at
+	 *   same time. It can be used to init several sections of the
+	 *   same type only.
+	 * - It cannot define L4/L5 TCP rules if it is used to init
+	 *   backend sections.
+	 * - It cannot define 'tcp-response content' rules if it
+	 *   is used to init frontend sections.
+	 *
+	 * If no error is found, <def_ref> count of the default proxy is incremented.
+	 */
+	if ((!LIST_ISEMPTY(&defpx->http_req_rules)        ||
+	     !LIST_ISEMPTY(&defpx->http_res_rules)        ||
+	     !LIST_ISEMPTY(&defpx->http_after_res_rules)  ||
+	     !LIST_ISEMPTY(&defpx->tcp_req.l4_rules)      ||
+	     !LIST_ISEMPTY(&defpx->tcp_req.l5_rules)      ||
+	     !LIST_ISEMPTY(&defpx->tcp_req.inspect_rules) ||
+	     !LIST_ISEMPTY(&defpx->tcp_rep.inspect_rules))) {
+
+		/* Note: Add tcpcheck_rules too if unresolve args become allowed in defaults section */
+		if (px->cap & PR_CAP_DEF) {
+			memprintf(errmsg, "a defaults section cannot inherit from a defaults section defining TCP/HTTP rules (defaults section at %s:%d)",
+			          defpx->conf.file, defpx->conf.line);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+		else if ((px->cap & PR_CAP_LISTEN) == PR_CAP_LISTEN) {
+			memprintf(errmsg, "a listen section cannot inherit from a defaults section defining TCP/HTTP rules");
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+		else if ((defcap == PR_CAP_BE || defcap == PR_CAP_FE) && (px->cap & PR_CAP_LISTEN) != defcap) {
+			memprintf(errmsg, "frontends and backends cannot inherit from the same defaults section"
+			         " if it defines TCP/HTTP rules (defaults section at %s:%d)",
+			         defpx->conf.file, defpx->conf.line);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+		else if (!(px->cap & PR_CAP_FE) && (!LIST_ISEMPTY(&defpx->tcp_req.l4_rules) ||
+		         !LIST_ISEMPTY(&defpx->tcp_req.l5_rules))) {
+			memprintf(errmsg, "a backend section cannot inherit from a defaults section defining"
+			         " 'tcp-request connection' or 'tcp-request session' rules (defaults section at %s:%d)",
+			         defpx->conf.file, defpx->conf.line);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+		else if (!(px->cap & PR_CAP_BE) && !LIST_ISEMPTY(&defpx->tcp_rep.inspect_rules)) {
+			memprintf(errmsg, "a frontend section cannot inherit from a defaults section defining"
+			         " 'tcp-response content' rules (defaults section at %s:%d)",
+			         defpx->conf.file, defpx->conf.line);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+
+		defpx->cap = (defpx->cap & ~PR_CAP_LISTEN) | (px->cap & PR_CAP_LISTEN);
+		defaults_px_ref(defpx, px);
+	}
+
+	if (defpx->tcpcheck.rs && (defpx->tcpcheck.rs->flags & TCPCHK_RULES_PROTO_CHK) &&
+	    (px->cap & PR_CAP_LISTEN) == PR_CAP_BE) {
+		/* If the current default proxy defines tcpcheck rules, the
+		 * current proxy will keep a reference on it. but only if the
+		 * current proxy has the backend capability.
+		 */
+		defaults_px_ref(defpx, px);
+	}
+
+ out:
+	return err_code;
 }
 
 /* proxy <px> removes its reference on its default proxy. The default proxy
- * refcount is decremented by one. If it was the last reference, the
- * corresponding default proxy is destroyed. For now this operation is not
- * thread safe and is performed during deinit staged only.
-*/
+ * <def_ref> count is decremented by one. If it was the last reference, the
+ * corresponding default proxy is destroyed.
+ *
+ * Access on default proxy reference is thread safe thanks to atomic ops.
+ */
 void proxy_unref_defaults(struct proxy *px)
 {
 	if (px->defpx == NULL)
 		return;
-	if (!--px->defpx->conf.refcount)
-		proxy_destroy_defaults(px->defpx);
+	if (!HA_ATOMIC_SUB_FETCH(&px->defpx->conf.def_ref, 1))
+		defaults_px_destroy(px->defpx);
 	px->defpx = NULL;
 }
 
@@ -1690,7 +3208,8 @@ int setup_new_proxy(struct proxy *px, const char *name, unsigned int cap, char *
 	px->cap = cap;
 	px->last_change = ns_to_sec(now_ns);
 
-	if (name && !(cap & PR_CAP_INT))
+	/* Internal proxies or with empty name are not stored in the named tree. */
+	if (name && name[0] != '\0' && !(cap & PR_CAP_INT))
 		proxy_store_name(px);
 
 	if (!(cap & PR_CAP_DEF))
@@ -1725,6 +3244,8 @@ struct proxy *alloc_new_proxy(const char *name, unsigned int cap, char **errmsg)
 	if (!setup_new_proxy(curproxy, name, cap, errmsg))
 		goto fail;
 
+	proxy_take(curproxy);
+
  done:
 	return curproxy;
 
@@ -1737,6 +3258,13 @@ struct proxy *alloc_new_proxy(const char *name, unsigned int cap, char **errmsg)
 		srv_free(&curproxy->defsrv);
 	free(curproxy);
 	return NULL;
+}
+
+/* Increment <px> refcount. Does nothing for a default proxy instance. */
+void proxy_take(struct proxy *px)
+{
+	if (!(px->cap & PR_CAP_DEF))
+		HA_ATOMIC_INC(&px->refcount);
 }
 
 /* post-check for proxies */
@@ -1856,6 +3384,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 		curproxy->clitcpka_cnt   = defproxy->clitcpka_cnt;
 		curproxy->clitcpka_idle  = defproxy->clitcpka_idle;
 		curproxy->clitcpka_intvl = defproxy->clitcpka_intvl;
+		curproxy->stream_new_from_sc = defproxy->stream_new_from_sc;
 	}
 
 	if (curproxy->cap & PR_CAP_BE) {
@@ -1866,14 +3395,12 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 		curproxy->redispatch_after = defproxy->redispatch_after;
 		curproxy->max_ka_queue = defproxy->max_ka_queue;
 
-		curproxy->tcpcheck_rules.flags = (defproxy->tcpcheck_rules.flags & ~TCPCHK_RULES_UNUSED_RS);
-		curproxy->tcpcheck_rules.list  = defproxy->tcpcheck_rules.list;
-		if (!LIST_ISEMPTY(&defproxy->tcpcheck_rules.preset_vars)) {
-			if (!dup_tcpcheck_vars(&curproxy->tcpcheck_rules.preset_vars,
-					       &defproxy->tcpcheck_rules.preset_vars)) {
-				memprintf(errmsg, "proxy '%s': failed to duplicate tcpcheck preset-vars", curproxy->id);
-				return 1;
-			}
+		curproxy->tcpcheck.flags = (defproxy->tcpcheck.flags & ~TCPCHK_FL_UNUSED_RS);
+		curproxy->tcpcheck.rs  = defproxy->tcpcheck.rs;
+		if (!dup_tcpcheck_vars(&curproxy->tcpcheck.preset_vars,
+				       &defproxy->tcpcheck.preset_vars)) {
+			memprintf(errmsg, "proxy '%s': failed to duplicate tcpcheck preset-vars", curproxy->id);
+			return 1;
 		}
 
 		curproxy->ck_opts = defproxy->ck_opts;
@@ -2058,7 +3585,7 @@ struct proxy *parse_new_proxy(const char *name, unsigned int cap,
 			ha_alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
 			free(errmsg);
 
-			ha_free(&curproxy);
+			proxy_drop(curproxy);
 			return NULL;
 		}
 	}
@@ -2573,6 +4100,7 @@ end:
 int stream_set_backend(struct stream *s, struct proxy *be)
 {
 	unsigned int req_ana;
+	unsigned int beconn;
 
 	if (s->flags & SF_BE_ASSIGNED)
 		return 1;
@@ -2581,9 +4109,13 @@ int stream_set_backend(struct stream *s, struct proxy *be)
 		return 0;
 
 	s->be = be;
-	s->be_tgcounters = be->be_counters.shared.tg[tgid - 1];
-	HA_ATOMIC_UPDATE_MAX(&be->be_counters.conn_max,
-			     HA_ATOMIC_ADD_FETCH(&be->beconn, 1));
+	if (be->be_counters.shared.tg)
+		s->be_tgcounters = be->be_counters.shared.tg[tgid - 1];
+	else
+		s->be_tgcounters = NULL;
+
+	beconn = HA_ATOMIC_ADD_FETCH(&be->beconn, 1);
+	COUNTERS_UPDATE_MAX(&be->be_counters.conn_max, beconn);
 	proxy_inc_be_ctr(be);
 
 	/* assign new parameters to the stream from the new backend */
@@ -2629,7 +4161,7 @@ int stream_set_backend(struct stream *s, struct proxy *be)
 		/* If the target backend requires HTTP processing, we have to allocate
 		 * the HTTP transaction if we did not have one.
 		 */
-		if (unlikely(!s->txn && be->http_needed && !http_create_txn(s)))
+		if (unlikely(!s->txn.http && be->http_needed && !http_create_txn(s)))
 			return 0;
 	}
 
@@ -2682,6 +4214,7 @@ void proxy_capture_error(struct proxy *proxy, int is_back,
 	if (!es)
 		return;
 
+	es->buf_size = buf->size;
 	es->buf_len = buf_len;
 	es->ev_id   = ev_id;
 
@@ -2862,6 +4395,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_LISTEN, "clitcpka-intvl", proxy_parse_tcpka_intvl },
 	{ CFG_LISTEN, "srvtcpka-intvl", proxy_parse_tcpka_intvl },
 #endif
+	{ CFG_LISTEN, "force-be-switch", proxy_parse_force_be_switch },
 	{ CFG_LISTEN, "guid", proxy_parse_guid },
 	{ 0, NULL, NULL },
 }};
@@ -3292,6 +4826,325 @@ static int cli_parse_shutdown_frontend(char **args, char *payload, struct appctx
 	return 1;
 }
 
+/* Parses a "add backend" CLI command to allocate a new backend instance,
+ * derived from a default proxy instance. This operation is performed under
+ * thread isolation.
+ *
+ * Always returns 1.
+ */
+static int cli_parse_add_backend(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct proxy *px, *defpx, *next;
+	struct post_proxy_check_fct *ppcf;
+	const char *be_name, *def_name, *guid = NULL, *err;
+	char *msg = NULL;
+	enum pr_mode mode = 0;
+	int err_code = ERR_NONE;
+
+	usermsgs_clr("CLI");
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
+	++args;
+	be_name = args[1];
+	if (!*be_name) {
+		cli_err(appctx, "Require backend name.\n");
+		return 1;
+	}
+	if ((err = invalid_char(be_name))) {
+		cli_dynerr(appctx, memprintf(&msg, "Invalid character '%c' in backend name.\n", *err));
+		return 1;
+	}
+
+	++args;
+	def_name = args[2];
+	if (!*args[1] || !*def_name || strcmp(args[1], "from") != 0) {
+		cli_err(appctx, "Usage: add backend <name> from <defproxy>.\n");
+		return 1;
+	}
+
+	/* Parse optional arguments */
+	args += 2;
+	while (*args[1]) {
+		/* "mode" */
+		if (*args[2] && !mode && strcmp(args[1], "mode") == 0) {
+			mode = str_to_proxy_mode(args[2]);
+			if (mode == PR_MODES) {
+				cli_err(appctx, "Unknown proxy mode.\n");
+				return 1;
+			}
+			if (mode != PR_MODE_TCP && mode != PR_MODE_HTTP) {
+				cli_err(appctx, "Dynamic backends are compatible with only TCP or HTTP mode.\n");
+				return 1;
+			}
+		}
+		/* guid */
+		else if (*args[2] && !guid && strcmp(args[1], "guid") == 0) {
+			guid = args[2];
+		}
+		/* unknown, malformed or duplicate argument */
+		else {
+			cli_err(appctx, "Usage: add backend <name> from <defproxy> [mode <px_mode>] [guid <val>].\n");
+			return 1;
+		}
+
+		args += 2;
+	}
+
+	defpx = proxy_find_by_name(def_name, PR_CAP_DEF, 0);
+	if (!defpx) {
+		cli_dynerr(appctx, memprintf(&msg, "Cannot find default proxy '%s'.\n", def_name));
+		return 1;
+	}
+	if (!(defpx->flags & PR_FL_DEF_EXPLICIT_MODE) && !mode) {
+		cli_dynerr(appctx, memprintf(&msg, "Mode is required as '%s' default proxy does not explicitly defines it.\n", def_name));
+		return 1;
+	}
+	if (defpx->mode != PR_MODE_TCP && defpx->mode != PR_MODE_HTTP) {
+		cli_dynerr(appctx, memprintf(&msg, "Dynamic backends only support TCP or HTTP mode, whereas default proxy '%s' uses 'mode %s'.\n",
+		           def_name, proxy_mode_str(defpx->mode)));
+		return 1;
+	}
+
+	thread_isolate();
+
+	if ((px = proxy_find_by_name(be_name, PR_CAP_NONE, 0)) ||
+	    (px = proxy_find_by_name(be_name, PR_CAP_DEF, 0))) {
+		memprintf(&msg,
+		  "name is already used by other proxy '%s %s'",
+		  proxy_cap_str(px->cap), be_name);
+		px = NULL;
+		goto err;
+	}
+
+	px = alloc_new_proxy(be_name, PR_CAP_BE, &msg);
+	if (!px)
+		goto err;
+
+	if (guid && guid_insert(&px->obj_type, guid, &msg)) {
+		memprintf(&msg, "GUID insertion : %s", msg);
+		goto err;
+	}
+
+	if (proxy_defproxy_cpy(px, defpx, &msg))
+		goto err;
+
+	/* Override default-proxy mode if defined. */
+	if (mode)
+		px->mode = mode;
+
+	if (proxy_ref_defaults(px, defpx, &msg))
+		goto err;
+
+	proxy_init_per_thr(px);
+
+	if (proxy_finalize(px, &err_code))
+		goto err;
+
+	list_for_each_entry(ppcf, &post_proxy_check_list, list) {
+		err_code |= ppcf->fct(px);
+		if (err_code & (ERR_ABORT|ERR_FATAL))
+			goto err;
+	}
+
+	px->flags |= PR_FL_BE_UNPUBLISHED;
+
+	if (!stats_allocate_proxy_counters_internal(&px->extra_counters_be,
+	                                            COUNTERS_BE,
+	                                            STATS_PX_CAP_BE,
+	                                            &px->per_tgrp->extra_counters_be_storage,
+	                                            &px->per_tgrp[1].extra_counters_be_storage -
+	                                            &px->per_tgrp[0].extra_counters_be_storage)) {
+		memprintf(&msg, "failed to allocate extra counters");
+		goto err;
+	}
+
+	/* Assign automatically proxy ID. */
+	px->uuid = proxy_get_next_id(dynpx_next_id);
+	if (!px->uuid) {
+		memprintf(&msg, "no spare proxy ID available");
+		goto err;
+	}
+	proxy_index_id(px);
+	dynpx_next_id = px->uuid;
+
+	if (!proxies_list) {
+		proxies_list = px;
+	}
+	else {
+		for (next = proxies_list; next->next; next = next->next)
+			;
+		next->next = px;
+	}
+	px->next = NULL;
+
+	thread_release();
+
+	if (unlikely(!be_supports_dynamic_srv(px, &msg)))
+		memprintf(&msg, "New backend registered (no support for dynamic servers: %s)", msg);
+	else
+		memprintf(&msg, "New backend registered");
+	ha_notice("%s.\n", msg);
+	ha_free(&msg);
+	cli_umsg(appctx, LOG_INFO);
+
+	return 1;
+
+ err:
+	/* This ensures any potential refcounting on defpx is decremented. */
+	proxy_drop(px);
+	thread_release();
+
+	if (msg) {
+		memprintf(&msg, "Error during backend creation : %s.\n", msg);
+		cli_dynerr(appctx, msg);
+	}
+	else {
+		ha_alert("Error during backend creation.\n");
+		cli_umsgerr(appctx);
+	}
+
+	return 1;
+}
+
+/* Test if the backend instance named <bename> can be deleted.
+ *
+ * Returns a positive integer if backend can be deleted. Else, 0 is returned if
+ * backend should be deletable after some delay. A negative value indicates
+ * that backend cannot be deleted without any external action.
+ *
+ * If <pb> is not NULL, it will be set to point to the backend instance if name
+ * is found. If <pm> is not NULL, it will be used on error to point to the
+ * description failure.
+ */
+int be_check_for_deletion(const char *bename, struct proxy **pb, const char **pm)
+{
+	struct proxy *be = NULL;
+	const char *msg = NULL;
+	int ret;
+
+	/* First, unrecoverable errors */
+	ret = -1;
+
+	if (!(be = proxy_be_by_name(bename))) {
+		msg = "No such backend.";
+		goto out;
+	}
+
+	if (be->cap & PR_CAP_FE) {
+		msg = "Cannot delete a listen section.";
+		goto out;
+	}
+
+	if (be->options & (PR_O_DISPATCH|PR_O_TRANSP)) {
+		msg = "Deletion of backend with deprecated dispatch/transparent options is not supported.";
+		goto out;
+	}
+
+	if (be->table) {
+		msg = "Cannot remove a backend with stick-table.";
+		goto out;
+	}
+
+	if (be->flags & PR_FL_NON_PURGEABLE) {
+		msg = "This proxy cannot be removed at runtime due to other configuration elements pointing to it.";
+		goto out;
+	}
+
+	if (be->mode != PR_MODE_TCP && be->mode != PR_MODE_HTTP) {
+		msg = "Only TCP or HTTP proxies can be removed at runtime.";
+		goto out;
+	}
+
+	if (!(be->flags & PR_FL_BE_UNPUBLISHED)) {
+		msg = "Backend must be unpublished prior to its deletion.";
+		goto out;
+	}
+
+	if (be->srv) {
+		msg = "Only a backend without server can be deleted.";
+		goto out;
+	}
+
+	/* Second, conditions that may change over time */
+	ret = 0;
+
+	if (be->beconn) {
+		msg = "Backend still has attached streams on it.";
+		goto out;
+	}
+
+	ret = 1;
+
+ out:
+	if (pb)
+		*pb = be;
+	if (pm)
+		*pm = msg;
+	return ret;
+}
+
+/* Handler for "delete backend". Runs under thread isolation. Always returns 1. */
+static int cli_parse_delete_backend(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct watcher *px_watch;
+	struct proxy *px, *prev;
+	const char *msg;
+	char *be_name;
+	int ret;
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
+	if (*args[3]) {
+		cli_err(appctx, "Usage: del backend <name>.\n");
+		return 1;
+	}
+
+	thread_isolate_full();
+
+	be_name = args[2];
+	ret = be_check_for_deletion(be_name, &px, &msg);
+	if (ret <= 0) {
+		cli_err(appctx, msg);
+		goto out;
+	}
+
+	while (!MT_LIST_ISEMPTY(&px->watcher_list)) {
+		px_watch = MT_LIST_NEXT(&px->watcher_list, struct watcher *, el);
+		watcher_next(px_watch, px->next);
+	}
+
+	ceb32_item_delete(&used_proxy_id, conf.uuid_node, uuid, px);
+	cebis_item_delete(&proxy_by_name, conf.name_node, id, px);
+
+	/* Detach backend from global proxies_list. */
+	if (proxies_list == px) {
+		proxies_list = px->next;
+	}
+	else {
+		for (prev = proxies_list->next; prev && prev->next != px; prev = prev->next)
+			;
+		BUG_ON(!prev); /* Proxy instance not found in global list ? */
+		prev->next = px->next;
+	}
+
+	px->flags |= PR_FL_DELETED;
+
+	thread_release();
+
+	ha_notice("Backend deleted.\n");
+	proxy_drop(px);
+
+	cli_umsg(appctx, LOG_INFO);
+	return 1;
+
+ out:
+	thread_release();
+	return 1;
+}
+
 /* Parses the "disable frontend" directive, it always returns 1.
  *
  * Grabs the proxy lock.
@@ -3351,6 +5204,54 @@ static int cli_parse_enable_frontend(char **args, char *payload, struct appctx *
 	if (!ret)
 		return cli_err(appctx, "Failed to resume frontend, check logs for precise cause (port conflict?).\n");
 	return 1;
+}
+
+static int cli_parse_publish_backend(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct proxy *px;
+
+	usermsgs_clr("CLI");
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
+	px = cli_find_backend(appctx, args[2]);
+	if (!px)
+		return cli_err(appctx, "No such backend.\n");
+
+	if (px->flags & PR_FL_DISABLED)
+		return cli_err(appctx, "No effect on a disabled backend.\n");
+
+	thread_isolate();
+	px->flags &= ~PR_FL_BE_UNPUBLISHED;
+	thread_release();
+
+	ha_notice("Backend published.\n");
+	return cli_umsg(appctx, LOG_INFO);
+}
+
+static int cli_parse_unpublish_backend(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct proxy *px;
+
+	usermsgs_clr("CLI");
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
+	px = cli_find_backend(appctx, args[2]);
+	if (!px)
+		return cli_err(appctx, "No such backend.\n");
+
+	if (px->flags & PR_FL_DISABLED)
+		return cli_err(appctx, "No effect on a disabled backend.\n");
+
+	thread_isolate();
+	px->flags |= PR_FL_BE_UNPUBLISHED;
+	thread_release();
+
+	ha_notice("Backend unpublished.\n");
+	return cli_umsg(appctx, LOG_INFO);
 }
 
 /* appctx context used during "show errors" */
@@ -3502,7 +5403,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 			              es->srv ? es->srv->puid : -1,
 			              es->ev_id, pn, port,
 			              es->buf_ofs, es->buf_out,
-			              global.tune.bufsize - es->buf_out - es->buf_len,
+			              es->buf_size - es->buf_out - es->buf_len,
 			              es->buf_len, es->buf_wrap, es->buf_err);
 
 			if (es->show)
@@ -3528,12 +5429,12 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 		}
 
 		/* OK, ptr >= 0, so we have to dump the current line */
-		while (ctx->ptr < es->buf_len && ctx->ptr < global.tune.bufsize) {
+		while (ctx->ptr < es->buf_len && ctx->ptr < es->buf_size) {
 			int newptr;
 			int newline;
 
 			newline = ctx->bol;
-			newptr = dump_text_line(&trash, es->buf, global.tune.bufsize, es->buf_len, &newline, ctx->ptr);
+			newptr = dump_text_line(&trash, es->buf, es->buf_size, es->buf_len, &newline, ctx->ptr);
 			if (newptr == ctx->ptr) {
 				applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
 				goto cant_send_unlock;
@@ -3565,14 +5466,18 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
+	{ { "add", "backend", NULL },                       "add backend <backend>                   : add a new backend",                                              cli_parse_add_backend, NULL, NULL, NULL, 0 },
+	{ { "del", "backend", NULL },                       "del backend <backend>                   : delete a backend",                                               cli_parse_delete_backend, NULL, NULL, NULL, 0 },
 	{ { "disable", "frontend",  NULL },                 "disable frontend <frontend>             : temporarily disable specific frontend",                          cli_parse_disable_frontend, NULL, NULL },
 	{ { "enable", "frontend",  NULL },                  "enable frontend <frontend>              : re-enable specific frontend",                                    cli_parse_enable_frontend, NULL, NULL },
+	{ { "publish", "backend",  NULL },                  "publish backend <backend>               : mark backend as ready for traffic",                              cli_parse_publish_backend, NULL, NULL },
 	{ { "set", "maxconn", "frontend",  NULL },          "set maxconn frontend <frontend> <value> : change a frontend's maxconn setting",                            cli_parse_set_maxconn_frontend, NULL },
 	{ { "show","servers", "conn",  NULL },              "show servers conn [<backend>]           : dump server connections status (all or for a single backend)",   cli_parse_show_servers, cli_io_handler_servers_state },
 	{ { "show","servers", "state",  NULL },             "show servers state [<backend>]          : dump volatile server information (all or for a single backend)", cli_parse_show_servers, cli_io_handler_servers_state },
 	{ { "show", "backend", NULL },                      "show backend                            : list backends in the current running config", NULL,              cli_io_handler_show_backend },
 	{ { "shutdown", "frontend",  NULL },                "shutdown frontend <frontend>            : stop a specific frontend",                                       cli_parse_shutdown_frontend, NULL, NULL },
 	{ { "set", "dynamic-cookie-key", "backend", NULL }, "set dynamic-cookie-key backend <bk> <k> : change a backend secret key for dynamic cookies",                cli_parse_set_dyncookie_key_backend, NULL },
+	{ { "unpublish", "backend",  NULL },                "unpublish backend <backend>             : remove backend for traffic processing",                          cli_parse_unpublish_backend, NULL, NULL },
 	{ { "enable", "dynamic-cookie", "backend", NULL },  "enable dynamic-cookie backend <bk>      : enable dynamic cookies on a specific backend",                   cli_parse_enable_dyncookie_backend, NULL },
 	{ { "disable", "dynamic-cookie", "backend", NULL }, "disable dynamic-cookie backend <bk>     : disable dynamic cookies on a specific backend",                  cli_parse_disable_dyncookie_backend, NULL },
 	{ { "show", "errors", NULL },                       "show errors [<px>] [request|response]   : report last request and/or response errors for each proxy",      cli_parse_show_errors, cli_io_handler_show_errors, NULL },

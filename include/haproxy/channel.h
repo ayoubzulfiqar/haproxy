@@ -376,6 +376,7 @@ static inline void channel_add_input(struct channel *chn, unsigned int len)
 		c_adv(chn, fwd);
 	}
 	/* notify that some data was read */
+	chn_prod(chn)->bytes_in += len;
 	chn->flags |= CF_READ_EVENT;
 }
 
@@ -421,7 +422,7 @@ static inline int channel_is_rewritable(const struct channel *chn)
  */
 static inline int channel_may_send(const struct channel *chn)
 {
-	return chn_cons(chn)->state == SC_ST_EST;
+	return chn_cons(chn)->state >= SC_ST_REQ;
 }
 
 /* HTX version of channel_may_recv(). Returns non-zero if the channel can still
@@ -787,8 +788,12 @@ static inline int channel_recv_max(const struct channel *chn)
  */
 static inline size_t channel_data_limit(const struct channel *chn)
 {
-	size_t max = (global.tune.bufsize - global.tune.maxrewrite);
 
+	size_t max;
+
+	if (!c_size(chn))
+		return 0;
+	max = (c_size(chn) - global.tune.maxrewrite);
 	if (IS_HTX_STRM(chn_strm(chn)))
 		max -= HTX_BUF_OVERHEAD;
 	return max;
@@ -803,18 +808,12 @@ static inline size_t channel_data(const struct channel *chn)
 	return (IS_HTX_STRM(chn_strm(chn)) ? htx_used_space(htxbuf(&chn->buf)) : c_data(chn));
 }
 
-/* Returns the amount of input data in a channel, taking he HTX streams into
+/* Returns the amount of input data in a channel, taking the HTX streams into
  * account. This function relies on channel_data().
  */
 static inline size_t channel_input_data(const struct channel *chn)
 {
 	return channel_data(chn) - co_data(chn);
-}
-
-/* Returns 1 if the channel is empty, taking he HTX streams into account */
-static inline size_t channel_empty(const struct channel *chn)
-{
-	return (IS_HTX_STRM(chn) ? htx_is_empty(htxbuf(&chn->buf)) : c_empty(chn));
 }
 
 /* Check channel's last_read date against the idle timeer to verify the producer
@@ -856,7 +855,7 @@ static inline void channel_check_xfer(struct channel *chn, size_t xferred)
 			chn->flags &= ~(CF_STREAMER | CF_STREAMER_FAST);
 		}
 		else if (chn->xfer_small >= 2) {
-			/* if the buffer has been at least half full twchne,
+			/* if the buffer has been at least half full times,
 			 * we receive faster than we send, so at least it
 			 * is not a "fast streamer".
 			 */

@@ -24,9 +24,9 @@
  *   - if p->node.node.leaf_p is NULL, the element is unlinked,
  *     otherwise it necessarily belongs to one of the other lists ; this may
  *     not be atomically checked under threads though ;
- *   - pendconn->px is never NULL if pendconn->list is not empty
- *   - pendconn->srv is never NULL if pendconn->list is in the server's queue,
- *     and is always NULL if pendconn->list is in the backend's queue or empty.
+ *   - pendconn->queue->px is never NULL if pendconn->node.node.leaf_p is not NULL
+ *   - pendconn->queue->sv is never NULL if pendconn is in the server's queue,
+ *     and is always NULL if it is in the proxy's queue or unlinked.
  *   - pendconn->target is NULL while the element is queued, and points to the
  *     assigned server when the pendconn is picked.
  *
@@ -44,7 +44,7 @@
  *   - a pendconn_add() is only performed by the stream which will own the
  *     pendconn ; the pendconn is allocated at this moment and returned ; it is
  *     added to either the server or the proxy's queue while holding this
-s *     queue's lock.
+ *     queue's lock.
  *
  *   - the pendconn is then met by a thread walking over the proxy or server's
  *     queue with the respective lock held. This lock is exclusive and the
@@ -59,7 +59,7 @@ s *     queue's lock.
  *     on the queue the pendconn is attached to.
  *
  *   - no single operation except the pendconn initialisation prior to the
- *     insertion are performed without eithre a queue lock held or the element
+ *     insertion are performed without either a queue lock held or the element
  *     being unlinked and visible exclusively to its stream.
  *
  *   - pendconn_process_next_strm() assign ->target so that the stream knows
@@ -105,11 +105,8 @@ unsigned int srv_dynamic_maxconn(const struct server *s)
 {
 	unsigned int max;
 
-	if (s->proxy->beconn >= s->proxy->fullconn)
-		/* no fullconn or proxy is full */
-		max = s->maxconn;
-	else if (s->minconn == s->maxconn)
-		/* static limit */
+	if (s->minconn == s->maxconn || s->proxy->beconn >= s->proxy->fullconn)
+		/* static limit, or no fullconn or proxy is full */
 		max = s->maxconn;
 	else max = MAX(s->minconn,
 		       s->proxy->beconn * s->maxconn / s->proxy->fullconn);
@@ -129,7 +126,8 @@ unsigned int srv_dynamic_maxconn(const struct server *s)
  * up to the caller to atomically decrement the pending counts.
  *
  * The caller must own the lock on the server queue. The pendconn must still be
- * queued (p->node.leaf_p != NULL) and must be in a server (p->srv != NULL).
+ * queued (p->node.node.leaf_p != NULL) and must be in a server queue
+ * (p->queue->sv != NULL).
  */
 static void __pendconn_unlink_srv(struct pendconn *p)
 {
@@ -142,7 +140,8 @@ static void __pendconn_unlink_srv(struct pendconn *p)
  * up to the caller to atomically decrement the pending counts.
  *
  * The caller must own the lock on the proxy queue. The pendconn must still be
- * queued (p->node.leaf_p != NULL) and must be in the proxy (p->srv == NULL).
+ * queued (p->node.node.leaf_p != NULL) and must be in the proxy queue
+ * (p->queue->sv == NULL).
  */
 static void __pendconn_unlink_prx(struct pendconn *p)
 {
@@ -150,18 +149,18 @@ static void __pendconn_unlink_prx(struct pendconn *p)
 	eb32_delete(&p->node);
 }
 
-/* Locks the queue the pendconn element belongs to. This relies on both p->px
- * and p->srv to be properly initialized (which is always the case once the
- * element has been added).
+/* Locks the queue the pendconn element belongs to. This relies on p->queue
+ * being properly initialized (which is always the case once the element
+ * has been added).
  */
 static inline void pendconn_queue_lock(struct pendconn *p)
 {
 	HA_SPIN_LOCK(QUEUE_LOCK, &p->queue->lock);
 }
 
-/* Unlocks the queue the pendconn element belongs to. This relies on both p->px
- * and p->srv to be properly initialized (which is always the case once the
- * element has been added).
+/* Unlocks the queue the pendconn element belongs to. This relies on p->queue
+ * being properly initialized (which is always the case once the element
+ * has been added).
  */
 static inline void pendconn_queue_unlock(struct pendconn *p)
 {
@@ -386,11 +385,23 @@ int process_srv_queue(struct server *s)
 {
 	struct server *ref = s->track ? s->track : s;
 	struct proxy  *p = s->proxy;
-	uint64_t non_empty_tgids = all_tgroups_mask;
+	long non_empty_tgids[(global.nbtgroups / LONGBITS) + 1];
 	int maxconn;
 	int done = 0;
 	int px_ok;
 	int cur_tgrp;
+	int i = global.nbtgroups;
+	int curgrpnb = i;
+
+
+	while (i >= LONGBITS) {
+		non_empty_tgids[(global.nbtgroups - i) / LONGBITS] = ULONG_MAX;
+		i -= LONGBITS;
+	}
+	while (i > 0) {
+		ha_bit_set(global.nbtgroups - i, non_empty_tgids);
+		i--;
+	}
 
 	/* if a server is not usable or backup and must not be used
 	 * to dequeue backend requests.
@@ -420,7 +431,7 @@ int process_srv_queue(struct server *s)
 	 * to our thread group, then we'll get one from a different one, to
 	 * be sure those actually get processed too.
 	 */
-	while (non_empty_tgids != 0
+	while (curgrpnb != 0
 	       && (done < global.tune.maxpollevents || !s->served) &&
 	       s->served < (maxconn = srv_dynamic_maxconn(s))) {
 	       int self_served;
@@ -431,8 +442,8 @@ int process_srv_queue(struct server *s)
 		* from our own thread-group queue.
 		*/
 	       self_served = _HA_ATOMIC_LOAD(&s->per_tgrp[tgid - 1].self_served) % (MAX_SELF_USE_QUEUE + 1);
-	       if ((self_served == MAX_SELF_USE_QUEUE && non_empty_tgids != (1UL << (tgid - 1))) ||
-		    !(non_empty_tgids & (1UL << (tgid - 1)))) {
+	       if ((self_served == MAX_SELF_USE_QUEUE && (curgrpnb > 1 || !ha_bit_test(tgid - 1, non_empty_tgids))) ||
+		    !ha_bit_test(tgid - 1, non_empty_tgids)) {
 			unsigned int old_served, new_served;
 
 			/*
@@ -452,7 +463,7 @@ int process_srv_queue(struct server *s)
 				 */
 				while (new_served == tgid ||
 				       new_served == global.nbtgroups + 1 ||
-				       !(non_empty_tgids & (1UL << (new_served - 1)))) {
+				       !ha_bit_test(new_served - 1, non_empty_tgids)) {
 					if (new_served == global.nbtgroups + 1)
 						new_served = 1;
 					else
@@ -468,7 +479,8 @@ int process_srv_queue(struct server *s)
 			to_dequeue = MAX_SELF_USE_QUEUE - self_served;
 		}
 		if (HA_ATOMIC_XCHG(&s->per_tgrp[cur_tgrp - 1].dequeuing, 1)) {
-			non_empty_tgids &= ~(1UL << (cur_tgrp - 1));
+			ha_bit_clr(cur_tgrp - 1, non_empty_tgids);
+			curgrpnb--;
 			continue;
 		}
 
@@ -479,7 +491,8 @@ int process_srv_queue(struct server *s)
 			 * the served field, only if it is < maxconn.
 			 */
 			if (!pendconn_process_next_strm(s, p, px_ok, cur_tgrp)) {
-				non_empty_tgids &= ~(1UL << (cur_tgrp - 1));
+				ha_bit_clr(cur_tgrp - 1, non_empty_tgids);
+				curgrpnb--;
 				break;
 			}
 			to_dequeue--;
@@ -497,8 +510,8 @@ int process_srv_queue(struct server *s)
 		_HA_ATOMIC_SUB(&p->totpend, done);
 		_HA_ATOMIC_ADD(&p->served, done);
 		__ha_barrier_atomic_store();
-		if (p->lbprm.server_take_conn)
-			p->lbprm.server_take_conn(s);
+		if (p->lbprm.ops && p->lbprm.ops->server_take_conn)
+			p->lbprm.ops->server_take_conn(s);
 	}
 	if (s->served == 0 && p->served == 0 && !HA_ATOMIC_LOAD(&p->ready_srv)) {
 		int i;

@@ -31,7 +31,7 @@
 ullong _freq_ctr_total_from_values(uint period, int pend, uint tick, ullong past, ullong curr);
 ullong freq_ctr_total(const struct freq_ctr *ctr, uint period, int pend);
 ullong freq_ctr_total_estimate(const struct freq_ctr *ctr, uint period, int pend);
-int freq_ctr_overshoot_period(const struct freq_ctr *ctr, uint period, uint freq);
+uint freq_ctr_overshoot_period(const struct freq_ctr *ctr, uint period, uint freq);
 uint update_freq_ctr_period_slow(struct freq_ctr *ctr, uint period, uint inc);
 
 /* Only usable during single threaded startup phase. */
@@ -400,6 +400,25 @@ static inline uint swrate_add_scaled_opportunistic(uint *sum, uint n, uint v, ui
 	old_sum = *sum;
 	new_sum = old_sum + v * s - div64_32((unsigned long long)old_sum * s + n - 1, n);
 	HA_ATOMIC_CAS(sum, &old_sum, new_sum);
+	return new_sum;
+}
+
+/* Like swrate_add() except that if <v> is beyond the current average, the
+ * average is replaced by the peak. This is essentially used to measure peak
+ * loads in the scheduler, reason why it is provided as a local variant that
+ * does not involve atomic operations.
+ */
+static inline uint swrate_add_peak_local(uint *sum, uint n, uint v)
+{
+	uint old_sum, new_sum;
+
+	old_sum = *sum;
+	if (v * n > old_sum)
+		new_sum = v * n;
+	else
+		new_sum = old_sum - (old_sum + n - 1) / n + v;
+
+	*sum = new_sum;
 	return new_sum;
 }
 

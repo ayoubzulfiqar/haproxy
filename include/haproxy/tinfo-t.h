@@ -42,7 +42,7 @@ struct thread_set {
 		ulong abs[(MAX_THREADS + LONGBITS - 1) / LONGBITS];
 		ulong rel[MAX_TGROUPS];
 	};
-	ulong grps; /* bit field of all non-empty groups, 0 for abs */
+	ulong nbgrps; /* Number of thread groups, 0 for abs */
 };
 
 /* tasklet classes */
@@ -69,9 +69,46 @@ enum {
 #define TH_FL_IN_DBG_HANDLER    0x00000100  /* thread currently in the debug signal handler */
 #define TH_FL_IN_WDT_HANDLER    0x00000200  /* thread currently in the wdt signal handler */
 #define TH_FL_IN_ANY_HANDLER    0x00000380  /* mask to test if the thread is in any signal handler */
+#define TH_FL_TASK_PROFILING_L  0x00000400  /* task profiling in locks (also requires TASK_PROFILING) */
+#define TH_FL_TASK_PROFILING_M  0x00000800  /* task profiling in mem alloc (also requires TASK_PROFILING) */
 
 /* we have 4 buffer-wait queues, in highest to lowest emergency order */
 #define DYNBUF_NBQ              4
+
+/* execution context, for tracing resource usage or warning origins */
+enum thread_exec_ctx_type {
+	TH_EX_CTX_NONE = 0,                 /* context not filled */
+	TH_EX_CTX_OTHER,                    /* context only known by a generic pointer */
+	TH_EX_CTX_INITCALL,                 /* the pointer is an initcall providing file:line */
+	TH_EX_CTX_CALLER,                   /* the pointer is an ha_caller of the caller providing file:line etc */
+	TH_EX_CTX_SMPF,                     /* directly registered sample fetch function, using .smpf_kwl */
+	TH_EX_CTX_CONV,                     /* directly registered converter function, using .conv_kwl */
+	TH_EX_CTX_FUNC,                     /* hopefully recognizable function/callback, using .pointer */
+	TH_EX_CTX_ACTION,                   /* directly registered action function, using .action_kwl */
+	TH_EX_CTX_FLT,                      /* filter whose config is in .flt_conf */
+	TH_EX_CTX_MUX,                      /* mux whose mux_ops is in .mux_ops */
+	TH_EX_CTX_TASK,                     /* task or tasklet whose function is in .task */
+	TH_EX_CTX_APPLET,                   /* applet whose applet is in .applet */
+	TH_EX_CTX_CLI_KWL,                  /* CLI keyword list, using .cli_kwl */
+};
+
+struct thread_exec_ctx {
+	enum thread_exec_ctx_type type;
+	/* 32-bit hole here on 64-bit platforms */
+	union {
+		const void *pointer;        /* generic pointer (for other) */
+		const struct initcall *initcall;  /* used with TH_EX_CTX_INITCALL */
+		const struct ha_caller *ha_caller;  /* used with TH_EX_CTX_CALLER */
+		const struct sample_fetch_kw_list *smpf_kwl; /* used with TH_EX_CTX_SMPF */
+		const struct sample_conv_kw_list *conv_kwl;  /* used with TH_EX_CTX_CONV */
+		const struct action_kw_list *action_kwl;  /* used with TH_EX_CTX_ACTION */
+		const struct flt_conf *flt_conf;  /* used with TH_EX_CTX_FLTCONF */
+		const struct mux_ops *mux_ops;  /* used with TH_EX_CTX_MUX */
+		const struct task *(*task)(struct task *, void *, unsigned int); /* used with TH_EX_CTX_TASK */
+		const struct applet *applet;  /* used with TH_EX_CTX_APPLET */
+		const struct cli_kw_list *cli_kwl; /* used with TH_EX_CTX_CLI_KWL */
+	};
+};
 
 /* Thread group information. This defines a base and a count of global thread
  * IDs which belong to it, and which can be looked up into thread_info/ctx. It
@@ -83,10 +120,11 @@ struct tgroup_info {
 	uint base;                 /* first thread in this group */
 	uint count;                /* number of threads in this group */
 	ulong tgid_bit;            /* bit corresponding to the tgroup ID */
+	void *(*start)(void *);    /* startup function common to all threads */
 
 	/* pad to cache line (64B) */
 	char __pad[0];            /* unused except to check remaining room */
-	char __end[0] __attribute__((aligned(64)));
+	char __end[0] THREAD_ALIGNED();
 };
 
 /* This structure describes the group-specific context (e.g. active threads
@@ -100,10 +138,11 @@ struct tgroup_ctx {
 	struct eb_root timers;            /* wait queue (sorted timers tree, global, accessed under wq_lock) */
 
 	uint niced_tasks;                 /* number of niced tasks in this group's run queues */
+	uint committed_extra_streams;     /* sum of extra front streams committed by muxes in this group */
 
 	/* pad to cache line (64B) */
 	char __pad[0];                    /* unused except to check remaining room */
-	char __end[0] __attribute__((aligned(64)));
+	char __end[0] THREAD_ALIGNED();
 };
 
 /* This structure describes all the per-thread info we need. When threads are
@@ -124,7 +163,7 @@ struct thread_info {
 
 	/* pad to cache line (64B) */
 	char __pad[0];                    /* unused except to check remaining room */
-	char __end[0] __attribute__((aligned(64)));
+	char __end[0] THREAD_ALIGNED();
 };
 
 /* This structure describes all the per-thread context we need. This is
@@ -150,7 +189,8 @@ struct thread_ctx {
 	struct list buffer_wq[DYNBUF_NBQ];  /* buffer waiters, 4 criticality-based queues */
 	struct list pool_lru_head;          /* oldest objects in thread-local pool caches */
 	struct list streams;                /* list of streams attached to this thread */
-	struct list quic_conns;             /* list of active quic-conns attached to this thread */
+	struct list quic_conns_fe;          /* list of active FE quic-conns attached to this thread */
+	struct list quic_conns_be;          /* list of active BE quic-conns attached to this thread */
 	struct list quic_conns_clo;         /* list of closing quic-conns attached to this thread */
 	struct list queued_checks;          /* checks waiting for a connection slot */
 	struct list tasklets[TL_CLASSES];   /* tasklets (and/or tasks) to run, by class */
@@ -169,8 +209,7 @@ struct thread_ctx {
 	uint64_t curr_mono_time;            /* latest system wide monotonic time (leaving poll) */
 
 	ulong lock_history;                 /* history of used locks, see thread.h for more details */
-
-	/* around 56 unused bytes here */
+	struct thread_exec_ctx exec_ctx;    /* current execution context when known, or NULL */
 
 	// fourth cache line here on 64 bits: accessed mostly using atomic ops
 	ALWAYS_ALIGN(64);
@@ -196,6 +235,7 @@ struct thread_ctx {
 	struct buffer *last_dump_buffer;        /* Copy of last buffer used for a dump; may be NULL or invalid; for post-mortem only */
 	unsigned long long total_streams;       /* Total number of streams created on this thread */
 	unsigned int stream_cnt;                /* Number of streams attached to this thread */
+	unsigned int rq_tot_peak;               /* total run queue size last call */
 
 	// around 68 bytes here for shared variables
 

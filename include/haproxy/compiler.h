@@ -31,6 +31,23 @@
 #include <stdlib.h>
 #endif
 
+/* DEFVAL() returns either the second argument as-is, or <def> if absent. This
+ * is for use in macros arguments.
+ */
+#define DEFVAL(_def,...) _FIRST_ARG(NULL, ##__VA_ARGS__, (_def))
+
+/* DEFNULL() returns either the argument as-is, or NULL if absent. This is for
+ * use in macros arguments.
+ */
+#define DEFNULL(...) DEFVAL(NULL, ##__VA_ARGS__)
+
+/* DEFZERO() returns either the argument as-is, or 0 if absent. This is for
+ * use in macros arguments.
+ */
+#define DEFZERO(...) DEFVAL(0, ##__VA_ARGS__)
+
+#define _FIRST_ARG(a, b, ...) b
+
 /*
  * Gcc before 3.0 needs [0] to declare a variable-size array
  */
@@ -415,6 +432,13 @@
  * for multi_threading, see THREAD_PAD() below.                              *
 \*****************************************************************************/
 
+/* Cache line size for alignment purposes. This value is incorrect for some
+ * Apple CPUs which have 128 bytes cache lines.
+ */
+#ifndef CACHELINE_SIZE
+#define CACHELINE_SIZE 64
+#endif
+
 /* sets alignment for current field or variable */
 #ifndef ALIGNED
 #define ALIGNED(x) __attribute__((aligned(x)))
@@ -438,12 +462,12 @@
 #endif
 #endif
 
-/* sets alignment for current field or variable only when threads are enabled.
- * Typically used to respect cache line alignment to avoid false sharing.
+/* Sets alignment for current field or variable only when threads are enabled.
+ * When no parameters are provided, we align to the cache line size.
  */
 #ifndef THREAD_ALIGNED
 #ifdef USE_THREAD
-#define THREAD_ALIGNED(x) __attribute__((aligned(x)))
+#define THREAD_ALIGNED(...) ALIGNED(DEFVAL(CACHELINE_SIZE, ##__VA_ARGS__))
 #else
 #define THREAD_ALIGNED(x)
 #endif
@@ -476,13 +500,12 @@
 #endif
 #endif
 
-/* add an optional alignment for next fields in a structure, only when threads
- * are enabled. Typically used to respect cache line alignment to avoid false
- * sharing.
+/* Add an optional alignment for next fields in a structure, only when threads
+ * are enabled. When no parameters are provided, we align to the cache line size.
  */
 #ifndef THREAD_ALIGN
 #ifdef USE_THREAD
-#define THREAD_ALIGN(x) union { } ALIGNED(x)
+#define THREAD_ALIGN(...) union { } ALIGNED(DEFVAL(CACHELINE_SIZE, ##__VA_ARGS__))
 #else
 #define THREAD_ALIGN(x)
 #endif
@@ -507,7 +530,7 @@
 /* add mandatory padding of the specified size between fields in a structure,
  * This is used to avoid false sharing of cache lines for dynamically allocated
  * structures which cannot guarantee alignment, or to ensure that the size of
- * the struct remains consistent on architectures with different aligment
+ * the struct remains consistent on architectures with different alignment
  * constraints
  */
 #ifndef ALWAYS_PAD
@@ -560,10 +583,12 @@
  * for such array declarations. But it's not the case for clang and other
  * compilers.
  */
-#if __has_attribute(nonstring)
-#define __nonstring __attribute__ ((nonstring))
-#else
-#define __nonstring
+#ifndef __nonstring
+#  if __has_attribute(nonstring)
+#    define __nonstring __attribute__ ((nonstring))
+#  else
+#    define __nonstring
+#  endif
 #endif
 
 #endif /* _HAPROXY_COMPILER_H */

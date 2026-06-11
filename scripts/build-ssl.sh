@@ -156,7 +156,7 @@ build_aws_lc () {
            mkdir -p build
            cd build
            cmake -version
-           cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=1 -DDISABLE_GO=1 -DDISABLE_PERL=1 \
+           cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_SHARED_LIBS=1 -DDISABLE_GO=1 -DDISABLE_PERL=1 \
                  -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH=${BUILDSSL_DESTDIR}/lib \
                  -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=${BUILDSSL_DESTDIR} ..
            make -j$(nproc)
@@ -184,7 +184,7 @@ build_aws_lc_fips () {
            mkdir -p build
            cd build
            cmake -version
-           cmake -DCMAKE_BUILD_TYPE=Release -DFIPS=1 -DBUILD_SHARED_LIBS=1 \
+           cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFIPS=1 -DBUILD_SHARED_LIBS=1 \
                  -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH=${BUILDSSL_DESTDIR}/lib \
                  -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=${BUILDSSL_DESTDIR} ..
            make -j$(nproc)
@@ -196,10 +196,11 @@ build_aws_lc_fips () {
 
 download_quictls () {
     if [ ! -d "${BUILDSSL_TMPDIR}/quictls" ]; then
-        git clone --depth=1 ${QUICTLS_URL} ${BUILDSSL_TMPDIR}/quictls
+        git clone -b "${QUICTLS_VERSION}" --depth=1 ${QUICTLS_URL} ${BUILDSSL_TMPDIR}/quictls
     else
        (
         cd ${BUILDSSL_TMPDIR}/quictls
+        git checkout "${QUICTLS_VERSION}" || exit 1
         git pull
        )
     fi
@@ -221,7 +222,11 @@ build_quictls () {
         cp -r include/* ${BUILDSSL_DESTDIR}/include
     else
         ./config shared no-tests ${QUICTLS_EXTRA_ARGS:-} --prefix="${BUILDSSL_DESTDIR}" --openssldir="${BUILDSSL_DESTDIR}" --libdir=lib -DPURIFY
-        make -j$(nproc) build_sw
+        if [ -z "${QUICTLS_VERSION##OpenSSL_1_1_1*}" ]; then
+            make all
+        else
+            make -j$(nproc) build_sw
+        fi
         make install_sw
     fi
 }
@@ -287,7 +292,7 @@ if [ ! -z ${AWS_LC_FIPS_VERSION+x} ]; then
 	build_aws_lc_fips
 fi
 
-if [ ! -z ${QUICTLS+x} ]; then
+if [ ! -z ${QUICTLS_VERSION+x} ]; then
         download_quictls
         build_quictls
 fi

@@ -11,7 +11,7 @@ default init, this was controversial but fedora and archlinux already uses it.
 At this time HAProxy still had a multi-process model, and the way haproxy is
 working was incompatible with the daemon mode.
 
-Systemd is compatible with traditionnal forking services, but somehow HAProxy
+Systemd is compatible with traditional forking services, but somehow HAProxy
 is different. To work correctly, systemd needs a main PID, this is the PID of
 the process that systemd will supervises.
 
@@ -45,7 +45,7 @@ However the wrapper suffered from several problems:
 
 ### mworker V1
 
-HAProxy 1.8 got ride of the wrapper which was replaced by the master worker
+HAProxy 1.8 got rid of the wrapper which was replaced by the master worker
 mode. This first version was basically a reintegration of the wrapper features
 within HAProxy. HAProxy is launched with the -W flag, read the configuration and
 then fork. In mworker mode, the master is usually launched as a root process,
@@ -86,7 +86,7 @@ retrieved automatically.
 The master is supervising the workers, when a current worker (not a previous one
 from before the reload) is exiting without being asked for a reload, the master
 will emit an "exit-on-failure" error and will kill every workers with a SIGTERM
-and exits with the same error code than the failed master, this behavior can be
+and exits with the same error code than the failed worker, this behavior can be
 changed by using the "no exit-on-failure" option in the global section.
 
 While the master is supervising the workers using the wait() function, the
@@ -186,8 +186,8 @@ number that can be found in HAPROXY_PROCESSES. With this change the stats socket
 in the configuration is less useful and everything can be done from the master
 CLI.
 
-With 2.7, the reload mecanism of the master CLI evolved, with previous versions,
-this mecanism was asynchronous, so once the `reload` command was received, the
+With 2.7, the reload mechanism of the master CLI evolved, with previous versions,
+this mechanism was asynchronous, so once the `reload` command was received, the
 master would reload, the active master CLI connection was closed, and there was
 no way to return a status as a response to the `reload` command. To achieve a
 synchronous reload, a dedicated sockpair is used, one side uses a master CLI
@@ -208,3 +208,38 @@ starts with -st to achieve a hard stop on the previous worker.
 Version 3.0 got rid of the libsystemd dependencies for sd_notify() after the
 events of xz/openssh, the function is now implemented directly in haproxy in
 src/systemd.c.
+
+### mworker V3
+
+This version was implemented with HAProxy 3.1, the goal was to stop parsing and
+applying the configuration in the master process.
+
+One of the caveats of the previous implementation was that the parser could take
+a lot of time, and the master process would be stuck in the parser instead of
+handling its polling loop, signals etc. Some parts of the configuration parsing
+could also be less reliable with third-party code (EXTRA_OBJS), it could, for
+example, allow opening FDs and not closing them before the reload which
+would crash the master after a few reloads.
+
+The startup of the master-worker was reorganized this way:
+
+- the "discovery" mode, which is a lighter configuration parsing step, only
+  applies the configuration which need to be effective for the master process.
+  For example, "master-worker", "mworker-max-reloads" and less than 20 other
+  keywords that are identified by KWF_DISCOVERY in the code. It is really fast
+  as it don't need all the configuration to be applied in the master process.
+
+- the master will then fork a worker, with a PROC_O_INIT flag. This worker has
+  a temporary sockpair connected to the master CLI. Once the worker is forked,
+  the master initializes its configuration and starts its polling loop.
+
+- The newly forked worker will try to parse the configuration, which could
+  result in a failure (exit 1), or any bad error code. In case of success, the
+  worker will send a "READY" message to the master CLI then close this FD. At
+  this step everything was initialized and the worker can enter its polling
+  loop.
+
+- The master then waits for the worker, it could:
+   * receive the READY message over the mCLI, resulting in a successful loading
+     of haproxy
+   * receive a SIGCHLD, meaning the worker exited and couldn't load

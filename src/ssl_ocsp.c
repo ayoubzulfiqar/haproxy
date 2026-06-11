@@ -290,6 +290,8 @@ int ssl_sock_load_ocsp_response(struct buffer *ocsp_response,
 	int ret = 1;
 #ifdef HAVE_ASN1_TIME_TO_TM
 	struct tm nextupd_tm = {0};
+#else
+	long expire = 0;
 #endif
 
 	resp = d2i_OCSP_RESPONSE(NULL, (const unsigned char **)&p,
@@ -391,11 +393,12 @@ int ssl_sock_load_ocsp_response(struct buffer *ocsp_response,
 	}
 	ocsp->expire = my_timegm(&nextupd_tm) - OCSP_MAX_RESPONSE_TIME_SKEW;
 #else
-	ocsp->expire = asn1_generalizedtime_to_epoch(nextupd) - OCSP_MAX_RESPONSE_TIME_SKEW;
-	if (ocsp->expire < 0) {
+	expire = asn1_generalizedtime_to_epoch(nextupd) - OCSP_MAX_RESPONSE_TIME_SKEW;
+	if (expire < 0) {
 		memprintf(err, "OCSP single response: Invalid \"Next Update\" time");
 		goto out;
 	}
+	ocsp->expire = expire;
 #endif
 
 	if (ocsp->expire < date.tv_sec) {
@@ -1510,6 +1513,9 @@ static int cli_parse_update_ocsp_response(char **args, char *payload, struct app
 	unsigned char key[OCSP_MAX_CERTID_ASN1_LENGTH] = {};
 	unsigned char *p;
 
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
 	if (!*args[3]) {
 		memprintf(&err, "'update ssl ocsp-response' expects a filename\n");
 		return cli_dynerr(appctx, err);
@@ -1590,6 +1596,9 @@ static int cli_parse_set_ocspresponse(char **args, char *payload, struct appctx 
 	char *err = NULL;
 	int i, j, ret;
 
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
 	if (!payload)
 		payload = args[3];
 
@@ -1630,9 +1639,11 @@ static int cli_parse_set_ocspresponse(char **args, char *payload, struct appctx 
 static int cli_parse_show_ocspresponse(char **args, char *payload, struct appctx *appctx, void *private)
 {
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-
 	struct show_ocspresp_cli_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	int arg_idx = 3;
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
 
 	if (*args[3]) {
 		struct certificate_ocsp *ocsp = NULL;
@@ -1816,6 +1827,9 @@ static int cli_parse_show_ocsp_updates(char **args, char *payload, struct appctx
 {
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
 	struct show_ocsp_updates_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
 
 	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
 

@@ -66,7 +66,7 @@ struct counters_shared {
 	COUNTERS_SHARED;
 	struct {
 		COUNTERS_SHARED_TG;
-	} *tg[MAX_TGROUPS];
+	} **tg;
 };
 
 /*
@@ -101,7 +101,7 @@ struct fe_counters_shared_tg {
 
 struct fe_counters_shared {
 	COUNTERS_SHARED;
-	struct fe_counters_shared_tg *tg[MAX_TGROUPS];
+	struct fe_counters_shared_tg **tg;
 };
 
 /* counters used by listeners and frontends */
@@ -160,7 +160,7 @@ struct be_counters_shared_tg {
 
 struct be_counters_shared {
 	COUNTERS_SHARED;
-	struct be_counters_shared_tg *tg[MAX_TGROUPS];
+	struct be_counters_shared_tg **tg;
 };
 
 /* counters used by servers and backends */
@@ -184,6 +184,29 @@ struct be_counters {
 		} http;
 	} p;                                    /* protocol-specific stats */
 };
+
+/* extra counters that are registered at boot by various modules */
+enum counters_type {
+	COUNTERS_FE = 0,
+	COUNTERS_BE,
+	COUNTERS_SV,
+	COUNTERS_LI,
+	COUNTERS_RSLV,
+
+	COUNTERS_OFF_END /* must always be last */
+};
+
+struct extra_counters {
+	char **datap; /* points to pointer to heap containing counters allocated in a linear fashion */
+	size_t size; /* size of allocated data */
+	size_t tgrp_step; /* distance in words between two datap for consecutive tgroups, 0 for single */
+	uint nbtgrp;  /* number of thread groups accessing these counters */
+	enum counters_type type; /* type of object containing the counters */
+};
+
+
+#define EXTRA_COUNTERS(name) \
+	struct extra_counters *name
 
 #endif /* _HAPROXY_COUNTERS_T_H */
 

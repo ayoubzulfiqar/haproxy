@@ -37,7 +37,7 @@ static void ssl_sock_switchctx_set(SSL *ssl, SSL_CTX *ctx)
  *
  * This function does a lookup in the bind_conf sni tree so the caller should lock its tree.
  */
-struct sni_ctx *ssl_sock_chose_sni_ctx(struct bind_conf *s, struct connection *conn,
+struct sni_ctx *ssl_sock_choose_sni_ctx(struct bind_conf *s, struct connection *conn,
                                        const char *servername, int have_rsa_sig, int have_ecdsa_sig)
 {
 	struct ebmb_node *node, *n, *node_ecdsa = NULL, *node_rsa = NULL, *node_anonymous = NULL;
@@ -194,7 +194,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 		                               &extension_data, &extension_len))
 #endif
 		{
-			/* This is not redundant. It we only return 0 without setting
+			/* This is not redundant. If we only return 0 without setting
 			 * <*al>, this has as side effect to generate another TLS alert
 			 * which would be set after calling quic_set_tls_alert().
 			 */
@@ -349,7 +349,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 	if ((TRACE_SOURCE)->verbosity >= SSL_VERB_ADVANCED) {
 		if (TRACE_ENABLED(TRACE_LEVEL_DATA, SSL_EV_CONN_CIPHERS_EXT, conn, 0, 0, 0)) {
 			const uint8_t *cipher_suites;
-			size_t len;
+			size_t __maybe_unused len;
 
 #if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 			len = ctx->cipher_suites_len;
@@ -444,13 +444,14 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 	}
 
 sni_lookup:
-	/* we need to transform this a NULL-ended string in lowecase */
+	/* we need to transform this into a NULL-terminated string in lowercase */
 	for (i = 0; i < trash.size && i < servername_len; i++)
 		trash.area[i] = tolower((unsigned char)servername[i]);
 	trash.area[i] = 0;
+	servername = trash.area;
 
 	HA_RWLOCK_RDLOCK(SNI_LOCK, &s->sni_lock);
-	sni_ctx = ssl_sock_chose_sni_ctx(s, conn, trash.area, has_rsa_sig, has_ecdsa_sig);
+	sni_ctx = ssl_sock_choose_sni_ctx(s, conn, trash.area, has_rsa_sig, has_ecdsa_sig);
 	if (sni_ctx) {
 		/* switch ctx */
 		struct ssl_bind_conf *conf = sni_ctx->conf;
@@ -506,7 +507,8 @@ sni_lookup:
 	/* abort handshake (was SSL_TLSEXT_ERR_ALERT_FATAL) */
 	if (conn)
 		conn->err_code = CO_ER_SSL_HANDSHAKE;
-	TRACE_ERROR("No suitable SSL context found", SSL_EV_CONN_SWITCHCTX_CB|SSL_EV_CONN_ERR, conn, ssl, &conn->err_code);
+	TRACE_ERROR("No suitable SSL context found", SSL_EV_CONN_SWITCHCTX_CB|SSL_EV_CONN_ERR,
+	            conn, ssl, conn ? &conn->err_code : NULL);
 #if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 	return ssl_select_cert_error;
 #else
@@ -555,7 +557,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv)
 		/* Look for the QUIC transport parameters. */
 		SSL_get_peer_quic_transport_params(ssl, &extension_data, &extension_len);
 		if (extension_len == 0) {
-			/* This is not redundant. It we only return 0 without setting
+			/* This is not redundant. If we only return 0 without setting
 			 * <*al>, this has as side effect to generate another TLS alert
 			 * which would be set after calling quic_set_tls_alert().
 			 */
@@ -659,8 +661,8 @@ sni_lookup:
 #endif /* (!) OPENSSL_IS_BORINGSSL */
 
 #if defined(USE_OPENSSL_WOLFSSL)
-/* This implement the equivalent of the clientHello Callback but using the cert_cb.
- * WolfSSL is able to extract the sigalgs and ciphers of the client byt using the API
+/* This implements the equivalent of the clientHello Callback but using the cert_cb.
+ * WolfSSL is able to extract the sigalgs and ciphers of the client by using the API
  * provided in https://github.com/wolfSSL/wolfssl/pull/6963
  *
  * Not activated for now since the PR is not merged.
@@ -738,14 +740,14 @@ int ssl_sock_switchctx_wolfSSL_cbk(WOLFSSL* ssl, void* arg)
 
 sni_lookup:
 
-	/* we need to transform this into a NULL-ended string in lowecase */
+	/* we need to transform this into a NULL-terminated string in lowercase */
 	for (i = 0; i < trash.size && servername[i] != '\0'; i++)
 		trash.area[i] = tolower((unsigned char)servername[i]);
 	trash.area[i] = 0;
 	servername = trash.area;
 
 	HA_RWLOCK_RDLOCK(SNI_LOCK, &s->sni_lock);
-	sni_ctx = ssl_sock_chose_sni_ctx(s, conn, servername, has_rsa_sig, has_ecdsa_sig);
+	sni_ctx = ssl_sock_choose_sni_ctx(s, conn, servername, has_rsa_sig, has_ecdsa_sig);
 	if (sni_ctx) {
 		/* switch ctx */
 		struct ssl_bind_conf *conf = sni_ctx->conf;

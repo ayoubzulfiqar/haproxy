@@ -1,23 +1,27 @@
+#include <haproxy/counters.h>
 #include <haproxy/errors.h>
 #include <haproxy/ncbmbuf.h>
 #include <haproxy/proxy.h>
 #include <haproxy/quic_conn.h>
 #include <haproxy/quic_sock.h>
 #include <haproxy/quic_ssl.h>
+#include <haproxy/quic_stats.h>
 #include <haproxy/quic_tls.h>
 #include <haproxy/quic_tp.h>
 #include <haproxy/quic_trace.h>
 #include <haproxy/ssl_sock.h>
-#include <haproxy/stats.h>
 #include <haproxy/trace.h>
+#ifdef USE_ECH
+#include <haproxy/ech.h>
+#endif
 
 DECLARE_TYPED_POOL(pool_head_quic_ssl_sock_ctx, "quic_ssl_sock_ctx", struct ssl_sock_ctx);
-const char *quic_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
+const char *default_quic_ciphersuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
                            ":TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_CCM_SHA256";
 #ifdef HAVE_OPENSSL_QUIC
-const char *quic_groups = "X25519:P-256:P-384:P-521:X25519MLKEM768";
+const char *default_quic_curves = "X25519:P-256:P-384:P-521:X25519MLKEM768";
 #else
-const char *quic_groups = "X25519:P-256:P-384:P-521";
+const char *default_quic_curves = "X25519:P-256:P-384:P-521";
 #endif
 
 
@@ -160,6 +164,28 @@ static int qc_ssl_crypto_data_cpy(struct quic_conn *qc, struct quic_enc_level *q
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_ADDDATA, qc);
 	return ret;
+}
+
+static int ha_quic_send_alert(SSL *ssl, enum ssl_encryption_level_t level, uint8_t alert)
+{
+	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
+
+	TRACE_ENTER(QUIC_EV_CONN_SSLALERT, qc);
+
+	TRACE_PROTO("Received TLS alert", QUIC_EV_CONN_SSLALERT, qc, &alert, &level);
+
+	quic_set_tls_alert(qc, alert);
+	if (qc->conn) {
+		ssl_sock_handle_hs_error(qc->conn);
+		if (objt_server(qc->conn->target) && !qc->conn->mux) {
+			/* This has as side effect to close the connection stream */
+			if (conn_create_mux(qc->conn, NULL) >= 0)
+				CALL_MUX_NO_RET(qc->conn->mux, wake(qc->conn));
+		}
+	}
+
+	TRACE_LEAVE(QUIC_EV_CONN_SSLALERT, qc);
+	return 1;
 }
 
 /* returns 0 on error, 1 on success */
@@ -628,17 +654,7 @@ leave:
  */
 static int ha_quic_ossl_alert(SSL *ssl, unsigned char alert_code, void *arg)
 {
-	int ret = 1, alert = alert_code;
-	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
-
-	TRACE_ENTER(QUIC_EV_CONN_SSLALERT, qc);
-
-	TRACE_PROTO("Received TLS alert", QUIC_EV_CONN_SSLALERT, qc, &alert);
-	quic_set_tls_alert(qc, alert_code);
-
-	TRACE_LEAVE(QUIC_EV_CONN_SSLALERT, qc);
-
-	return ret;
+	return ha_quic_send_alert(ssl, -1, alert_code);
 }
 
 static const OSSL_DISPATCH ha_quic_dispatch[] = {
@@ -694,24 +710,11 @@ static inline int ha_quic_set_write_secret(SSL *ssl, enum ssl_encryption_level_t
 
 static int ha_quic_flush_flight(SSL *ssl)
 {
-	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
+	struct quic_conn __maybe_unused *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
 
 	TRACE_ENTER(QUIC_EV_CONN_FFLIGHT, qc);
 	TRACE_LEAVE(QUIC_EV_CONN_FFLIGHT, qc);
 
-	return 1;
-}
-
-static int ha_quic_send_alert(SSL *ssl, enum ssl_encryption_level_t level, uint8_t alert)
-{
-	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
-
-	TRACE_ENTER(QUIC_EV_CONN_SSLALERT, qc);
-
-	TRACE_PROTO("Received TLS alert", QUIC_EV_CONN_SSLALERT, qc, &alert, &level);
-
-	quic_set_tls_alert(qc, alert);
-	TRACE_LEAVE(QUIC_EV_CONN_SSLALERT, qc);
 	return 1;
 }
 
@@ -742,8 +745,11 @@ static SSL_QUIC_METHOD ha_quic_method = {
  */
 int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 {
-	struct ssl_bind_conf __maybe_unused *ssl_conf_cur;
 	int cfgerr = 0;
+	const char *ciphersuites = bind_conf->ssl_conf.ciphersuites ?
+		bind_conf->ssl_conf.ciphersuites : default_quic_ciphersuites;
+	const char *curves = bind_conf->ssl_conf.curves ?
+		bind_conf->ssl_conf.curves : default_quic_curves;
 
 	long options =
 		(SSL_OP_ALL & ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS) |
@@ -760,7 +766,8 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 	SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 	SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 	SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-	if (SSL_CTX_set_ciphersuites(ctx, quic_ciphers) != 1) {
+	        
+	if (SSL_CTX_set_ciphersuites(ctx, ciphersuites) != 1) {
 		ha_warning("Binding [%s:%d] for %s %s: default QUIC cipher"
 		           " suites setting failed.\n",
 		           bind_conf->file, bind_conf->line,
@@ -769,17 +776,14 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 		cfgerr++;
 	}
 
-#ifndef HAVE_OPENSSL_QUICTLS
-	/* TODO: this should also work with QUICTLS */
-	if (SSL_CTX_set1_groups_list(ctx, quic_groups) != 1) {
+	if (SSL_CTX_set1_curves_list(ctx, curves) != 1) {
 		ha_warning("Binding [%s:%d] for %s %s: default QUIC cipher"
-		           " groups setting failed.\n",
+		           " curves setting failed.\n",
 		           bind_conf->file, bind_conf->line,
 		           proxy_type_str(bind_conf->frontend),
 		           bind_conf->frontend->id);
 		cfgerr++;
 	}
-#endif
 
 	if (bind_conf->ssl_conf.early_data) {
 #if !defined(HAVE_SSL_0RTT_QUIC)
@@ -810,6 +814,20 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 		cfgerr++;
 #endif
 
+#ifdef USE_ECH
+	if (bind_conf->ssl_conf.ech_filedir) {
+		int loaded = 0;
+
+		if (load_echkeys(ctx, bind_conf->ssl_conf.ech_filedir, &loaded) != 1) {
+			cfgerr += 1;
+			ha_alert("Proxy '%s': failed to load ECH key s from %s for '%s' at [%s:%d].\n",
+			         bind_conf->frontend->id, bind_conf->ssl_conf.ech_filedir,
+			         bind_conf->arg, bind_conf->file, bind_conf->line);
+		}
+	}
+#endif
+
+
 	return cfgerr;
 }
 
@@ -826,11 +844,6 @@ SSL_CTX *ssl_quic_srv_new_ssl_ctx(void)
 
 	SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 	SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-	if (SSL_CTX_set_ciphersuites(ctx, quic_ciphers) != 1)
-		goto err;
-
-	if (SSL_CTX_set1_groups_list(ctx, quic_groups) != 1)
-		goto err;
 
 #ifdef USE_QUIC_OPENSSL_COMPAT
 	if (!quic_tls_compat_init(NULL, ctx))
@@ -991,19 +1004,19 @@ int qc_ssl_do_hanshake(struct quic_conn *qc, struct ssl_sock_ctx *ctx)
 
 		/* Check the alpn could be negotiated */
 		if (!qc_is_back(qc)) {
-			if (!qc->app_ops) {
+			if (!qc->alpn) {
 				TRACE_ERROR("No negotiated ALPN", QUIC_EV_CONN_IO_CB, qc, &state);
 				quic_set_tls_alert(qc, SSL_AD_NO_APPLICATION_PROTOCOL);
 				goto err;
 			}
 		}
 		else if (qc->conn) {
-			const unsigned char *alpn;
-			size_t alpn_len;
+			const char *alpn;
+			int alpn_len;
 
 			qc->conn->flags &= ~(CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN);
-			if (!ssl_sock_get_alpn(qc->conn, ctx, (const char **)&alpn, (int *)&alpn_len) ||
-			    !quic_set_app_ops(qc, alpn, alpn_len)) {
+			if (!ssl_sock_get_alpn(qc->conn, ctx, &alpn, &alpn_len) ||
+			    !qc_register_alpn(qc, alpn, alpn_len)) {
 				TRACE_ERROR("No negotiated ALPN", QUIC_EV_CONN_IO_CB, qc, &state);
 				quic_set_tls_alert(qc, SSL_AD_NO_APPLICATION_PROTOCOL);
 				goto err;
@@ -1016,10 +1029,10 @@ int qc_ssl_do_hanshake(struct quic_conn *qc, struct ssl_sock_ctx *ctx)
 				}
 
 				/* Wake up MUX after its creation. Operation similar to TLS+ALPN on TCP stack. */
-				qc->conn->mux->wake(qc->conn);
+				CALL_MUX_NO_RET(qc->conn->mux, wake(qc->conn));
 			}
 			else {
-				/* Wake up upper layer if the MUX is alreay initialized.
+				/* Wake up upper layer if the MUX is already initialized.
 				 * This is the case when the MUX was started for a 0-RTT session
 				 * but without early-data secrets to send them (when the server
 				 * does not support 0-RTT).
@@ -1341,23 +1354,39 @@ int qc_alloc_ssl_sock_ctx(struct quic_conn *qc, void *target)
 		if (!qc_ssl_set_quic_transport_params(ctx->ssl, qc, quic_version_1, 0))
 			goto err;
 
-		if (!(srv->ssl_ctx.options & SRV_SSL_O_EARLY_DATA))
-		    ssl_sock_srv_try_reuse_sess(ctx, srv);
+		ssl_sock_srv_try_reuse_sess(ctx, srv);
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L) && defined(HAVE_SSL_0RTT_QUIC)
-		else {
-			/* Enable early data only if the SSL session, transport parameters
-			 * and application protocol could be reused. This insures the mux is
-			 * correctly selected.
+		if ((srv->ssl_ctx.options & SRV_SSL_O_EARLY_DATA)) {
+			int ret;
+			char *alpn;
+			struct quic_early_transport_params *etps;
+			/* This code is called by connect_server() by way of
+			 * conn_prepare().
+			 * XXX TODO XXX: there is a remaining race condition where
+			 * the negotiated alpn could be reset before running this code
+			 * here. In this case the app_ops for the mux will not be
+			 * set by quic_reuse_srv_params().
+			 *
+			 * Enable the early data only if the transport parameters
+			 * and application protocol could be reused. This insures that
+			 * no early-data level secrets will be derived if this is not
+			 * the case, leading the mux to be started but without being
+			 * able to send data at early-data level.
 			 */
-			if (ssl_sock_srv_try_reuse_sess(ctx, srv))
+			HA_RWLOCK_RDLOCK(SERVER_LOCK, &srv->path_params.param_lock);
+			alpn = srv->path_params.nego_alpn;
+			etps = &srv->path_params.tps;
+			ret = quic_reuse_srv_params(qc, alpn, etps);
+			HA_RWLOCK_RDUNLOCK(SERVER_LOCK, &srv->path_params.param_lock);
+			if (ret) {
 				SSL_set_quic_early_data_enabled(ctx->ssl, 1);
+			}
 			else {
 				/* No error here. 0-RTT will not be enabled. */
 				TRACE_PROTO("Could not reuse any ALPN", QUIC_EV_CONN_NEW, qc);
 			}
 		}
 #endif
-
 		SSL_set_connect_state(ctx->ssl);
 	}
 

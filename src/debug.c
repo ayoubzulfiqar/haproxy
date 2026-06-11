@@ -367,6 +367,9 @@ void ha_thread_dump_one(struct buffer *buf, int is_caller)
 			      (now - th_ctx->sched_call_date));
 	}
 
+	/* report the execution context when known */
+	chunk_append_thread_ctx(buf, &th_ctx->exec_ctx, "             exec_ctx: ", "\n");
+
 	/* this is the end of what we can dump from outside the current thread */
 
 	chunk_appendf(buf, "             curr_task=");
@@ -605,7 +608,11 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
 		chunk_appendf(buf, "%sCurrent executing a Lua HTTP service -- ", pfx);
 	}
 
-	if (hlua && hlua->T) {
+	/* only dump the Lua stack on panic because the approach is often
+	 * destructive and the running program might not recover from this
+	 * if called during warnings or "show threads".
+	 */
+	if (hlua && hlua->T && (get_tainted() & TAINTED_PANIC)) {
 		chunk_appendf(buf, "stack traceback:\n    ");
 		append_prefixed_str(buf, hlua_traceback(hlua->T, "\n    "), pfx, '\n', 0);
 	}
@@ -1350,8 +1357,7 @@ static int debug_parse_cli_write(char **args, char *payload, struct appctx *appc
 /*
  *  debug dev stream [strm=<ptr>] [strm.f[{+-=}<flags>]] [txn.f[{+-=}<flags>]] \
  *                   [req.f[{+-=}<flags>]] [res.f[{+-=}<flags>]]               \
- *                   [sif.f[{+-=<flags>]] [sib.f[{+-=<flags>]]                 \
- *                   [sif.s[=<state>]] [sib.s[=<state>]]
+ *                   [scf.s[=<state>]] [scb.s[=<state>]]
  */
 static int debug_parse_cli_stream(char **args, char *payload, struct appctx *appctx, void *private)
 {
@@ -1394,7 +1400,8 @@ static int debug_parse_cli_stream(char **args, char *payload, struct appctx *app
 		} else if (isteq(name, ist("strm.x"))) {
 			ptr = (!s || !may_access(s)) ? NULL : &s->conn_exp; size = sizeof(s->conn_exp);
 		} else if (isteq(name, ist("txn.f"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->txn->flags; size = sizeof(s->txn->flags);
+			ptr = (!s || !may_access(s) || (s->flags & SF_TXN_MASK) != SF_TXN_HTTP) ? NULL : &s->txn.http->flags;
+			size = sizeof(s->txn.http->flags);
 		} else if (isteq(name, ist("req.f"))) {
 			ptr = (!s || !may_access(s)) ? NULL : &s->req.flags; size = sizeof(s->req.flags);
 		} else if (isteq(name, ist("res.f"))) {
@@ -1620,7 +1627,7 @@ static struct task *debug_delay_inj_task(struct task *t, void *ctx, unsigned int
  */
 static int debug_parse_delay_inj(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	unsigned long *tctx; // [0] = inter, [2] = count
+	unsigned long *tctx; // [0] = inter, [1] = nbwakeups
 	struct task *task;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))

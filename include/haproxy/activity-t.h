@@ -24,6 +24,7 @@
 
 #include <haproxy/api-t.h>
 #include <haproxy/freq_ctr-t.h>
+#include <haproxy/tinfo-t.h>
 
 /* bit fields for the "profiling" global variable */
 #define HA_PROF_TASKS_OFF   0x00000000     /* per-task CPU profiling forced disabled */
@@ -33,6 +34,8 @@
 #define HA_PROF_TASKS_MASK  0x00000003     /* per-task CPU profiling mask */
 
 #define HA_PROF_MEMORY      0x00000004     /* memory profiling */
+#define HA_PROF_TASKS_MEM   0x00000008     /* per-task CPU profiling with memory */
+#define HA_PROF_TASKS_LOCK  0x00000010     /* per-task CPU profiling with locks */
 
 
 #ifdef USE_MEMORY_PROFILING
@@ -82,6 +85,7 @@ struct memprof_stats {
 	unsigned long long alloc_tot;
 	unsigned long long free_tot;
 	void *info; // for pools, ptr to the pool
+	struct thread_exec_ctx exec_ctx;
 };
 #endif
 
@@ -125,8 +129,8 @@ struct activity {
 	unsigned int ctr2;         // general purposee debug counter
 #endif
 	char __pad[0]; // unused except to check remaining room
-	char __end[0] __attribute__((aligned(64))); // align size to 64.
-};
+	char __end[0] THREAD_ALIGNED();
+} THREAD_ALIGNED();
 
 /* 256 entries for callers * callees should be highly sufficient (~45 seen usually) */
 #define SCHED_ACT_HASH_BITS 8
@@ -146,7 +150,7 @@ struct sched_activity {
 	uint64_t lkw_time; /* lock waiting time */
 	uint64_t lkd_time; /* locked time */
 	uint64_t mem_time; /* memory ops wait time */
-};
+} THREAD_ALIGNED();
 
 #endif /* _HAPROXY_ACTIVITY_T_H */
 

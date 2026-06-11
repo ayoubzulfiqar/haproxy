@@ -44,14 +44,6 @@
 #define qpack_debug_hexdump(...) do { } while (0)
 #endif
 
-/* Encoded field line bitmask */
-#define QPACK_EFL_BITMASK  0xf0
-#define QPACK_LFL_WPBNM    0x00 // Literal field line with post-base name reference
-#define QPACK_IFL_WPBI     0x10 // Indexed field line with post-based index
-#define QPACK_LFL_WLN_BIT  0x20 // Literal field line with literal name
-#define QPACK_LFL_WNR_BIT  0x40 // Literal field line with name reference
-#define QPACK_IFL_BIT      0x80 // Indexed field line
-
 /* reads a varint from <raw>'s lowest <b> bits and <len> bytes max (raw included).
  * returns the 64-bit value on success after updating buf and len_in. Forces
  * len_in to (uint64_t)-1 on truncated input.
@@ -61,34 +53,42 @@
 static uint64_t qpack_get_varint(const unsigned char **buf, uint64_t *len_in, int b)
 {
 	uint64_t ret = 0;
-	int len = *len_in;
+	uint64_t len = *len_in;
 	const uint8_t *raw = *buf;
-	uint8_t shift = 0;
+	uint64_t v, limit = (1ULL << 62) - 1;
+	int shift = 0;
+
+	if (len == 0)
+		goto too_short;
 
 	len--;
 	ret = *raw++ & ((1ULL << b) - 1);
 	if (ret != (uint64_t)((1ULL << b) - 1))
 		goto end;
 
-	while (len && (*raw & 128)) {
-		ret += ((uint64_t)*raw++ & 127) << shift;
-		shift += 7;
+	do {
+		if (!len)
+			goto too_short;
+
+		v = *raw++;
 		len--;
-	}
+		/* This check is sufficient to prevent any overflow
+		 * and implicitly limits shift to 63.
+		 */
+		if ((v & 127) > (limit - ret) >> shift)
+			goto too_large;
 
-	/* last 7 bits */
-	if (!len)
-		goto too_short;
+		ret += (v & 127) << shift;
+		shift += 7;
+	} while (v & 128);
 
-	len--;
-	ret += ((uint64_t)*raw++ & 127) << shift;
-
- end:
+end:
 	*buf = raw;
 	*len_in = len;
 	return ret;
 
- too_short:
+too_large:
+too_short:
 	*len_in = (uint64_t)-1;
 	return 0;
 }
@@ -111,7 +111,8 @@ int qpack_decode_enc(struct buffer *buf, int fin, void *ctx)
 	 * connection error of type H3_CLOSED_CRITICAL_STREAM.
 	 */
 	if (fin) {
-		qcc_set_error(qcs->qcc, H3_ERR_CLOSED_CRITICAL_STREAM, 1);
+		qcc_set_error(qcs->qcc, H3_ERR_CLOSED_CRITICAL_STREAM, 1,
+		              muxc_tevt_type_proto_err);
 		return -1;
 	}
 
@@ -144,7 +145,8 @@ int qpack_decode_enc(struct buffer *buf, int fin, void *ctx)
 		 * QPACK_ENCODER_STREAM_ERROR.
 		 */
 		if (capacity) {
-			qcc_set_error(qcs->qcc, QPACK_ERR_ENCODER_STREAM_ERROR, 1);
+			qcc_set_error(qcs->qcc, QPACK_ERR_ENCODER_STREAM_ERROR, 1,
+			              muxc_tevt_type_proto_err);
 			return -1;
 		}
 
@@ -171,7 +173,8 @@ int qpack_decode_dec(struct buffer *buf, int fin, void *ctx)
 	 * connection error of type H3_CLOSED_CRITICAL_STREAM.
 	 */
 	if (fin) {
-		qcc_set_error(qcs->qcc, H3_ERR_CLOSED_CRITICAL_STREAM, 1);
+		qcc_set_error(qcs->qcc, H3_ERR_CLOSED_CRITICAL_STREAM, 1,
+		              muxc_tevt_type_proto_err);
 		return -1;
 	}
 
@@ -196,7 +199,8 @@ int qpack_decode_dec(struct buffer *buf, int fin, void *ctx)
 		 */
 
 		/* For the moment haproxy does not emit dynamic table insertion. */
-		qcc_set_error(qcs->qcc, QPACK_ERR_DECODER_STREAM_ERROR, 1);
+		qcc_set_error(qcs->qcc, QPACK_ERR_DECODER_STREAM_ERROR, 1,
+		              muxc_tevt_type_proto_err);
 		return -1;
 	}
 	else if (inst & QPACK_DEC_INST_SACK) {
@@ -220,7 +224,14 @@ static int qpack_decode_fs_pfx(uint64_t *enc_ric, uint64_t *db, int *sign_bit,
 	if (*len == (uint64_t)-1)
 		return -QPACK_RET_RIC;
 
-	*sign_bit = **raw & 0x8;
+	/* Ensure at least one byte remains for the sign bit
+	 * and the start of the Delta Base varint.
+	 */
+	if (!*len)
+		return -QPACK_RET_TRUNCATED;
+
+	/* Safe access to the sign bit thanks to the check above */
+	*sign_bit = **raw & 0x80;
 	*db = qpack_get_varint(raw, len, 7);
 	if (*len == (uint64_t)-1)
 		return -QPACK_RET_DB;
@@ -389,7 +400,10 @@ int qpack_decode_fs(const unsigned char *raw, uint64_t len, struct buffer *tmp,
 			n = efl_type & 0x20;
 			static_tbl = efl_type & 0x10;
 			index = qpack_get_varint(&raw, &len, 4);
-			if (len == (uint64_t)-1) {
+			/* There must be at least one byte available for <h> value after this
+			 * decoding before the next call to qpack_get_varint().
+			 */
+			if ((int64_t)len <= 0) {
 				qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
 				ret = -QPACK_RET_TRUNCATED;
 				goto out;
@@ -415,7 +429,7 @@ int qpack_decode_fs(const unsigned char *raw, uint64_t len, struct buffer *tmp,
 			qpack_debug_printf(stderr, " n=%d t=%d index=%llu", !!n, !!static_tbl, (unsigned long long)index);
 			h = *raw & 0x80;
 			length = qpack_get_varint(&raw, &len, 7);
-			if (len == (uint64_t)-1) {
+			if (len == (uint64_t)-1 || len < length) {
 				qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
 				ret = -QPACK_RET_TRUNCATED;
 				goto out;
@@ -432,26 +446,21 @@ int qpack_decode_fs(const unsigned char *raw, uint64_t len, struct buffer *tmp,
 					ret = -QPACK_RET_TOO_LARGE;
 					goto out;
 				}
+
 				nlen = huff_dec(raw, length, trash, tmp->size - tmp->data);
-				if (nlen == (uint32_t)-1) {
+				if (nlen < 0) {
 					qpack_debug_printf(stderr, " can't decode huffman.\n");
 					ret = -QPACK_RET_HUFFMAN;
 					goto out;
 				}
 
-				qpack_debug_printf(stderr, " [name huff %d->%d '%s']", (int)length, (int)nlen, trash);
+				qpack_debug_printf(stderr, " [value huff %d->%d '%s']", (int)length, (int)nlen, trash);
 				/* makes an ist from tmp storage */
 				b_add(tmp, nlen);
 				value = ist2(trash, nlen);
 			}
 			else {
 				value = ist2(raw, length);
-			}
-
-			if (len < length) {
-				qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
-				ret = -QPACK_RET_TRUNCATED;
-				goto out;
 			}
 
 			raw += length;
@@ -466,7 +475,10 @@ int qpack_decode_fs(const unsigned char *raw, uint64_t len, struct buffer *tmp,
 			n = *raw & 0x10;
 			hname = *raw & 0x08;
 			name_len = qpack_get_varint(&raw, &len, 3);
-			if (len == (uint64_t)-1) {
+			/* There must be at least one byte available for <hvalue> after this
+			 * decoding before the next call to qpack_get_varint().
+			 */
+			if ((int64_t)len < (int64_t)name_len + 1) {
 				qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
 				ret = -QPACK_RET_TRUNCATED;
 				goto out;
@@ -474,12 +486,6 @@ int qpack_decode_fs(const unsigned char *raw, uint64_t len, struct buffer *tmp,
 
 			qpack_debug_printf(stderr, " n=%d hname=%d name_len=%llu", !!n, !!hname, (unsigned long long)name_len);
 			/* Name string */
-
-			if (len < name_len) {
-				qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
-				ret = -QPACK_RET_TRUNCATED;
-				goto out;
-			}
 
 			if (hname) {
 				char *trash;
@@ -492,7 +498,7 @@ int qpack_decode_fs(const unsigned char *raw, uint64_t len, struct buffer *tmp,
 					goto out;
 				}
 				nlen = huff_dec(raw, name_len, trash, tmp->size - tmp->data);
-				if (nlen == (uint32_t)-1) {
+				if (nlen < 0) {
 					qpack_debug_printf(stderr, " can't decode huffman.\n");
 					ret = -QPACK_RET_HUFFMAN;
 					goto out;
@@ -512,19 +518,13 @@ int qpack_decode_fs(const unsigned char *raw, uint64_t len, struct buffer *tmp,
 
 			hvalue = *raw & 0x80;
 			value_len = qpack_get_varint(&raw, &len, 7);
-			if (len == (uint64_t)-1) {
+			if (len == (uint64_t)-1 || len < value_len) {
 				qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
 				ret = -QPACK_RET_TRUNCATED;
 				goto out;
 			}
 
 			qpack_debug_printf(stderr, " hvalue=%d value_len=%llu", !!hvalue, (unsigned long long)value_len);
-
-			if (len < value_len) {
-				qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
-				ret = -QPACK_RET_TRUNCATED;
-				goto out;
-			}
 
 			if (hvalue) {
 				char *trash;
@@ -537,13 +537,13 @@ int qpack_decode_fs(const unsigned char *raw, uint64_t len, struct buffer *tmp,
 					goto out;
 				}
 				nlen = huff_dec(raw, value_len, trash, tmp->size - tmp->data);
-				if (nlen == (uint32_t)-1) {
+				if (nlen < 0) {
 					qpack_debug_printf(stderr, " can't decode huffman.\n");
 					ret = -QPACK_RET_HUFFMAN;
 					goto out;
 				}
 
-				qpack_debug_printf(stderr, " [name huff %d->%d '%s']", (int)value_len, (int)nlen, trash);
+				qpack_debug_printf(stderr, " [value huff %d->%d '%s']", (int)value_len, (int)nlen, trash);
 				/* makes an ist from tmp storage */
 				b_add(tmp, nlen);
 				value = ist2(trash, nlen);

@@ -89,12 +89,23 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			global.tune.options |=  GTUNE_BUSY_POLLING;
 	}
 	else if (strcmp(args[0], "set-dumpable") == 0) { /* "no set-dumpable" or "set-dumpable" */
-		if (alertif_too_many_args(0, file, linenum, args, &err_code))
+		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
-		if (kwm == KWM_NO)
+		if (kwm == KWM_NO) {
 			global.tune.options &= ~GTUNE_SET_DUMPABLE;
-		else
-			global.tune.options |=  GTUNE_SET_DUMPABLE;
+			goto out;
+		}
+		if (!*args[1] || strcmp(args[1], "on") == 0)
+			global.tune.options |= GTUNE_SET_DUMPABLE;
+		else if (strcmp(args[1], "libs") == 0)
+			global.tune.options |= GTUNE_SET_DUMPABLE | GTUNE_COLLECT_LIBS;
+		else if (strcmp(args[1], "off") == 0)
+			global.tune.options &= ~GTUNE_SET_DUMPABLE;
+		else {
+			ha_alert("parsing [%s:%d] : '%s' only supports 'on' and 'off' as an argument, found '%s'.\n", file, linenum, args[0], args[1]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+	                goto out;
+		}
 	}
 	else if (strcmp(args[0], "h2-workaround-bogus-websocket-clients") == 0) { /* "no h2-workaround-bogus-websocket-clients" or "h2-workaround-bogus-websocket-clients" */
 		if (alertif_too_many_args(0, file, linenum, args, &err_code))
@@ -456,9 +467,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		for (i = 1; *args[i]; i++)
 			len += strlen(args[i]) + 1;
 
-		if (global.desc)
-			free(global.desc);
-
+		free(global.desc);
 		global.desc = d = calloc(1, len);
 
 		d += snprintf(d, global.desc + len - d, "%s", args[1]);
@@ -487,9 +496,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		if (global.node)
-			free(global.node);
-
+		free(global.node);
 		global.node = strdup(args[1]);
 	}
 	else if (strcmp(args[0], "unix-bind") == 0) {
@@ -1423,6 +1430,9 @@ static int cfg_parse_global_tune_opts(char **args, int section_type,
 
 		return 0;
 	}
+	else if (strcmp(args[0], "tune.defaults.purge") == 0) {
+		global.tune.options |= GTUNE_PURGE_DEFAULTS;
+	}
 	else if (strcmp(args[0], "tune.pattern.cache-size") == 0) {
 		if (*(args[1]) == 0) {
 			memprintf(err, "'%s' expects a positive numeric value", args[0]);
@@ -1431,6 +1441,16 @@ static int cfg_parse_global_tune_opts(char **args, int section_type,
 		global.tune.pattern_cache = atoi(args[1]);
 		if (global.tune.pattern_cache < 0) {
 			memprintf(err, "'%s' expects a positive numeric value", args[0]);
+			return -1;
+		}
+	}
+	else if (strcmp(args[0], "tune.streams-elasticity") == 0) {
+		char *stop;
+
+		global.tune.streams_elasticity = strtol(args[1], &stop, 10);
+		if (!*args[1] || *stop ||
+		    (global.tune.streams_elasticity && global.tune.streams_elasticity < 100)) {
+			memprintf(err, "'%s' expects 0 or a positive percentage value of 100 or above", args[0]);
 			return -1;
 		}
 	}
@@ -1609,11 +1629,6 @@ static int cfg_parse_global_shm_stats_file(char **args, int section_type,
 				           struct proxy *curpx, const struct proxy *defpx,
 				           const char *file, int line, char **err)
 {
-	if (!experimental_directives_allowed) {
-		memprintf(err, "'%s' directive is experimental, must be allowed via a global 'expose-experimental-directives'", args[0]);
-		return -1;
-	}
-
 	if (global.shm_stats_file != NULL) {
 		memprintf(err, "'%s' already specified.\n", args[0]);
 		return -1;
@@ -1624,7 +1639,6 @@ static int cfg_parse_global_shm_stats_file(char **args, int section_type,
 		return -1;
 	}
 
-	mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
 	global.shm_stats_file = strdup(args[1]);
 	return 0;
 }
@@ -1633,11 +1647,6 @@ static int cfg_parse_global_shm_stats_file_max_objects(char **args, int section_
 				                       struct proxy *curpx, const struct proxy *defpx,
 				                       const char *file, int line, char **err)
 {
-	if (!experimental_directives_allowed) {
-		memprintf(err, "'%s' directive is experimental, must be allowed via a global 'expose-experimental-directives'", args[0]);
-		return -1;
-	}
-
 	if (shm_stats_file_max_objects != -1) {
 		memprintf(err, "'%s' already specified.\n", args[0]);
 		return -1;
@@ -1648,7 +1657,6 @@ static int cfg_parse_global_shm_stats_file_max_objects(char **args, int section_
 		return -1;
 	}
 
-	mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
 	shm_stats_file_max_objects = atoi(args[1]);
 	return 0;
 }
@@ -1869,6 +1877,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "tune.bufsize", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.chksize", cfg_parse_global_unsupported_opts },
 	{ CFG_GLOBAL, "tune.comp.maxlevel", cfg_parse_global_tune_opts },
+	{ CFG_GLOBAL, "tune.defaults.purge", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.disable-fast-forward", cfg_parse_global_tune_forward_opts },
 	{ CFG_GLOBAL, "tune.disable-zero-copy-forwarding", cfg_parse_global_tune_forward_opts },
 	{ CFG_GLOBAL, "tune.glitches.kill.cpu-usage", cfg_parse_global_tune_opts },
@@ -1892,6 +1901,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "tune.runqueue-depth", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.sndbuf.client", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.sndbuf.server", cfg_parse_global_tune_opts },
+	{ CFG_GLOBAL, "tune.streams-elasticity", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.takeover-other-tg-connections", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "unsetenv", cfg_parse_global_env_opts, KWF_DISCOVERY },
 	{ CFG_GLOBAL, "zero-warning", cfg_parse_global_mode, KWF_DISCOVERY },

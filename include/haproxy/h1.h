@@ -98,8 +98,8 @@ enum h1m_state {
 #define H1_MF_UPG_WEBSOCKET     0x00008000 // Set for a Websocket upgrade handshake
 #define H1_MF_TE_CHUNKED        0x00010000 // T-E "chunked"
 #define H1_MF_TE_OTHER          0x00020000 // T-E other than supported ones found (only "chunked" is supported for now)
-#define H1_MF_UPG_H2C           0x00040000 // "h2c" or "h2" used as upgrade token
-
+#define H1_MF_UPG_HDR           0x00040000 // non-empty Upgrapde header found
+#define H1_MF_NOT_HTTP           0x00080000 // Not an HTTP message (e.g "RTSP", only possible if invalid message are accepted)
 /* Mask to use to reset H1M flags when we restart headers parsing.
  *
  * WARNING: Don't forget to update it if a new flag must be preserved when
@@ -160,7 +160,7 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 
 int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value);
 void h1_parse_connection_header(struct h1m *h1m, struct ist *value);
-void h1_parse_upgrade_header(struct h1m *h1m, struct ist value);
+void h1_parse_upgrade_header(struct h1m *h1m, struct ist *value);
 
 void h1_generate_random_ws_input_key(char key_out[25]);
 void h1_calculate_ws_output_key(const char *key, char *result);
@@ -263,6 +263,8 @@ static inline int h1_parse_chunk_size(const struct buffer *buf, int start, int s
 	const char *ptr_old = ptr;
 	const char *end = b_wrap(buf);
 	uint64_t chunk = 0;
+	int backslash = 0;
+	int quote = 0;
 
 	stop -= start; // bytes left
 	start = stop;  // bytes to transfer
@@ -327,13 +329,37 @@ static inline int h1_parse_chunk_size(const struct buffer *buf, int start, int s
 			if (--stop == 0)
 				return 0;
 
-			while (!HTTP_IS_CRLF(*ptr)) {
+			/* The loop seeks the first CRLF or non-tab CTL char
+			 * and stops there. If a backslash/quote is active,
+			 * it's an error. If none, we assume it's the CRLF
+			 * and go back to the top of the loop checking for
+			 * CR then LF. This way CTLs, lone LF etc are handled
+			 * in the fallback path. This allows to protect
+			 * remotes against their own possibly non-compliant
+			 * chunk-ext parser which could mistakenly skip a
+			 * quoted CRLF. Chunk-ext are not used anyway, except
+			 * by attacks.
+			 */
+			while (!HTTP_IS_CTL(*ptr) || HTTP_IS_SPHT(*ptr)) {
+				if (backslash)
+					backslash = 0; // escaped char
+				else if (*ptr == '\\' && quote)
+					backslash = 1;
+				else if (*ptr == '\\') // backslash not permitted outside quotes
+					goto error;
+				else if (*ptr == '"')  // begin/end of quoted-pair
+					quote = !quote;
 				if (++ptr >= end)
 					ptr = b_orig(buf);
 				if (--stop == 0)
 					return 0;
 			}
-			/* we have a CRLF now, loop above */
+
+			/* mismatched quotes / backslashes end here */
+			if (quote || backslash)
+				goto error;
+
+			/* CTLs (CRLF) fall to the common check */
 			continue;
 		}
 		else

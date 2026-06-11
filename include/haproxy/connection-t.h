@@ -130,7 +130,8 @@ enum {
 
 	CO_FL_OPT_TOS       = 0x00000020,  /* connection has a special sockopt tos */
 
-	/* unused : 0x00000040, 0x00000080 */
+	CO_FL_QMUX_SEND    = 0x00000040,   /* connection uses QMux protocol, needs to exchange transport parameters before starting mux layer */
+	CO_FL_QMUX_RECV    = 0x00000080,   /* connection uses QMux protocol, needs to exchange transport parameters before starting mux layer */
 
 	/* These flags indicate whether the Control and Transport layers are initialized */
 	CO_FL_CTRL_READY    = 0x00000100, /* FD was registered, fd_delete() needed */
@@ -145,7 +146,7 @@ enum {
 	CO_FL_WAIT_ROOM     = 0x00000800,  /* data sink is full */
 
 	CO_FL_WANT_SPLICING = 0x00001000,  /* we wish to use splicing on the connection when possible */
-	/* unused: 0x00002000 */
+	CO_FL_SSL_NO_CACHED_INFO = 0x00002000, /* Don't use any cached information when creating a new SSL connection */
 
 	CO_FL_EARLY_SSL_HS  = 0x00004000,  /* We have early data pending, don't start SSL handshake yet */
 	CO_FL_EARLY_DATA    = 0x00008000,  /* At least some of the data are early data */
@@ -178,6 +179,8 @@ enum {
 	/* below we have all handshake flags grouped into one */
 	CO_FL_HANDSHAKE     = CO_FL_SEND_PROXY | CO_FL_ACCEPT_PROXY | CO_FL_ACCEPT_CIP | CO_FL_SOCKS4_SEND | CO_FL_SOCKS4_RECV,
 	CO_FL_WAIT_XPRT     = CO_FL_WAIT_L4_CONN | CO_FL_HANDSHAKE | CO_FL_WAIT_L6_CONN,
+	/* handshake running on top of a layer6 */
+	CO_FL_WAIT_XPRT_L6  = CO_FL_QMUX_SEND | CO_FL_QMUX_RECV,
 
 	CO_FL_SSL_WAIT_HS   = 0x08000000,  /* wait for an SSL handshake to complete */
 
@@ -212,13 +215,14 @@ static forceinline char *conn_show_flags(char *buf, size_t len, const char *deli
 	/* flags */
 	_(CO_FL_SAFE_LIST, _(CO_FL_IDLE_LIST, _(CO_FL_CTRL_READY,
 	_(CO_FL_REVERSED, _(CO_FL_ACT_REVERSING, _(CO_FL_OPT_MARK, _(CO_FL_OPT_TOS,
-	_(CO_FL_XPRT_READY, _(CO_FL_WANT_DRAIN, _(CO_FL_WAIT_ROOM, _(CO_FL_EARLY_SSL_HS,
+	_(CO_FL_QMUX_SEND, _(CO_FL_QMUX_RECV,
+	_(CO_FL_XPRT_READY, _(CO_FL_WANT_DRAIN, _(CO_FL_WAIT_ROOM, _(CO_FL_SSL_NO_CACHED_INFO, _(CO_FL_EARLY_SSL_HS,
 	_(CO_FL_EARLY_DATA, _(CO_FL_SOCKS4_SEND, _(CO_FL_SOCKS4_RECV, _(CO_FL_SOCK_RD_SH,
 	_(CO_FL_SOCK_WR_SH, _(CO_FL_ERROR, _(CO_FL_FDLESS, _(CO_FL_WAIT_L4_CONN,
 	_(CO_FL_WAIT_L6_CONN, _(CO_FL_SEND_PROXY, _(CO_FL_ACCEPT_PROXY, _(CO_FL_ACCEPT_CIP,
 	_(CO_FL_SSL_WAIT_HS, _(CO_FL_PRIVATE, _(CO_FL_RCVD_PROXY, _(CO_FL_SESS_IDLE,
 	_(CO_FL_XPRT_TRACKED
-	))))))))))))))))))))))))))));
+	)))))))))))))))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -283,6 +287,8 @@ enum {
 
 	CO_ER_SSL_FATAL,         /* SSL fatal error during a SSL_read or SSL_write */
 
+	CO_ER_QMUX,              /* QMux transport parameter exchange failure */
+
 	CO_ER_REVERSE,           /* Error during reverse connect */
 
 	CO_ER_POLLERR,           /* we only noticed POLLERR */
@@ -345,6 +351,7 @@ enum {
 	XPRT_SSL = 1,
 	XPRT_HANDSHAKE = 2,
 	XPRT_QUIC = 3,
+	XPRT_QMUX = 4,
 	XPRT_ENTRIES /* must be last one */
 };
 
@@ -356,6 +363,7 @@ enum {
 	MX_FL_NO_UPG      = 0x00000004, /* set if mux does not support any upgrade */
 	MX_FL_FRAMED      = 0x00000008, /* mux working on top of a framed transport layer (QUIC) */
 	MX_FL_REVERSABLE  = 0x00000010, /* mux supports connection reversal */
+	MX_FL_EXPERIMENTAL = 0x00000020, /* requires experimental support directives */
 };
 
 /* PROTO token registration */
@@ -476,7 +484,7 @@ struct xprt_ops {
 	void (*dump_info)(struct buffer *, const struct connection *);
 	/*
 	 * Returns the value for various capabilities.
-	 * Returns 0 if the capability is known, iwth the actual value in arg,
+	 * Returns 0 if the capability is known, with the actual value in arg,
 	 * or -1 otherwise
 	 */
 	int (*get_capability)(struct connection *connection, void *xprt_ctx, enum xprt_capabilities, void *arg);
@@ -660,17 +668,19 @@ struct connection {
 		struct buffer name;    /* Only used for passive reverse. Used as SNI when connection added to server idle pool. */
 	} reverse;
 
+	uint64_t sni_hash;             /* Hash of the SNI. Used to cache the TLS session and try to reuse it. set to 0 is there is no SNI */
 	uint32_t term_evts_log;        /* Termination events log: first 4 events reported from fd, handshake or xprt */
 	uint32_t mark;                 /* set network mark, if CO_FL_OPT_MARK is set */
 	uint8_t tos;                   /* set ip tos, if CO_FL_OPT_TOS is set */
 };
 
 struct mux_proto_list {
-	const struct ist token;    /* token name and length. Empty is catch-all */
+	const struct ist mux_proto;    /* Mux protocol, to be used with the "proto" directive */
 	enum proto_proxy_mode mode;
 	enum proto_proxy_side side;
 	const struct mux_ops *mux;
 	const char *alpn;          /* Default alpn to set by default when the mux protocol is forced (optional, in binary form) */
+	int init_xprt;
 	struct list list;
 };
 
@@ -794,7 +804,7 @@ struct idle_conns {
 	struct mt_list toremove_conns;
 	struct task *cleanup_task;
 	__decl_thread(HA_SPINLOCK_T idle_conns_lock);
-} THREAD_ALIGNED(64);
+} THREAD_ALIGNED();
 
 
 /* Termination events logs:

@@ -60,7 +60,6 @@ extern int thread_cpus_enabled_at_boot;
 /* Only way found to replace variables with constants that are optimized away
  * at build time.
  */
-enum { all_tgroups_mask = 1UL };
 enum { tid_bit = 1UL };
 enum { tid = 0 };
 enum { tgid = 1 };
@@ -208,7 +207,6 @@ void wait_for_threads_completion();
 void set_thread_cpu_affinity();
 unsigned long long ha_get_pthread_id(unsigned int thr);
 
-extern volatile unsigned long all_tgroups_mask;
 extern volatile unsigned int rdv_requests;
 extern volatile unsigned int isolated_thread;
 extern THREAD_LOCAL unsigned int tid;      /* The thread id */
@@ -364,15 +362,19 @@ static inline unsigned long thread_isolated()
 		extern uint64_t now_mono_time(void);			\
 		if (_LK_ != _LK_UN) {					\
 			th_ctx->lock_level += bal;			\
-			if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING)) \
+			if (unlikely((th_ctx->flags & (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_L)) == \
+			             (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_L))) \
 				lock_start = now_mono_time();		\
 		}							\
 		(void)(expr);						\
 		if (_LK_ == _LK_UN) {					\
 			th_ctx->lock_level += bal;			\
-			if (th_ctx->lock_level == 0 && unlikely(th_ctx->flags & TH_FL_TASK_PROFILING)) \
+			if (th_ctx->lock_level == 0 &&\
+			    unlikely((th_ctx->flags & (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_L)) == \
+			             (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_L))) \
 				th_ctx->locked_total += now_mono_time() - th_ctx->lock_start_date; \
-		} else if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING)) { \
+		} else if (unlikely((th_ctx->flags & (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_L)) == \
+			             (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_L))) { \
 			uint64_t now = now_mono_time();			\
 			if (lock_start)					\
 				th_ctx->lock_wait_total += now - lock_start; \
@@ -386,7 +388,8 @@ static inline unsigned long thread_isolated()
 		typeof(expr) _expr = (expr);				\
 		if (_expr == 0) {					\
 			th_ctx->lock_level += bal;			\
-			if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING)) { \
+			if (unlikely((th_ctx->flags & (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_L)) == \
+			             (TH_FL_TASK_PROFILING|TH_FL_TASK_PROFILING_L))) { \
 				if (_LK_ == _LK_UN && th_ctx->lock_level == 0) \
 					th_ctx->locked_total += now_mono_time() - th_ctx->lock_start_date; \
 				else if (_LK_ != _LK_UN && th_ctx->lock_level == 1) \

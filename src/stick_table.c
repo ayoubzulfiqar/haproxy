@@ -36,7 +36,6 @@
 #include <haproxy/proxy.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
-#include <haproxy/stats-t.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stick_table.h>
 #include <haproxy/stream.h>
@@ -54,6 +53,7 @@
 enum sticktable_field {
 	STICKTABLE_SIZE = 0,
 	STICKTABLE_USED,
+	STICKTABLE_LOCAL_UPDATES,
 	/* must always be the last one */
 	STICKTABLE_TOTAL_FIELDS
 };
@@ -276,6 +276,7 @@ int stktable_trash_oldest(struct stktable *t)
 {
 	struct stksess *ts;
 	struct eb32_node *eb;
+	struct list tofree_list;
 	int max_search; // no more than 50% misses
 	int max_per_bucket;
 	int done_per_bucket;
@@ -289,7 +290,7 @@ int stktable_trash_oldest(struct stktable *t)
 
 	/* start from a random bucket number to avoid starvation in the last ones */
 	bucket = init_bucket = statistical_prng_range(CONFIG_HAP_TBL_BUCKETS - 1);
-
+	LIST_INIT(&tofree_list);
 	to_batch = STKTABLE_MAX_UPDATES_AT_ONCE;
 
 	max_search = to_batch * 2; // no more than 50% misses
@@ -390,7 +391,8 @@ int stktable_trash_oldest(struct stktable *t)
 			ebmb_delete(&ts->key);
 			MT_LIST_DELETE(&ts->pend_updts);
 			eb32_delete(&ts->upd);
-			__stksess_free(t, ts);
+			LIST_APPEND(&tofree_list, mt_list_to_list(&ts->pend_updts));
+
 			batched++;
 			done_per_bucket++;
 
@@ -416,6 +418,12 @@ int stktable_trash_oldest(struct stktable *t)
 		if (bucket >= CONFIG_HAP_TBL_BUCKETS)
 			bucket = 0;
 	} while (max_search > 0 && bucket != init_bucket);
+
+	while (!LIST_ISEMPTY(&tofree_list)) {
+		ts = LIST_ELEM(tofree_list.n, struct stksess *, pend_updts);
+		LIST_DELETE(mt_list_to_list(&ts->pend_updts));
+		__stksess_free(t, ts);
+	}
 
 	return batched;
 }
@@ -953,12 +961,15 @@ struct task *process_tables_expire(struct task *task, void *context, unsigned in
 	struct stktable *t;
 	struct stksess *ts;
 	struct eb32_node *table_eb, *eb;
+	struct list tofree_list;
 	int updt_locked;
 	int to_visit;
 	int task_exp;
 	int bucket;
 
 	task_exp = TICK_ETERNITY;
+
+	LIST_INIT(&tofree_list);
 
 	bucket = (ps - &per_bucket[0]);
 
@@ -1088,7 +1099,7 @@ struct task *process_tables_expire(struct task *task, void *context, unsigned in
 			ebmb_delete(&ts->key);
 			MT_LIST_DELETE(&ts->pend_updts);
 			eb32_delete(&ts->upd);
-			__stksess_free(t, ts);
+			LIST_APPEND(&tofree_list, mt_list_to_list(&ts->pend_updts));
 		}
 
 		if (updt_locked)
@@ -1110,6 +1121,13 @@ struct task *process_tables_expire(struct task *task, void *context, unsigned in
 		if (!tick_isset(task_exp) || (tick_isset(next_exp_table) && tick_is_lt(next_exp_table, task_exp)))
 			task_exp = next_exp_table;
 		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->buckets[bucket].sh_lock);
+
+		while (!LIST_ISEMPTY(&tofree_list)) {
+			ts = LIST_ELEM(tofree_list.n, struct stksess *, pend_updts);
+			LIST_DELETE(mt_list_to_list(&ts->pend_updts));
+			__stksess_free(t, ts);
+		}
+
 		tmpnode = eb32_next(table_eb);
 
 		if (table_eb->key != next_exp_table) {
@@ -2675,10 +2693,12 @@ static enum act_return action_inc_gpc(struct act_rule *rule, struct proxy *px,
 	struct stkctr *stkctr;
 
 	/* Extract the stksess, return OK if no stksess available. */
-	if (s)
+	if (s && s->stkctr)
 		stkctr = &s->stkctr[rule->arg.gpc.sc];
-	else
+	else if (sess->stkctr)
 		stkctr = &sess->stkctr[rule->arg.gpc.sc];
+	else
+		return ACT_RET_CONT;
 
 	ts = stkctr_entry(stkctr);
 	if (ts) {
@@ -2716,10 +2736,12 @@ static enum act_return action_inc_gpc0(struct act_rule *rule, struct proxy *px,
 	unsigned int period = 0;
 
 	/* Extract the stksess, return OK if no stksess available. */
-	if (s)
+	if (s && s->stkctr)
 		stkctr = &s->stkctr[rule->arg.gpc.sc];
-	else
+	else if (sess->stkctr)
 		stkctr = &sess->stkctr[rule->arg.gpc.sc];
+	else
+		return ACT_RET_CONT;
 
 	ts = stkctr_entry(stkctr);
 	if (ts) {
@@ -5702,6 +5724,10 @@ static int cli_parse_table_req(char **args, char *payload, struct appctx *appctx
 		return 0;
 	}
 
+	/* only "show" is permitted to level user, others (clear/set) require "oper" */
+	if (ctx->action != STK_CLI_ACT_SHOW && !cli_has_level(appctx, ACCESS_LVL_OPER))
+		return 1;
+
 	if (strcmp(args[3], "key") == 0)
 		return table_process_entry_per_key(appctx, args);
 	if (strcmp(args[3], "ptr") == 0)
@@ -5952,7 +5978,7 @@ static int stkt_create_stk_ctr_pool(void)
 	if (!global.tune.nb_stk_ctr)
 		return 0;
 
-	pool_head_stk_ctr = create_pool("stk_ctr", sizeof(*((struct session*)0)->stkctr) * global.tune.nb_stk_ctr, MEM_F_SHARED);
+	pool_head_stk_ctr = create_pool("stk_ctr", array_size_or_fail(sizeof(*((struct session*)0)->stkctr), global.tune.nb_stk_ctr), MEM_F_SHARED);
 	if (!pool_head_stk_ctr) {
 		ha_alert("out of memory while creating the stick-counters pool.\n");
 		return ERR_ABORT;
@@ -5968,7 +5994,9 @@ static void stkt_late_init(void)
 	f = find_sample_fetch("src", strlen("src"));
 	if (f)
 		smp_fetch_src = f->process;
-	stkt_create_stk_ctr_pool();
+
+	if (stkt_create_stk_ctr_pool() & (ERR_ABORT | ERR_FATAL))
+		exit(1); // error already reported by the function
 
 	for (i = 0; i < CONFIG_HAP_TBL_BUCKETS; i++) {
 		MT_LIST_INIT(&per_bucket[i].toadd_tables);
@@ -5990,7 +6018,7 @@ INITCALL0(STG_INIT_2, stkt_late_init);
 static struct cli_kw_list cli_kws = {{ },{
 	{ { "clear", "table", NULL }, "clear table <table> [<filter>]*         : remove an entry from a table (filter: data/key)",                           cli_parse_table_req, cli_io_handler_table, cli_release_show_table, (void *)STK_CLI_ACT_CLR },
 	{ { "set",   "table", NULL }, "set table <table> key <k> [data.* <v>]* : update or create a table entry's data",                                     cli_parse_table_req, cli_io_handler_table, NULL, (void *)STK_CLI_ACT_SET },
-	{ { "show",  "table", NULL }, "show table <table> [<filter>]*          : report table usage stats or dump this table's contents (filter: data/key)", cli_parse_table_req, cli_io_handler_table, cli_release_show_table, (void *)STK_CLI_ACT_SHOW },
+	{ { "show",  "table", NULL }, "show table [<table> [<filter>]*]        : report table usage stats or dump this table's contents (filter: data/key)", cli_parse_table_req, cli_io_handler_table, cli_release_show_table, (void *)STK_CLI_ACT_SHOW },
 	{{},}
 }};
 
@@ -6309,6 +6337,10 @@ static int stk_promex_metric_info(unsigned int id, struct promex_metric *metric,
 			*metric = (struct promex_metric){ .n = ist("used"), .type = PROMEX_MT_GAUGE, .flags = PROMEX_FL_MODULE_METRIC };
 			*desc = ist("Number of entries used in this stick table.");
 			break;
+		case STICKTABLE_LOCAL_UPDATES:
+			*metric = (struct promex_metric){ .n = ist("local_updates"), .type = PROMEX_MT_GAUGE, .flags = PROMEX_FL_MODULE_METRIC };
+			*desc = ist("Cumulative number of updates on the stick table initiated by the local process. Please note that this value will eventually wrap after 4294967295 since it is stored using unsigned int (uint32). As this metric is often used to compute the update rate of a given table between two queries, wrapping must be taken into account and the time between 2 queries must not exceed the theoretical time needed for this value to wrap.");
+			break;
 		default:
 			return -1;
 	}
@@ -6345,6 +6377,17 @@ static int stk_promex_fill_ts(void *unused, void *metric_ctx, unsigned int id, s
 			break;
 		case STICKTABLE_USED:
 			*field = mkf_u32(FN_GAUGE, t->current);
+			break;
+		case STICKTABLE_LOCAL_UPDATES:
+			/* localupdate is meant to be guarded by updt_lock, but
+			 * here we don't care about the most up-to-date value, nor
+			 * need to read the value consistently with another table-related
+			 * one, all we really want is a rough reading of the current
+			 * number of local updates performed on the table, thus we hope
+			 * the value is read as an atomic operation (which should be
+			 * the case for uint32 on most platforms)
+			 */
+			*field = mkf_u32(FN_GAUGE, t->localupdate);
 			break;
 		default:
 			return -1;

@@ -1,6 +1,7 @@
 #include <haproxy/qpack-enc.h>
 
 #include <haproxy/buf.h>
+#include <haproxy/qpack-t.h>
 #include <haproxy/intops.h>
 
 /* Returns the byte size required to encode <i> as a <prefix_size>-prefix
@@ -88,7 +89,7 @@ int qpack_encode_int_status(struct buffer *out, unsigned int status)
 	case 425: idx = 70; break;
 	case 500: idx = 71; break;
 
-	/* status code not in QPACK static table, idx is null. */
+	/* status code not in QPACK static table, idx is 0. */
 	default: break;
 	}
 
@@ -265,8 +266,6 @@ int qpack_encode_field_section_line(struct buffer *out)
 	return 0;
 }
 
-#define QPACK_LFL_WLN_BIT  0x20 // Literal field line with literal name
-
 /* Encode a header in literal field line with literal name.
  * Returns 0 on success else non-zero.
  */
@@ -281,7 +280,7 @@ int qpack_encode_header(struct buffer *out, const struct ist n, const struct ist
 
 	/* literal field line with literal name
 	 * | 0 | 0 | 1 | N | H | . | . | . |
-	 * N :(allow an intermediary to add the header in a dynamic table)
+	 * N: allow an intermediary to add the header in a dynamic table
 	 * H: huffman encoded
 	 * name len
 	 */

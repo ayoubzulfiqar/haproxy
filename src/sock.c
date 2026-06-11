@@ -162,8 +162,8 @@ struct connection *sock_accept_conn(struct listener *l, int *status)
 	case ENFILE:
 		if (p)
 			send_log(p, LOG_EMERG,
-			         "Proxy %s reached system FD limit (maxsock=%d). Please check system tunables.\n",
-			         p->id, global.maxsock);
+			         "Proxy %s reached system FD limit (actconn=%d). Please check system tunables.\n",
+			         p->id, actconn);
 		ret = CO_AC_PAUSE;
 		break;
 
@@ -179,8 +179,8 @@ struct connection *sock_accept_conn(struct listener *l, int *status)
 	case ENOMEM:
 		if (p)
 			send_log(p, LOG_EMERG,
-			         "Proxy %s reached system memory limit (maxsock=%d). Please check system tunables.\n",
-			         p->id, global.maxsock);
+			         "Proxy %s reached system memory limit (actconn=%d). Please check system tunables.\n",
+			         p->id, actconn);
 		ret = CO_AC_PAUSE;
 		break;
 
@@ -381,7 +381,7 @@ void sock_unbind(struct receiver *rx)
 		return;
 
 	if (!stopping && master &&
-	    rx->flags & RX_F_INHERITED)
+	    rx->flags & RX_F_INHERITED_FD)
 		return;
 
 	rx->flags &= ~RX_F_BOUND;
@@ -533,7 +533,7 @@ int sock_get_old_sockets(const char *unixsocket)
 
 	}
 	memset(&msghdr, 0, sizeof(msghdr));
-	cmsgbuf = malloc(CMSG_SPACE(sizeof(int)) * MAX_SEND_FD);
+	cmsgbuf = malloc(array_size_or_fail(CMSG_SPACE(sizeof(int)), MAX_SEND_FD));
 	if (!cmsgbuf) {
 		ha_warning("Failed to allocate memory to send sockets\n");
 		goto out;
@@ -561,13 +561,13 @@ int sock_get_old_sockets(const char *unixsocket)
 		goto out;
 	}
 
-	tmpbuf = malloc(fd_nb * (1 + MAXPATHLEN + 1 + IFNAMSIZ + sizeof(int)));
+	tmpbuf = malloc(array_size_or_fail(fd_nb, (1 + MAXPATHLEN + 1 + IFNAMSIZ + sizeof(int))));
 	if (tmpbuf == NULL) {
 		ha_warning("Failed to allocate memory while receiving sockets\n");
 		goto out;
 	}
 
-	tmpfd = malloc(fd_nb * sizeof(int));
+	tmpfd = malloc(array_size_or_fail(fd_nb, sizeof(int)));
 	if (tmpfd == NULL) {
 		ha_warning("Failed to allocate memory while receiving sockets\n");
 		goto out;
@@ -905,6 +905,23 @@ void sock_conn_ctrl_close(struct connection *conn)
 	conn->handle.fd = DEAD_FD_MAGIC;
 }
 
+/* call getsockopt() for <level> and <optname> on connection <conn>'s socket,
+ * store the result in <buf> for at most <size> bytes, and return the number
+ * of bytes read on success (which may be zero). Returns < 0 on error.
+ * Note that the recommended way to use the level is to pass IPPROTO_TCP for
+ * TCP_*, IPPROTO_UDP for UDP_*, IPPROTO_IP for IP_*, IPPROTO_IPV6 for IPV6_*,
+ * and SOL_SOCKET for UNIX sockets.
+ */
+int sock_conn_get_opt(const struct connection *conn, int level, int optname, void *buf, int size)
+{
+	socklen_t opt_len = size;
+
+	if (getsockopt(conn->handle.fd, level, optname, buf, &opt_len) == -1)
+		return -1;
+
+	return opt_len;
+}
+
 /* This is the callback which is set when a connection establishment is pending
  * and we have nothing to send. It may update the FD polling status to indicate
  * !READY. It returns 0 if it fails in a fatal way or needs to poll to go
@@ -994,6 +1011,7 @@ int sock_conn_check(struct connection *conn)
 			goto wait;
 
 		if (errno && errno != EISCONN) {
+			conn_set_errno(conn, errno);
 			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_connect_err);
 			goto out_error;
 		}

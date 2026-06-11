@@ -76,6 +76,7 @@ struct protocol proto_tcpv4 = {
 	.check_events   = sock_check_events,
 	.ignore_events  = sock_ignore_events,
 	.get_info       = tcp_get_info,
+	.get_opt        = sock_conn_get_opt,
 
 	/* binding layer */
 	.rx_suspend     = tcp_suspend_receiver,
@@ -121,6 +122,7 @@ struct protocol proto_tcpv6 = {
 	.check_events   = sock_check_events,
 	.ignore_events  = sock_ignore_events,
 	.get_info       = tcp_get_info,
+	.get_opt        = sock_conn_get_opt,
 
 	/* binding layer */
 	.rx_suspend     = tcp_suspend_receiver,
@@ -167,6 +169,7 @@ struct protocol proto_mptcpv4 = {
 	.check_events   = sock_check_events,
 	.ignore_events  = sock_ignore_events,
 	.get_info       = tcp_get_info,
+	.get_opt        = sock_conn_get_opt,
 
 	/* binding layer */
 	.rx_suspend     = tcp_suspend_receiver,
@@ -212,6 +215,7 @@ struct protocol proto_mptcpv6 = {
 	.check_events   = sock_check_events,
 	.ignore_events  = sock_ignore_events,
 	.get_info       = tcp_get_info,
+	.get_opt        = sock_conn_get_opt,
 
 	/* binding layer */
 	.rx_suspend     = tcp_suspend_receiver,
@@ -778,6 +782,17 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		}
 	}
 #endif
+#if defined(TCP_SAVE_SYN)
+	if (listener->bind_conf->tcp_ss) {
+		if (setsockopt(fd, IPPROTO_TCP, TCP_SAVE_SYN,
+			       &listener->bind_conf->tcp_ss, sizeof(listener->bind_conf->tcp_ss)) == -1) {
+			chunk_appendf(msg, "%scannot set TCP Save SYN, (%s)", msg->data ? ", " : "",
+				      strerror(errno));
+			err |= ERR_WARN;
+		}
+	} else
+		setsockopt(fd, IPPROTO_TCP, TCP_SAVE_SYN, &zero, sizeof(zero));
+#endif
 #if defined(TCP_USER_TIMEOUT)
 	if (listener->bind_conf->tcp_ut) {
 		if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
@@ -909,7 +924,7 @@ static int tcp_suspend_receiver(struct receiver *rx)
 	 * parent process and any possible subsequent worker inheriting it.
 	 * Thus we just stop receiving from it.
 	 */
-	if (rx->flags & RX_F_INHERITED)
+	if (rx->flags & RX_F_INHERITED_SOCK)
 		goto done;
 
 	if (connect(rx->fd, &sa, sizeof(sa)) < 0)
@@ -945,7 +960,7 @@ static int tcp_resume_receiver(struct receiver *rx)
 	if (rx->fd < 0)
 		return 0;
 
-	if ((rx->flags & RX_F_INHERITED) || listen(rx->fd, listener_backlog(l)) == 0) {
+	if ((rx->flags & RX_F_INHERITED_SOCK) || listen(rx->fd, listener_backlog(l)) == 0) {
 		fd_want_recv(l->rx.fd);
 		return 1;
 	}
@@ -1013,7 +1028,32 @@ static int tcp_get_info(struct connection *conn, long long int *info, int info_n
 
 static void __proto_tcp_init(void)
 {
-#if defined(__linux__) && !defined(TCP_MD5SIG)
+#if defined(__linux__) && defined(TCP_MD5SIG)
+	/* check if the setsockopt works to register a line in haproxy -vv */
+	struct sockaddr_in *addr;
+	int fd;
+	struct tcp_md5sig md5 = {};
+
+
+	addr = (struct sockaddr_in *)&md5.tcpm_addr;
+
+	addr->sin_family = AF_INET;
+	addr->sin_port = 0;
+	addr->sin_addr.s_addr = htonl(0x7F000001);
+
+	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (fd < 0) {
+		goto end;
+	}
+	md5.tcpm_keylen = strlcpy2((char*)md5.tcpm_key, "foobar", sizeof(md5.tcpm_key));
+	if (setsockopt(fd, IPPROTO_TCP, TCP_MD5SIG, &md5, sizeof(md5)) < 0) {
+		goto end;
+	}
+	hap_register_feature("HAVE_WORKING_TCP_MD5SIG");
+end:
+	if (fd >= 0)
+		close(fd);
+
 	hap_register_feature("HAVE_TCP_MD5SIG");
 #endif
 }

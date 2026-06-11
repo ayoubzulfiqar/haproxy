@@ -25,6 +25,7 @@
 #include <haproxy/quic_retransmit.h>
 #include <haproxy/quic_retry.h>
 #include <haproxy/quic_sock.h>
+#include <haproxy/quic_stats.h>
 #include <haproxy/quic_stream.h>
 #include <haproxy/quic_tls.h>
 #include <haproxy/quic_trace.h>
@@ -439,7 +440,8 @@ static int qc_send_ppkts(struct buffer *buf, struct quic_conn *qc)
 			}
 			qc->path->in_flight += pkt->in_flight_len;
 			pkt->pktns->tx.in_flight += pkt->in_flight_len;
-			if (quic_tune_test(QUIC_TUNE_FB_CC_HYSTART, qc) && pkt->pktns == qc->apktns)
+			if (quic_tune_test(QUIC_TUNE_FB_CC_HYSTART, qc) && pkt->pktns == qc->apktns &&
+			    cc->algo->hystart_start_round != NULL)
 				cc->algo->hystart_start_round(cc, pkt->pn_node.key);
 			if (pkt->in_flight_len)
 				qc_set_timer(qc);
@@ -726,7 +728,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 
 			/* TODO currently it's not possible to emit an ACK and probing data simultaneously (see qc_do_build_pkt()).
 			 * As a side-effect, this could cause coalescing of two packets of the same type which should be avoided.
-			 * To implement this, a new datagram is forced by invokation of qc_txb_store(). This must then be checked
+			 * To implement this, a new datagram is forced by invocation of qc_txb_store(). This must then be checked
 			 * if padding is required as in this case this will be the last packet of the current datagram.
 			 */
 			if (probe && (must_ack || (qel->pktns->flags & QUIC_FL_PKTNS_ACK_REQUIRED)))
@@ -1779,44 +1781,43 @@ static inline int quic_do_enc_token(unsigned char **pos, const unsigned char *en
 	return 1;
 }
 
-/* Encode a token depending on <qc> connection type (listener or not).
- * For listeners, ony a null byte is encoded (no token).
- * For clients, if a RETRY token has been received, it is encoded, if not, if a
- * new token has been received (from NEW_TOKEN frame) and could be retrieved
- * from cache, it is encoded, if not a null byte is encoded (no token).
+/* Encode an INITIAL token at <pos> buffer position, without exceeding <end>
+ * pointer.
+ *
+ * On client side, token is either retrieved from a previously received RETRY
+ * paquet, or from the server cache populated by a NEW_TOKEN frame received by
+ * a previous connection. An empty field is encoded if no token is available.
+ *
+ * On server side, INITIAL token is not used so an empty field is encoded.
+ *
+ * Returns 1 on success or 0 on error.
  */
 static inline int quic_enc_token(struct quic_conn *qc,
                                  unsigned char **pos, const unsigned char *end)
 {
-	int ret = 0;
-	const unsigned char *tok;
+	struct server *s;
+	unsigned char *tok;
 	size_t toklen;
 
-	if (!qc_is_back(qc)) {
-		ret = quic_do_enc_token(pos, end, NULL, 0);
-	}
-	else if (qc->retry_token) {
+	if (qc->retry_token) {
+		/* Only clients may received token from a RETRY packet. */
+		BUG_ON(!qc_is_back(qc));
 		tok = qc->retry_token;
 		toklen = qc->retry_token_len;
-		ret = quic_do_enc_token(pos, end, tok, toklen);
 	}
-	else if (!qc->conn) {
-		TRACE_ERROR("connection closed", QUIC_EV_CONN_TXPKT, qc);
-		goto out;
+	else if (qc_is_back(qc) && qc->conn) {
+		/* Retrieve token from the server cache. */
+		s = __objt_server(qc->conn->target);
+		tok    = (unsigned char *)istptr(s->per_thr[tid].quic_retry_token);
+		toklen = istlen(s->per_thr[tid].quic_retry_token);
 	}
 	else {
-		struct server *s = __objt_server(qc->conn->target);
-		struct ist *stok;
-
-		stok = &s->per_thr[tid].quic_retry_token;
-		if (isttest(*stok))
-			ret = quic_do_enc_token(pos, end, (unsigned char *)istptr(*stok), istlen(*stok));
-		else
-			ret = quic_do_enc_token(pos, end, NULL, 0);
+		/* Prepare to encode an empty field. */
+		tok = NULL;
+		toklen = 0;
 	}
 
- out:
-	return ret;
+	return quic_do_enc_token(pos, end, tok, toklen);
 }
 
 /* This function builds a clear packet from <pkt> information (its type)
@@ -1840,7 +1841,7 @@ static inline int quic_enc_token(struct quic_conn *qc,
  * depending on its list of parameters. In most cases, <frms> frame list is
  * not empty. So, this function first tries to build this list of frames.
  *
- * Return 1 if succeeded (enough room to buile this packet), O if not.
+ * Return 1 if succeeded (enough room to build this packet), 0 if not.
  */
 static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
                            size_t dglen, struct quic_tx_packet *pkt,
@@ -1972,7 +1973,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 			if (qel->pktns->tx.pto_probe) {
 				/* If a probing packet was asked and could not be built,
 				 * this is not because there was not enough room, but due to
-				 * its frames which were already acknowledeged.
+				 * its frames which were already acknowledged.
 				 * See qc_stream_frm_is_acked()) called by qc_build_frms().
 				 * Note that qc_stream_frm_is_acked() logs a trace in this
 				 * case mentioning some frames were already acknowledged.
@@ -2028,8 +2029,8 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	/* Handle Initial packet padding if necessary. */
 	if (padding && dglen < QUIC_INITIAL_PACKET_MINLEN) {
 		padding_len = QUIC_INITIAL_PACKET_MINLEN - dglen;
-
 		len += padding_len;
+
 		/* Update size of packet length field with new PADDING data. */
 		if (pkt->type != QUIC_PACKET_TYPE_SHORT) {
 			size_t len_sz_diff = quic_int_getsize(len) - len_sz;
@@ -2037,6 +2038,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 				padding_len -= len_sz_diff;
 				len_sz += len_sz_diff;
 				dglen += len_sz_diff;
+				len -= len_sz_diff;
 			}
 		}
 	}
@@ -2061,7 +2063,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	 * must be at least QUIC_PACKET_PN_MAXLEN(4) bytes long, so that the sample
 	 * will be extracted as the AEAD tag.
 	 *
-	 * Note that from here, <len> includes <*pn_len>, the total frame lenghts,
+	 * Note that from here, <len> includes <*pn_len>, the total frame lengths,
 	 * and QUIC_TLS_TAG_LEN(16).
 	 */
 	if (len < QUIC_PACKET_PN_MAXLEN + QUIC_HP_SAMPLE_LEN) {
@@ -2073,6 +2075,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 		len += padding_len;
 	}
 
+	/* Encode length field : length of PN and payload (frames + TLS AEAD tag). */
 	if (pkt->type != QUIC_PACKET_TYPE_SHORT && !quic_enc_int(&pos, end, len))
 		goto no_room;
 
@@ -2086,7 +2089,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	/* payload building (ack-eliciting or not frames) */
 	payload = pos;
 	if (ack_frm_len) {
-		if (!qc_build_frm(&pos, end, &ack_frm, pkt, qc))
+		if (!qc_build_frm_pkt(&ack_frm, pkt, &pos, end, qc))
 			goto no_room;
 
 		pkt->largest_acked_pn = quic_pktns_get_largest_acked_pn(qel->pktns);
@@ -2097,7 +2100,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	if (!LIST_ISEMPTY(&frm_list)) {
 		struct quic_frame *tmp_cf;
 		list_for_each_entry_safe(cf, tmp_cf, &frm_list, list) {
-			if (!qc_build_frm(&pos, end, cf, pkt, qc)) {
+			if (!qc_build_frm_pkt(cf, pkt, &pos, end, qc)) {
 				ssize_t room = end - pos;
 				TRACE_PROTO("Not enough room", QUIC_EV_CONN_TXPKT,
 				            qc, NULL, NULL, &room);
@@ -2117,13 +2120,13 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	/* Build a PING frame if needed. */
 	if (add_ping_frm) {
 		frm.type = QUIC_FT_PING;
-		if (!qc_build_frm(&pos, end, &frm, pkt, qc))
+		if (!qc_build_frm_pkt(&frm, pkt, &pos, end, qc))
 			goto no_room;
 	}
 
 	/* Build a CONNECTION_CLOSE frame if needed. */
 	if (cc) {
-		if (!qc_build_frm(&pos, end, &cc_frm, pkt, qc))
+		if (!qc_build_frm_pkt(&cc_frm, pkt, &pos, end, qc))
 			goto no_room;
 
 		pkt->flags |= QUIC_FL_TX_PACKET_CC;
@@ -2133,7 +2136,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	if (padding_len) {
 		frm.type = QUIC_FT_PADDING;
 		frm.padding.len = padding_len;
-		if (!qc_build_frm(&pos, end, &frm, pkt, qc))
+		if (!qc_build_frm_pkt(&frm, pkt, &pos, end, qc))
 			goto no_room;
 	}
 

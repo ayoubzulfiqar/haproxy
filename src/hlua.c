@@ -23,6 +23,11 @@
 #error "Requires Lua 5.3 or later."
 #endif
 
+/* LUA_GNAME was introduced in Lua 5.4 */
+#ifndef LUA_GNAME
+#define LUA_GNAME "_G"
+#endif
+
 #include <import/ebpttree.h>
 
 #include <haproxy/api.h>
@@ -57,7 +62,6 @@
 #include <haproxy/session.h>
 #include <haproxy/ssl_ckch.h>
 #include <haproxy/ssl_sock.h>
-#include <haproxy/stats-t.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
@@ -172,6 +176,24 @@ static int hlua_panic_ljmp(lua_State *L) { WILL_LJMP(longjmp(safe_ljmp_env, 1));
  */
 static struct list referenced_functions = LIST_HEAD_INIT(referenced_functions);
 
+/* List of callbacks registered via hap_register_hlua_state_init(), called
+ * for each new lua_State created in hlua_init_state().
+ */
+static struct list hlua_state_init_list = LIST_HEAD_INIT(hlua_state_init_list);
+
+void hap_register_hlua_state_init(int (*fct)(lua_State *L, char **errmsg))
+{
+	struct hlua_state_init_fct *entry;
+
+	entry = calloc(1, sizeof(*entry));
+	if (!entry) {
+		ha_alert("hlua: out of memory registering state init callback\n");
+		exit(1);
+	}
+	entry->fct = fct;
+	LIST_APPEND(&hlua_state_init_list, &entry->list);
+}
+
 /* This variable is used only during initialization to identify the Lua state
  * currently being initialized. 0 is the common lua state, 1 to n are the Lua
  * states dedicated to each thread (in this case hlua_state_id==tid+1).
@@ -273,6 +295,7 @@ static const char *hlua_tostring_safe(lua_State *L, int index)
 			break;
 		default:
 			/* error was caught */
+			lua_pop(L, 1); // consume the lua object pushed on the stack since we ignore it
 			return NULL;
 	}
 	return str;
@@ -323,6 +346,7 @@ static const char *hlua_pushvfstring_safe(lua_State *L, const char *fmt, va_list
 			break;
 		default:
 			/* error was caught */
+			lua_pop(L, 1); // consume the lua object pushed on the stack since we ignore it
 			dst = NULL;
 	}
 	va_end(cpy_argp);
@@ -380,6 +404,7 @@ static const char *hlua_pushfstring_safe(lua_State *L, const char *fmt, ...)
 
 /* Applet status flags */
 #define APPLET_DONE     0x01 /* applet processing is done. */
+#define APPLET_REQ_RECV 0x02 /* The request was fully received */
 /* unused: 0x02 */
 #define APPLET_HDR_SENT 0x04 /* Response header sent. */
 /* unused: 0x08, 0x10 */
@@ -511,6 +536,31 @@ static uint32_t hlua_timeout_burst = 1000; /* burst timeout. */
 static uint32_t hlua_timeout_session = 4000; /* session timeout. */
 static uint32_t hlua_timeout_task = 0; /* task timeout. */
 static uint32_t hlua_timeout_applet = 4000; /* applet timeout. */
+
+/* tune.lua.openlibs: bitmask of optional Lua standard libraries to open.
+ * The base and coroutine libraries are always loaded regardless of this
+ * setting (base provides core functions required by HAProxy; coroutine is
+ * always overridden by HAProxy's safe wrapper).
+ */
+#define HLUA_OPENLIBS_ALL  0xFF
+
+static const struct {
+	const char    *name;
+	lua_CFunction  open;
+	uint           flag;
+} hlua_openlibs_tbl[] = {
+	{ LUA_TABLIBNAME,  luaopen_table,   0x01 },
+	{ LUA_IOLIBNAME,   luaopen_io,      0x02 },
+	{ LUA_OSLIBNAME,   luaopen_os,      0x04 },
+	{ LUA_STRLIBNAME,  luaopen_string,  0x08 },
+	{ LUA_MATHLIBNAME, luaopen_math,    0x10 },
+	{ LUA_UTF8LIBNAME, luaopen_utf8,    0x20 },
+	{ LUA_LOADLIBNAME, luaopen_package, 0x40 },
+	{ LUA_DBLIBNAME,   luaopen_debug,   0x80 },
+	{ NULL, NULL, 0 }
+};
+
+static uint hlua_openlibs_flags = HLUA_OPENLIBS_ALL;
 
 /* hlua multipurpose timer:
  *  used to compute burst lua time (within a single hlua_ctx_resume())
@@ -676,7 +726,7 @@ struct hlua_mem_allocator {
 	size_t limit;
 };
 
-static struct hlua_mem_allocator hlua_global_allocator THREAD_ALIGNED(64);
+static struct hlua_mem_allocator hlua_global_allocator THREAD_ALIGNED();
 
 /* hlua event subscription */
 struct hlua_event_sub {
@@ -870,6 +920,7 @@ void hlua_unref(lua_State *L, int ref)
 __LJMP static int _hlua_traceback(lua_State *L)
 {
 	lua_Debug *ar = lua_touserdata(L, 1);
+	int ret;
 
 	/* Fill fields:
 	 * 'S': fills in the fields source, short_src, linedefined, lastlinedefined, and what;
@@ -877,7 +928,10 @@ __LJMP static int _hlua_traceback(lua_State *L)
 	 * 'n': fills in the field name and namewhat;
 	 * 't': fills in the field istailcall;
 	 */
-	return lua_getinfo(L, "Slnt", ar);
+	ret = lua_getinfo(L, "Slnt", ar);
+	if (!ret)
+		WILL_LJMP(luaL_error(L, "unexpected"));
+	return 0;
 }
 
 
@@ -896,10 +950,11 @@ const char *hlua_traceback(lua_State *L, const char* sep)
 		lua_pushlightuserdata(L, &ar);
 
 		/* safe getinfo */
-		switch (lua_pcall(L, 1, 1, 0)) {
+		switch (lua_pcall(L, 1, 0, 0)) {
 			case LUA_OK:
 				break;
 			default:
+				lua_pop(L, 1); // consume the lua object pushed on the stack since we ignore it
 				goto end; // abort
 		}
 
@@ -998,6 +1053,7 @@ static int hlua_pusherror(lua_State *L, const char *fmt, ...)
 		case LUA_OK:
 			break;
 		default:
+			lua_pop(L, 1); // consume the lua object pushed on the stack since we ignore it
 			ret = 0;
 	}
 
@@ -2911,20 +2967,20 @@ __LJMP static int hlua_socket_receive_yield(struct lua_State *L, int status, lua
 
 		/* remove final \r\n. */
 		if (nblk == 1) {
-			if (blk1[len1-1] == '\n') {
+			if (len1 && blk1[len1-1] == '\n') {
 				len1--;
 				skip_at_end++;
-				if (blk1[len1-1] == '\r') {
+				if (len1 && blk1[len1-1] == '\r') {
 					len1--;
 					skip_at_end++;
 				}
 			}
 		}
 		else {
-			if (blk2[len2-1] == '\n') {
+			if (len2 && blk2[len2-1] == '\n') {
 				len2--;
 				skip_at_end++;
-				if (blk2[len2-1] == '\r') {
+				if (len2 && blk2[len2-1] == '\r') {
 					len2--;
 					skip_at_end++;
 				}
@@ -3944,7 +4000,7 @@ __LJMP static int hlua_channel_get_data_yield(lua_State *L, int status, lua_KCon
 		if (!len)
 			goto dup;
 		if (len == -1)
-			len = global.tune.bufsize;
+			len = c_size(chn);
 		if (len < 0) {
 			lua_pushfstring(L, "length out of range.");
 			WILL_LJMP(lua_error(L));
@@ -4027,7 +4083,7 @@ __LJMP static int hlua_channel_get_line_yield(lua_State *L, int status, lua_KCon
 		if (!len)
 			goto dup;
 		if (len == -1)
-			len = global.tune.bufsize;
+			len = c_size(chn);
 		if (len < 0) {
 			lua_pushfstring(L, "length out of range.");
 			WILL_LJMP(lua_error(L));
@@ -4918,7 +4974,7 @@ __LJMP static int hlua_run_sample_fetch(lua_State *L)
 
 	/* Run the sample fetch process. */
 	smp_set_owner(&smp, hsmp->p, hsmp->s->sess, hsmp->s, hsmp->dir & SMP_OPT_DIR);
-	if (!f->process(args, &smp, f->kw, f->private)) {
+	if (!EXEC_CTX_WITH_RET(f->exec_ctx, f->process(args, &smp, f->kw, f->private))) {
 		if (hsmp->flags & HLUA_F_AS_STRING)
 			lua_pushstring(L, "");
 		else
@@ -5051,7 +5107,7 @@ __LJMP static int hlua_run_sample_conv(lua_State *L)
 	}
 
 	/* Run the sample conversion process. */
-	if (!conv->process(args, &smp, conv->private)) {
+	if (!EXEC_CTX_WITH_RET(conv->exec_ctx, conv->process(args, &smp, conv->private))) {
 		if (hsmp->flags & HLUA_F_AS_STRING)
 			lua_pushstring(L, "");
 		else
@@ -5298,6 +5354,9 @@ __LJMP static int hlua_applet_tcp_getline_yield(lua_State *L, int status, lua_KC
 
 	/* End of data: commit the total strings and return. */
 	if (ret < 0) {
+		/* Stop to consume */
+		applet_wont_consume(luactx->appctx);
+
 		luaL_pushresult(&luactx->b);
 		return 1;
 	}
@@ -5312,6 +5371,10 @@ __LJMP static int hlua_applet_tcp_getline_yield(lua_State *L, int status, lua_KC
 		luaL_addlstring(&luactx->b, blk2, len2);
 
 	applet_skip_input(luactx->appctx, len1+len2);
+
+	/* Stop to consume until the next receive */
+	applet_wont_consume(luactx->appctx);
+
 	luaL_pushresult(&luactx->b);
 	return 1;
 }
@@ -5320,6 +5383,9 @@ __LJMP static int hlua_applet_tcp_getline_yield(lua_State *L, int status, lua_KC
 __LJMP static int hlua_applet_tcp_getline(lua_State *L)
 {
 	struct hlua_appctx *luactx = MAY_LJMP(hlua_checkapplet_tcp(L, 1));
+
+	/* Restart to consume - could have been disabled by a previous receive */
+	applet_will_consume(luactx->appctx);
 
 	/* Initialise the string catenation. */
 	luaL_buffinit(L, &luactx->b);
@@ -5347,6 +5413,9 @@ __LJMP static int hlua_applet_tcp_recv_try(lua_State *L)
 	/* Data not yet available. return yield. */
 	if (ret == 0) {
 		if (tick_is_expired(exp_date, now_ms)) {
+			/* Stop to consume until the next receive */
+			applet_wont_consume(luactx->appctx);
+
 			/* return the result. */
 			lua_pushnil(L);
 			return 1;
@@ -5358,6 +5427,9 @@ __LJMP static int hlua_applet_tcp_recv_try(lua_State *L)
 
 	/* End of data: commit the total strings and return. */
 	if (ret < 0) {
+		/* Stop to consume */
+		applet_wont_consume(luactx->appctx);
+
 		luaL_pushresult(&luactx->b);
 		return 1;
 	}
@@ -5378,6 +5450,9 @@ __LJMP static int hlua_applet_tcp_recv_try(lua_State *L)
 		applet_skip_input(luactx->appctx, len1+len2);
 
 		if (tick_is_expired(exp_date, now_ms)) {
+			/* Stop to consume until the next receive */
+			applet_wont_consume(luactx->appctx);
+
 			/* return the result. */
 			luaL_pushresult(&luactx->b);
 			return 1;
@@ -5411,6 +5486,9 @@ __LJMP static int hlua_applet_tcp_recv_try(lua_State *L)
 			applet_need_more_data(luactx->appctx);
 			return 0;
 		}
+
+		/* Stop to consume until the next receive */
+		applet_wont_consume(luactx->appctx);
 
 		/* return the result. */
 		luaL_pushresult(&luactx->b);
@@ -5466,6 +5544,9 @@ __LJMP static int hlua_applet_tcp_recv(lua_State *L)
 	exp_date = delay ? tick_add(now_ms, delay) : TICK_ETERNITY;
 	lua_pushinteger(L, exp_date);
 
+	/* Restart to consume - could have been disabled by a previous receive */
+	applet_will_consume(luactx->appctx);
+
 	/* Initialise the string catenation. */
 	luaL_buffinit(L, &luactx->b);
 
@@ -5486,6 +5567,9 @@ __LJMP static int hlua_applet_tcp_try_recv(lua_State *L)
 
 	/* set the expiration date (mandatory arg but not relevant here) */
 	lua_pushinteger(L, now_ms);
+
+	/* Restart to consume - could have been disabled by a previous receive */
+	applet_will_consume(luactx->appctx);
 
 	/* Initialise the string catenation. */
 	luaL_buffinit(L, &luactx->b);
@@ -5763,10 +5847,14 @@ __LJMP static int hlua_applet_http_get_priv(lua_State *L)
 __LJMP static int hlua_applet_http_getline_yield(lua_State *L, int status, lua_KContext ctx)
 {
 	struct hlua_appctx *luactx = MAY_LJMP(hlua_checkapplet_http(L, 1));
+	struct hlua_http_ctx *http_ctx = luactx->appctx->svcctx;
 	struct buffer *inbuf = applet_get_inbuf(luactx->appctx);
 	struct htx *htx;
 	struct htx_blk *blk;
 	int stop = 0;
+
+	if (http_ctx->flags & APPLET_REQ_RECV)
+		goto end;
 
 	if (!inbuf)
 		goto wait;
@@ -5816,8 +5904,10 @@ __LJMP static int hlua_applet_http_getline_yield(lua_State *L, int status, lua_K
 	/* The message was fully consumed and no more data are expected
 	 * (EOM flag set).
 	 */
-	if (htx_is_empty(htx) && (htx->flags & HTX_FL_EOM))
+	if (htx_is_empty(htx) && (htx->flags & HTX_FL_EOM)) {
+		http_ctx->flags |= APPLET_REQ_RECV;
 		stop = 1;
+	}
 
 	htx_to_buf(htx, inbuf);
 	if (!stop) {
@@ -5825,6 +5915,10 @@ __LJMP static int hlua_applet_http_getline_yield(lua_State *L, int status, lua_K
 		applet_need_more_data(luactx->appctx);
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_applet_http_getline_yield, TICK_ETERNITY, 0));
 	}
+
+  end:
+	/* Stop to consume until the next receive or the end of the response */
+	applet_wont_consume(luactx->appctx);
 
 	/* return the result. */
 	luaL_pushresult(&luactx->b);
@@ -5836,6 +5930,9 @@ __LJMP static int hlua_applet_http_getline_yield(lua_State *L, int status, lua_K
 __LJMP static int hlua_applet_http_getline(lua_State *L)
 {
 	struct hlua_appctx *luactx = MAY_LJMP(hlua_checkapplet_http(L, 1));
+
+	/* Restart to consume - could have been disabled by a previous receive */
+	applet_will_consume(luactx->appctx);
 
 	/* Initialise the string catenation. */
 	luaL_buffinit(L, &luactx->b);
@@ -5850,10 +5947,14 @@ __LJMP static int hlua_applet_http_getline(lua_State *L)
 __LJMP static int hlua_applet_http_recv_yield(lua_State *L, int status, lua_KContext ctx)
 {
 	struct hlua_appctx *luactx = MAY_LJMP(hlua_checkapplet_http(L, 1));
+	struct hlua_http_ctx *http_ctx = luactx->appctx->svcctx;
 	struct buffer *inbuf = applet_get_inbuf(luactx->appctx);
 	struct htx *htx;
 	struct htx_blk *blk;
 	int len;
+
+	if (http_ctx->flags & APPLET_REQ_RECV)
+		goto end;
 
 	if (!inbuf)
 		goto wait;
@@ -5902,8 +6003,10 @@ __LJMP static int hlua_applet_http_recv_yield(lua_State *L, int status, lua_KCon
 	/* The message was fully consumed and no more data are expected
 	 * (EOM flag set).
 	 */
-	if (htx_is_empty(htx) && (htx->flags & HTX_FL_EOM))
+	if (htx_is_empty(htx) && (htx->flags & HTX_FL_EOM)) {
+		http_ctx->flags |= APPLET_REQ_RECV;
 		len = 0;
+	}
 
 	htx_to_buf(htx, inbuf);
 	applet_fl_clr(luactx->appctx, APPCTX_FL_INBLK_FULL);
@@ -5919,6 +6022,7 @@ __LJMP static int hlua_applet_http_recv_yield(lua_State *L, int status, lua_KCon
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_applet_http_recv_yield, TICK_ETERNITY, 0));
 	}
 
+  end:
 	/* Stop to consume until the next receive or the end of the response */
 	applet_wont_consume(luactx->appctx);
 
@@ -6091,6 +6195,17 @@ __LJMP static int hlua_applet_http_status(lua_State *L)
 	}
 
 	http_ctx->status = status;
+	/* Anchor the reason string in the registry so the Lua GC can't
+	 * collect it before start_response() reads it back. The previous
+	 * direct pointer assignment was a use-after-free if a GC ran
+	 * between set_status() and start_response().
+	 */
+	lua_pushlightuserdata(L, &http_ctx->reason);
+	if (reason)
+		lua_pushvalue(L, 3);
+	else
+		lua_pushnil(L);
+	lua_settable(L, LUA_REGISTRYINDEX);
 	http_ctx->reason = reason;
 	lua_pushboolean(L, 1);
 	return 1;
@@ -6518,7 +6633,7 @@ __LJMP static int hlua_http_req_rep_hdr(lua_State *L)
 	if (htxn->dir != SMP_OPT_DIR_REQ || !IS_HTX_STRM(htxn->s))
 		WILL_LJMP(lua_error(L));
 
-	return MAY_LJMP(hlua_http_rep_hdr(L, &htxn->s->txn->req, 1));
+	return MAY_LJMP(hlua_http_rep_hdr(L, &htxn->s->txn.http->req, 1));
 }
 
 __LJMP static int hlua_http_res_rep_hdr(lua_State *L)
@@ -6531,7 +6646,7 @@ __LJMP static int hlua_http_res_rep_hdr(lua_State *L)
 	if (htxn->dir != SMP_OPT_DIR_RES || !IS_HTX_STRM(htxn->s))
 		WILL_LJMP(lua_error(L));
 
-	return MAY_LJMP(hlua_http_rep_hdr(L, &htxn->s->txn->rsp, 1));
+	return MAY_LJMP(hlua_http_rep_hdr(L, &htxn->s->txn.http->rsp, 1));
 }
 
 __LJMP static int hlua_http_req_rep_val(lua_State *L)
@@ -6544,7 +6659,7 @@ __LJMP static int hlua_http_req_rep_val(lua_State *L)
 	if (htxn->dir != SMP_OPT_DIR_REQ || !IS_HTX_STRM(htxn->s))
 		WILL_LJMP(lua_error(L));
 
-	return MAY_LJMP(hlua_http_rep_hdr(L, &htxn->s->txn->req, 0));
+	return MAY_LJMP(hlua_http_rep_hdr(L, &htxn->s->txn.http->req, 0));
 }
 
 __LJMP static int hlua_http_res_rep_val(lua_State *L)
@@ -6557,7 +6672,7 @@ __LJMP static int hlua_http_res_rep_val(lua_State *L)
 	if (htxn->dir != SMP_OPT_DIR_RES || !IS_HTX_STRM(htxn->s))
 		WILL_LJMP(lua_error(L));
 
-	return MAY_LJMP(hlua_http_rep_hdr(L, &htxn->s->txn->rsp, 0));
+	return MAY_LJMP(hlua_http_rep_hdr(L, &htxn->s->txn.http->rsp, 0));
 }
 
 /* This function deletes all the occurrences of an header.
@@ -6586,7 +6701,7 @@ __LJMP static int hlua_http_req_del_hdr(lua_State *L)
 	if (htxn->dir != SMP_OPT_DIR_REQ || !IS_HTX_STRM(htxn->s))
 		WILL_LJMP(lua_error(L));
 
-	return hlua_http_del_hdr(L, &htxn->s->txn->req);
+	return hlua_http_del_hdr(L, &htxn->s->txn.http->req);
 }
 
 __LJMP static int hlua_http_res_del_hdr(lua_State *L)
@@ -6599,7 +6714,7 @@ __LJMP static int hlua_http_res_del_hdr(lua_State *L)
 	if (htxn->dir != SMP_OPT_DIR_RES || !IS_HTX_STRM(htxn->s))
 		WILL_LJMP(lua_error(L));
 
-	return hlua_http_del_hdr(L, &htxn->s->txn->rsp);
+	return hlua_http_del_hdr(L, &htxn->s->txn.http->rsp);
 }
 
 /* This function adds an header. It is a wrapper used by
@@ -6612,9 +6727,23 @@ __LJMP static inline int hlua_http_add_hdr(lua_State *L, struct http_msg *msg)
 	size_t value_len;
 	const char *value = MAY_LJMP(luaL_checklstring(L, 3, &value_len));
 	struct htx *htx = htxbuf(&msg->chn->buf);
+	size_t i;
+
+	/* Reject header values containing CR/LF/NUL to prevent HTTP header
+	 * injection on HTTP/1 output.
+	 */
+	for (i = 0; i < name_len; i++) {
+		if (name[i] == 0 || name[i] == '\r' || name[i] == '\n')
+			WILL_LJMP(lua_error(L));
+	}
+
+	for (i = 0; i < value_len; i++) {
+		if (value[i] == 0 || value[i] == '\r' || value[i] == '\n')
+			WILL_LJMP(lua_error(L));
+	}
 
 	lua_pushboolean(L, http_add_header(htx, ist2(name, name_len),
-					   ist2(value, value_len)));
+					   ist2(value, value_len), 1));
 	return 0;
 }
 
@@ -6628,7 +6757,7 @@ __LJMP static int hlua_http_req_add_hdr(lua_State *L)
 	if (htxn->dir != SMP_OPT_DIR_REQ || !IS_HTX_STRM(htxn->s))
 		WILL_LJMP(lua_error(L));
 
-	return hlua_http_add_hdr(L, &htxn->s->txn->req);
+	return hlua_http_add_hdr(L, &htxn->s->txn.http->req);
 }
 
 __LJMP static int hlua_http_res_add_hdr(lua_State *L)
@@ -6641,7 +6770,7 @@ __LJMP static int hlua_http_res_add_hdr(lua_State *L)
 	if (htxn->dir != SMP_OPT_DIR_RES || !IS_HTX_STRM(htxn->s))
 		WILL_LJMP(lua_error(L));
 
-	return hlua_http_add_hdr(L, &htxn->s->txn->rsp);
+	return hlua_http_add_hdr(L, &htxn->s->txn.http->rsp);
 }
 
 static int hlua_http_req_set_hdr(lua_State *L)
@@ -6654,8 +6783,8 @@ static int hlua_http_req_set_hdr(lua_State *L)
 	if (htxn->dir != SMP_OPT_DIR_REQ || !IS_HTX_STRM(htxn->s))
 		WILL_LJMP(lua_error(L));
 
-	hlua_http_del_hdr(L, &htxn->s->txn->req);
-	return hlua_http_add_hdr(L, &htxn->s->txn->req);
+	hlua_http_del_hdr(L, &htxn->s->txn.http->req);
+	return hlua_http_add_hdr(L, &htxn->s->txn.http->req);
 }
 
 static int hlua_http_res_set_hdr(lua_State *L)
@@ -6668,8 +6797,8 @@ static int hlua_http_res_set_hdr(lua_State *L)
 	if (htxn->dir != SMP_OPT_DIR_RES || !IS_HTX_STRM(htxn->s))
 		WILL_LJMP(lua_error(L));
 
-	hlua_http_del_hdr(L, &htxn->s->txn->rsp);
-	return hlua_http_add_hdr(L, &htxn->s->txn->rsp);
+	hlua_http_del_hdr(L, &htxn->s->txn.http->rsp);
+	return hlua_http_add_hdr(L, &htxn->s->txn.http->rsp);
 }
 
 /* This function set the method. */
@@ -7096,7 +7225,7 @@ __LJMP static int hlua_http_msg_set_body_len(lua_State *L)
 			goto success;
 
 		/* add "Transfer-Encoding: chunked" header */
-		if (!http_add_header(htx, ist("Transfer-Encoding"), ist("chunked")))
+		if (!http_add_header(htx, ist("Transfer-Encoding"), ist("chunked"), 0))
 			goto failure;
 		msg->flags |= (HTTP_MSGF_VER_11|HTTP_MSGF_XFER_LEN|HTTP_MSGF_TE_CHNK);
 		sl->flags |= (HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_XFER_ENC|HTX_SL_F_CHNK);
@@ -7128,7 +7257,7 @@ __LJMP static int hlua_http_msg_set_body_len(lua_State *L)
 		}
 
 		/* Now add Content-Length header */
-		if (!http_add_header(htx, ist("Content-Length"), ist(clen)))
+		if (!http_add_header(htx, ist("Content-Length"), ist(clen), 0))
 			goto failure;
 		msg->flags |= (HTTP_MSGF_VER_11|HTTP_MSGF_XFER_LEN|HTTP_MSGF_CNT_LEN);
 		sl->flags |= (HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN);
@@ -7462,7 +7591,7 @@ __LJMP static int hlua_http_msg_get_body(lua_State *L)
 		if (!len)
 			goto dup;
 		if (len == -1)
-			len = global.tune.bufsize;
+			len = c_size(msg->chn);
 		if (len < 0) {
 			lua_pushfstring(L, "length out of range.");
 			WILL_LJMP(lua_error(L));
@@ -8013,6 +8142,11 @@ struct http_hdr *hlua_httpclient_table_to_hdrs(lua_State *L)
 				goto next_value;
 			}
 
+			if (hdr_num >= global.tune.max_http_hdr) {
+				lua_pop(L, 2);
+				goto skip_headers;
+			}
+
 			v = lua_tolstring(L, -1, &vlen);
 			value = ist2(v, vlen);
 			name = ist2(n, nlen);
@@ -8540,7 +8674,7 @@ __LJMP static int hlua_txn_new(lua_State *L, struct stream *s, struct proxy *p, 
 		/* Creates the HTTP-Request object is the current proxy allows http. */
 		lua_pushstring(L, "http_req");
 		if (p->mode == PR_MODE_HTTP) {
-			if (!hlua_http_msg_new(L, &s->txn->req))
+			if (!hlua_http_msg_new(L, &s->txn.http->req))
 				return 0;
 		}
 		else
@@ -8550,7 +8684,7 @@ __LJMP static int hlua_txn_new(lua_State *L, struct stream *s, struct proxy *p, 
 		/* Creates the HTTP-Response object is the current proxy allows http. */
 		lua_pushstring(L, "http_res");
 		if (p->mode == PR_MODE_HTTP) {
-			if (!hlua_http_msg_new(L, &s->txn->rsp))
+			if (!hlua_http_msg_new(L, &s->txn.http->rsp))
 				return 0;
 		}
 		else
@@ -8750,7 +8884,7 @@ __LJMP static int hlua_txn_forward_reply(lua_State *L, struct stream *s)
 	h1m_init_res(&h1m);
 	htx = htx_from_buf(&s->res.buf);
 	channel_htx_truncate(&s->res, htx);
-	if (s->txn->req.flags & HTTP_MSGF_VER_11) {
+	if (s->txn.http->req.flags & HTTP_MSGF_VER_11) {
 		flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11);
 		sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"),
 				    ist2(status, status_len), ist2(reason, reason_len));
@@ -8848,7 +8982,7 @@ __LJMP static int hlua_txn_forward_reply(lua_State *L, struct stream *s)
 	htx->flags |= HTX_FL_EOM;
 
 	/* Now, forward the response and terminate the transaction */
-	s->txn->status = code;
+	s->txn.http->status = code;
 	htx_to_buf(htx, &s->res.buf);
 	if (!http_forward_proxy_resp(s, 1))
 		goto fail;
@@ -8900,7 +9034,7 @@ __LJMP static int hlua_txn_done(lua_State *L)
 
 	if (lua_gettop(L) == 1 || !lua_istable(L, 2)) {
 		/* No reply or invalid reply */
-		s->txn->status = 0;
+		s->txn.http->status = 0;
 		http_reply_and_close(s, 0, NULL);
 	}
 	else {
@@ -10188,6 +10322,7 @@ static int hlua_new_event_sub_safe(lua_State *L, struct event_hdl_sub *sub)
 			return 1;
 		default:
 			/* error was caught */
+			lua_pop(L, 1); // consume the lua object pushed on the stack since we ignore it
 			return 0;
 	}
 }
@@ -11065,8 +11200,11 @@ void hlua_applet_tcp_fct(struct appctx *ctx)
 		goto out;
 
 	/* The applet execution is already done. */
-	if (tcp_ctx->flags & APPLET_DONE)
+	if (tcp_ctx->flags & APPLET_DONE) {
+		/* Restart to consume to drain request data */
+		applet_will_consume(ctx);
 		goto out;
+	}
 
 	/* Execute the function. */
 	switch (hlua_ctx_resume(hlua, 1)) {
@@ -11074,6 +11212,9 @@ void hlua_applet_tcp_fct(struct appctx *ctx)
 	case HLUA_E_OK:
 		tcp_ctx->flags |= APPLET_DONE;
 		applet_set_eos(ctx);
+
+		/* Restart to consume to drain request data */
+		applet_will_consume(ctx);
 		break;
 
 	/* yield. */
@@ -11164,7 +11305,7 @@ static int hlua_applet_http_init(struct appctx *ctx)
 	struct task *task;
 	const char *error;
 
-	txn = strm->txn;
+	txn = strm->txn.http;
 	hlua = pool_alloc(pool_head_hlua);
 	if (!hlua) {
 		SEND_ERR(strm->be, "Lua applet http '%s': out of memory.\n",
@@ -11494,6 +11635,9 @@ void hlua_applet_http_fct(struct appctx *ctx)
 	if (!(strm->flags & SF_ERR_MASK))
 		strm->flags |= SF_ERR_RESOURCE;
 	http_ctx->flags |= APPLET_DONE;
+
+	/* Restart to consume to drain the request */
+	applet_will_consume(ctx);
 	goto out;
 }
 
@@ -13210,6 +13354,76 @@ static int hlua_cfg_parse_bool_sample_conversion(char **args, int section_type, 
 	return 0;
 }
 
+static int hlua_cfg_parse_openlibs(char **args, int section_type, struct proxy *curpx,
+                                   const struct proxy *defpx, const char *file, int line,
+                                   char **err)
+{
+	char *token, *save, *str;
+	uint flags = 0;
+	int has_none = 0;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (!*args[1]) {
+		memprintf(err, "'%s' expects 'all', 'none', or a comma-separated list of "
+		          "libraries: table,io,os,string,math,utf8,package,debug", args[0]);
+		return -1;
+	}
+
+	if (hlua_loaded) {
+		memprintf(err, "'%s' must be set before any \"lua-load\" or "
+		          "\"lua-load-per-thread\" directive.", args[0]);
+		return -1;
+	}
+
+	str = args[1];
+	while ((token = strtok_r(str, ",", &save))) {
+		int i;
+
+		if (strcmp(token, "all") == 0) {
+			flags = HLUA_OPENLIBS_ALL;
+		}
+		else if (strcmp(token, "none") == 0) {
+			has_none = 1;
+		}
+		else {
+			for (i = 0; hlua_openlibs_tbl[i].name; i++) {
+				if (strcmp(token, hlua_openlibs_tbl[i].name) == 0) {
+					flags |= hlua_openlibs_tbl[i].flag;
+					break;
+				}
+			}
+			if (!hlua_openlibs_tbl[i].name) {
+				int j;
+				memprintf(err, "'%s': unknown library '%s', expected one of: all,none", args[0], token);
+				for (j = 0; hlua_openlibs_tbl[j].name; j++)
+					memprintf(err, "%s,%s", *err, hlua_openlibs_tbl[j].name);
+				return -1;
+			}
+		}
+		str = NULL;
+	}
+
+	if (has_none && flags) {
+		memprintf(err, "'%s': 'none' cannot be combined with other libraries.", args[0]);
+		return -1;
+	}
+
+	/* Reject a non-default restriction if the Lua VM is already initialised,
+	 * which happens when lua-load, lua-load-per-thread or lua-prepend-path
+	 * appeared before this directive.
+	 */
+	if (flags != HLUA_OPENLIBS_ALL && hlua_states[0]) {
+		memprintf(err, "'%s' must appear before any 'lua-load', 'lua-load-per-thread' or 'lua-prepend-path' directive",
+		           args[0]);
+		return -1;
+	}
+
+	hlua_openlibs_flags = flags;
+	return 0;
+}
+
 /* This function is called by the main configuration key "lua-load". It loads and
  * execute an lua file during the parsing of the HAProxy configuration file. It is
  * the main lua entry point.
@@ -13306,6 +13520,8 @@ static int hlua_load(char **args, int section_type, struct proxy *curpx,
 		return -1;
 	}
 
+	hlua_init();
+
 	/* loading for global state */
 	hlua_state_id = 0;
 	ha_set_thread(NULL);
@@ -13323,6 +13539,8 @@ static int hlua_load_per_thread(char **args, int section_type, struct proxy *cur
 		memprintf(err, "'%s' expects a file as parameter.", args[0]);
 		return -1;
 	}
+
+	hlua_init();
 
 	if (per_thread_load == NULL) {
 		/* allocate the first entry large enough to store the final NULL */
@@ -13412,6 +13630,8 @@ static int hlua_config_prepend_path(char **args, int section_type, struct proxy 
 	struct prepend_path *p = NULL;
 	size_t i;
 
+	hlua_init();
+
 	if (too_many_args(2, args, err, NULL)) {
 		goto err;
 	}
@@ -13496,6 +13716,7 @@ static struct cfg_kw_list cfg_kws = {{ },{
 	{ CFG_GLOBAL, "tune.lua.log.loggers",     hlua_cfg_parse_log_loggers },
 	{ CFG_GLOBAL, "tune.lua.log.stderr",      hlua_cfg_parse_log_stderr },
 	{ CFG_GLOBAL, "tune.lua.bool-sample-conversion", hlua_cfg_parse_bool_sample_conversion },
+	{ CFG_GLOBAL, "tune.lua.openlibs",               hlua_cfg_parse_openlibs },
 	{ 0, NULL, NULL },
 }};
 
@@ -13513,40 +13734,25 @@ __LJMP static int hlua_ckch_commit_yield(lua_State *L, int status, lua_KContext 
 {
 	struct ckch_inst **lua_ckchi = lua_touserdata(L, -1);
 	struct ckch_store **lua_ckchs = lua_touserdata(L, -2);
-	struct ckch_inst *ckchi = *lua_ckchi;
 	struct ckch_store *old_ckchs = lua_ckchs[0];
 	struct ckch_store *new_ckchs = lua_ckchs[1];
 	struct hlua *hlua;
 	char *err = NULL;
 	int y = 1;
+	int retval = 0;
 
 	hlua = hlua_gethlua(L);
 
-	/* get the first ckchi to copy */
-	if (ckchi == NULL)
-		ckchi = LIST_ELEM(old_ckchs->ckch_inst.n, typeof(ckchi), by_ckchs);
-
 	/* walk through the old ckch_inst and creates new ckch_inst using the updated ckchs */
-	list_for_each_entry_from(ckchi, &old_ckchs->ckch_inst, by_ckchs) {
-		struct ckch_inst *new_inst;
+	retval = ckch_store_rebuild_instances(old_ckchs, new_ckchs, lua_ckchi,
+					      hlua ? 10 : -1, &y, &err);
 
-		/* it takes a lot of CPU to creates SSL_CTXs, so we yield every 10 CKCH instances
-		 * during runtime
-		 */
-		if (hlua && (y % 10) == 0) {
-
-			*lua_ckchi = ckchi;
-
-			task_wakeup(hlua->task, TASK_WOKEN_MSG);
-			MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_ckch_commit_yield, TICK_ETERNITY, 0));
-		}
-
-		if (ckch_inst_rebuild(new_ckchs, ckchi, &new_inst, &err))
-			goto error;
-
-		/* link the new ckch_inst to the duplicate */
-		LIST_APPEND(&new_ckchs->ckch_inst, &new_inst->by_ckchs);
-		y++;
+	if (retval < 0)
+		goto error;
+	else if (retval == 0) {
+		/* yield */
+		task_wakeup(hlua->task, TASK_WOKEN_MSG);
+		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_ckch_commit_yield, TICK_ETERNITY, 0));
 	}
 
 	/* The generation is finished, we can insert everything */
@@ -13834,6 +14040,7 @@ int hlua_post_init()
 
 	hlua_body = 0;
 
+
 #if defined(USE_OPENSSL)
 	/* Initialize SSL server. */
 	if (socket_ssl->xprt->prepare_srv) {
@@ -14027,7 +14234,11 @@ lua_State *hlua_init_state(int thread_num)
 	struct prepend_path *pp;
 
 	/* Init main lua stack. */
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 505
+	L = lua_newstate(hlua_alloc, &hlua_global_allocator, luaL_makeseed(0));
+#else
 	L = lua_newstate(hlua_alloc, &hlua_global_allocator);
+#endif
 
 	if (!L) {
 		fprintf(stderr,
@@ -14058,8 +14269,25 @@ lua_State *hlua_init_state(int thread_num)
 		lua_atpanic(L, hlua_panic_ljmp);
 	}
 
-	/* Initialise lua. */
-	luaL_openlibs(L);
+	/* Initialise lua: open standard libraries according to tune.lua.openlibs.
+	 * The base and coroutine libraries are always loaded: base provides the
+	 * core Lua functions HAProxy relies on; coroutine.create() is overridden
+	 * by HAProxy's own safe wrapper right after.
+	 */
+	if (hlua_openlibs_flags == HLUA_OPENLIBS_ALL) {
+		luaL_openlibs(L);
+	} else {
+		int i;
+
+		luaL_requiref(L, LUA_GNAME,     luaopen_base,      1); lua_pop(L, 1);
+		luaL_requiref(L, LUA_COLIBNAME, luaopen_coroutine, 1); lua_pop(L, 1);
+		for (i = 0; hlua_openlibs_tbl[i].name; i++) {
+			if (hlua_openlibs_flags & hlua_openlibs_tbl[i].flag) {
+				luaL_requiref(L, hlua_openlibs_tbl[i].name, hlua_openlibs_tbl[i].open, 1);
+				lua_pop(L, 1);
+			}
+		}
+	}
 #define HLUA_PREPEND_PATH_TOSTRING1(x) #x
 #define HLUA_PREPEND_PATH_TOSTRING(x) HLUA_PREPEND_PATH_TOSTRING1(x)
 #ifdef HLUA_PREPEND_PATH
@@ -14620,6 +14848,28 @@ lua_State *hlua_init_state(int thread_num)
 	/* Register previous table in the registry with reference and named entry. */
 	class_socket_ref = hlua_register_metatable(L, CLASS_SOCKET);
 
+	/* Call all registered state init callbacks. */
+	{
+		struct hlua_state_init_fct *e;
+		char *errmsg = NULL;
+		int err_code;
+
+		list_for_each_entry(e, &hlua_state_init_list, list) {
+			err_code = e->fct(L, &errmsg);
+			if (errmsg) {
+				if (err_code & ERR_ALERT)
+					ha_alert("Lua: %s\n", errmsg);
+				else if (err_code & ERR_WARN)
+					ha_warning("Lua: %s\n", errmsg);
+				else
+					ha_notice("Lua: %s\n", errmsg);
+				ha_free(&errmsg);
+			}
+			if (err_code & (ERR_ABORT|ERR_FATAL))
+				exit(1);
+		}
+	}
+
 	lua_atpanic(L, hlua_panic_safe);
 
 	return L;
@@ -14639,6 +14889,9 @@ void hlua_init(void) {
 		NULL
 	};
 #endif
+
+	if (hlua_states[0])
+		return; /* already initialised */
 
 	/* Init post init function list head */
 	for (i = 0; i < MAX_THREADS + 1; i++)
@@ -14705,16 +14958,22 @@ static void hlua_deinit()
 {
 	int thr;
 	struct hlua_reg_filter *reg_flt, *reg_flt_bck;
+	struct hlua_state_init_fct *e, *eb;
 
 	list_for_each_entry_safe(reg_flt, reg_flt_bck, &referenced_filters, l)
 		release_hlua_reg_filter(reg_flt);
+
+	list_for_each_entry_safe(e, eb, &hlua_state_init_list, list) {
+		LIST_DELETE(&e->list);
+		free(e);
+	}
 
 	for (thr = 0; thr < MAX_THREADS+1; thr++) {
 		if (hlua_states[thr])
 			lua_close(hlua_states[thr]);
 	}
 
-	free_proxy(socket_proxy);
+	proxy_drop(socket_proxy);
 }
 
 REGISTER_POST_DEINIT(hlua_deinit);
@@ -14728,3 +14987,14 @@ static void hlua_register_build_options(void)
 }
 
 INITCALL0(STG_REGISTER, hlua_register_build_options);
+
+/* Ensure the Lua VM is initialised even if no Lua directive appeared
+ * in the configuration (e.g. no global section at all).
+ */
+static int hlua_pre_check(void)
+{
+	hlua_init();
+	return ERR_NONE;
+}
+
+REGISTER_PRE_CHECK(hlua_pre_check);

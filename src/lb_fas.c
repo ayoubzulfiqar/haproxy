@@ -255,16 +255,10 @@ static void fas_update_server_weight(struct server *srv)
  * weighted least-conns. It also sets p->lbprm.wdiv to the eweight to
  * uweight ratio. Both active and backup groups are initialized.
  */
-void fas_init_server_tree(struct proxy *p)
+static int fas_init_server_tree(struct proxy *p)
 {
 	struct server *srv;
 	struct eb_root init_head = EB_ROOT;
-
-	p->lbprm.set_server_status_up   = fas_set_server_status_up;
-	p->lbprm.set_server_status_down = fas_set_server_status_down;
-	p->lbprm.update_server_eweight  = fas_update_server_weight;
-	p->lbprm.server_take_conn = fas_srv_reposition;
-	p->lbprm.server_drop_conn = fas_srv_reposition;
 
 	p->lbprm.wdiv = BE_WEIGHT_SCALE;
 	for (srv = p->srv; srv; srv = srv->next) {
@@ -285,6 +279,7 @@ void fas_init_server_tree(struct proxy *p)
 		srv->lb_tree = (srv->flags & SRV_F_BACKUP) ? &p->lbprm.fas.bck : &p->lbprm.fas.act;
 		fas_queue_srv(srv);
 	}
+	return 0;
 }
 
 /* Return next server from the FS tree in backend <p>. If the tree is empty,
@@ -339,6 +334,21 @@ struct server *fas_get_next_server(struct proxy *p, struct server *srvtoavoid)
 	return srv;
 }
 
+static struct lb_ops lb_fas_ops = {ILH,
+	.map = {
+		{ .mask = BE_LB_KIND | BE_LB_PARM, .match = BE_LB_KIND_CB | BE_LB_CB_FAS },
+		{ 0, 0 }
+	},
+	.algo_prop              = BE_LB_LKUP_FSTREE | BE_LB_PROP_DYN,
+	.proxy_init             = fas_init_server_tree,
+	.set_server_status_up   = fas_set_server_status_up,
+	.set_server_status_down = fas_set_server_status_down,
+	.update_server_eweight  = fas_update_server_weight,
+	.server_take_conn       = fas_srv_reposition,
+	.server_drop_conn       = fas_srv_reposition,
+};
+
+INITCALL1(STG_REGISTER, lb_ops_register, &lb_fas_ops);
 
 /*
  * Local variables:

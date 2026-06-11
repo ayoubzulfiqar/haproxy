@@ -119,6 +119,9 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 		chunk_appendf(&trace_buf, " : qc@%p(%c) idle_timer_task@%p flags=0x%x",
 		              qc, (qc->flags & QUIC_FL_CONN_IS_BACK) ? 'B' : 'F',
 		              qc->idle_timer_task, qc->flags);
+		if (qc->conn)
+			chunk_appendf(&trace_buf, " conn@%p(err_code=%d flags=0x%llx)",
+		              qc->conn, qc->conn->err_code, (ull)qc->conn->flags);
 		if (mask & QUIC_EV_CONN_NEW) {
 			const int *ssl_err = a2;
 
@@ -603,30 +606,32 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 	if (mask & QUIC_EV_CONN_RCV) {
 		int i;
 		const struct quic_dgram *dgram = a2;
+		const struct sockaddr_storage *saddr, *daddr;
 		char bufaddr[INET6_ADDRSTRLEN], bufport[6];
 
 		if (qc) {
 			addr_to_str(&qc->peer_addr, bufaddr, sizeof(bufaddr));
 			port_to_str(&qc->peer_addr, bufport, sizeof(bufport));
-			chunk_appendf(&trace_buf, " peer_addr=%s:%s ", bufaddr, bufport);
+			chunk_appendf(&trace_buf, " peer_addr=%s:%s", bufaddr, bufport);
 		}
 
 		if (dgram) {
 			chunk_appendf(&trace_buf, " dgram.len=%zu", dgram->len);
 			/* Socket */
-			if (dgram->saddr.ss_family == AF_INET ||
-				dgram->saddr.ss_family == AF_INET6) {
-				addr_to_str(&dgram->saddr, bufaddr, sizeof(bufaddr));
-				port_to_str(&dgram->saddr, bufport, sizeof(bufport));
-				chunk_appendf(&trace_buf, "saddr=%s:%s ", bufaddr, bufport);
+			saddr = (struct sockaddr_storage *)&dgram->saddr;
+			daddr = (struct sockaddr_storage *)&dgram->daddr;
+			if (saddr->ss_family == AF_INET || saddr->ss_family == AF_INET6) {
+				addr_to_str(saddr, bufaddr, sizeof(bufaddr));
+				port_to_str(saddr, bufport, sizeof(bufport));
+				chunk_appendf(&trace_buf, " saddr=%s:%s", bufaddr, bufport);
 
-				addr_to_str(&dgram->daddr, bufaddr, sizeof(bufaddr));
-				port_to_str(&dgram->daddr, bufport, sizeof(bufport));
-				chunk_appendf(&trace_buf, "daddr=%s:%s ", bufaddr, bufport);
+				addr_to_str(daddr, bufaddr, sizeof(bufaddr));
+				port_to_str(daddr, bufport, sizeof(bufport));
+				chunk_appendf(&trace_buf, " daddr=%s:%s", bufaddr, bufport);
 			}
 			/* DCID */
 			for (i = 0; i < dgram->dcid_len; ++i)
-				chunk_appendf(&trace_buf, "%02x", dgram->dcid[i]);
+				chunk_appendf(&trace_buf, " %02x", dgram->buf[dgram->dcid_off + i]);
 
 		}
 	}

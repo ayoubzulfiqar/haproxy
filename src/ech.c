@@ -136,6 +136,10 @@ static int cli_parse_show_ech(char **args, char *payload,
 {
 	struct show_ech_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
+
 	/* no parameter, shows only file list */
 	if (*args[3]) {
 		SSL_CTX *sctx = NULL;
@@ -297,6 +301,9 @@ static int cli_parse_add_ech(char **args, char *payload, struct appctx *appctx, 
 	OSSL_ECHSTORE *es = NULL;
 	BIO *es_in = NULL;
 
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
 	if (!*args[3] || !payload)
 		return cli_err(appctx, "syntax: add ssl ech <name> <PEM file content>");
 	if (cli_find_ech_specific_ctx(args[3], &sctx) != 1)
@@ -324,6 +331,9 @@ static int cli_parse_set_ech(char **args, char *payload, struct appctx *appctx, 
 	OSSL_ECHSTORE *es = NULL;
 	BIO *es_in = NULL;
 
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
 	if (!*args[3] || !payload)
 		return cli_err(appctx, "syntax: set ssl ech <name> <PEM file content>");
 	if (cli_find_ech_specific_ctx(args[3], &sctx) != 1)
@@ -350,6 +360,9 @@ static int cli_parse_del_ech(char **args, char *payload, struct appctx *appctx, 
 	time_t age = 0;
 	char success_message[ECH_SUCCESS_MSG_MAX];
 	OSSL_ECHSTORE *es = NULL;
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
 
 	if (!*args[3])
 		return cli_err(appctx, "syntax: del ssl ech <name>");
@@ -384,7 +397,7 @@ static void cli_release_ech(struct appctx *appctx)
 
 
 static struct cli_kw_list cli_kws = {{ },{
-    { { "show", "ssl", "ech", NULL},  "show ssl ech [<name>]                   : display a named ECH configuation or all",      cli_parse_show_ech, cli_io_handler_ech_details, cli_release_ech, NULL, ACCESS_EXPERIMENTAL },
+    { { "show", "ssl", "ech", NULL},  "show ssl ech [<name>]                   : display a named ECH configuration or all",      cli_parse_show_ech, cli_io_handler_ech_details, cli_release_ech, NULL, ACCESS_EXPERIMENTAL },
     { { "add", "ssl", "ech", NULL },  "add ssl ech <name> <payload>            : add a new PEM-formatted ECH config and key ",  cli_parse_add_ech, NULL, NULL, NULL, ACCESS_EXPERIMENTAL },
     { { "set", "ssl", "ech", NULL },  "set ssl ech <name> <payload>            : replace all ECH configs with that provided",   cli_parse_set_ech, NULL, NULL, NULL, ACCESS_EXPERIMENTAL },
     { { "del", "ssl", "ech", NULL },  "del ssl ech <name> [<age-in-secs>]      : delete ECH configs",                           cli_parse_del_ech, NULL, NULL, NULL, ACCESS_EXPERIMENTAL },

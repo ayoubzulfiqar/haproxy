@@ -241,7 +241,7 @@ struct task *rhttp_process(struct task *task, void *ctx, unsigned int state)
 			 * directly.
 			 */
 			if (conn->mux && conn->mux->destroy) {
-				conn->mux->destroy(conn->ctx);
+				CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
 			}
 			else {
 				conn_stop_tracking(conn);
@@ -371,7 +371,7 @@ int rhttp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	}
 
 	/* Check that server uses HTTP/2 either with proto or ALPN. */
-	if ((!srv->mux_proto || !isteqi(srv->mux_proto->token, ist("h2"))) &&
+	if ((!srv->mux_proto || !isteqi(srv->mux_proto->mux_proto, ist("h2"))) &&
 	    (!srv->use_ssl || !isteqi(ist(srv->ssl_ctx.alpn_str), ist("\x02h2")))) {
 		snprintf(errmsg, errlen, "Cannot reverse connect with server '%s/%s' unless HTTP/2 is activated on it with either proto or alpn keyword.", name, ist0(sv_name));
 		goto err;
@@ -464,7 +464,7 @@ struct connection *rhttp_accept_conn(struct listener *l, int *status)
 	BUG_ON(!(conn->flags & CO_FL_ACT_REVERSING));
 	conn->flags &= ~CO_FL_ACT_REVERSING;
 	conn->flags |= CO_FL_REVERSED;
-	conn->mux->ctl(conn, MUX_CTL_REVERSE_CONN, NULL);
+	CALL_MUX_NO_RET(conn->mux, ctl(conn, MUX_CTL_REVERSE_CONN, NULL));
 
 	l->rx.rhttp.pend_conn = NULL;
 	*status = CO_AC_NONE;

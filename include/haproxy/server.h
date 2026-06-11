@@ -29,6 +29,7 @@
 #include <haproxy/api.h>
 #include <haproxy/applet-t.h>
 #include <haproxy/arg-t.h>
+#include <haproxy/counters.h>
 #include <haproxy/freq_ctr.h>
 #include <haproxy/proxy-t.h>
 #include <haproxy/resolvers-t.h>
@@ -40,9 +41,9 @@
 #include <haproxy/tools.h>
 
 
-__decl_thread(extern HA_SPINLOCK_T idle_conn_srv_lock);
 extern struct idle_conns idle_conns[MAX_THREADS];
-extern struct task *idle_conn_task;
+extern struct task *idle_conn_task[MAX_THREADS];
+extern struct eb_root idle_conn_srv[MAX_THREADS];
 extern struct mt_list servers_list;
 extern struct dict server_key_dict;
 
@@ -55,6 +56,7 @@ int srv_update_addr(struct server *s, void *ip, int ip_sin_family, struct server
 struct sample_expr *_parse_srv_expr(char *expr, struct arg_list *args_px,
                                     const char *file, int linenum, char **err);
 int server_parse_exprs(struct server *srv, struct proxy *px, char **err);
+int srv_configure_auto_sni(struct server *srv, int *err_code, char **err);
 int server_set_inetaddr(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater, struct buffer *msg);
 int server_set_inetaddr_warn(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater);
 void server_get_inetaddr(struct server *s, struct server_inetaddr *inetaddr);
@@ -207,19 +209,23 @@ static inline void server_index_id(struct proxy *px, struct server *srv)
 /* increase the number of cumulated streams on the designated server */
 static inline void srv_inc_sess_ctr(struct server *s)
 {
-	if (s->counters.shared.tg[tgid - 1]) {
+	if (s->counters.shared.tg) {
 		_HA_ATOMIC_INC(&s->counters.shared.tg[tgid - 1]->cum_sess);
 		update_freq_ctr(&s->counters.shared.tg[tgid - 1]->sess_per_sec, 1);
 	}
-	HA_ATOMIC_UPDATE_MAX(&s->counters.sps_max,
+	COUNTERS_UPDATE_MAX(&s->counters.sps_max,
 	                     update_freq_ctr(&s->counters._sess_per_sec, 1));
 }
 
 /* set the time of last session on the designated server */
 static inline void srv_set_sess_last(struct server *s)
 {
-	if (s->counters.shared.tg[tgid - 1])
-		HA_ATOMIC_STORE(&s->counters.shared.tg[tgid - 1]->last_sess,  ns_to_sec(now_ns));
+	if (s->counters.shared.tg) {
+		uint now_sec = ns_to_sec(now_ns);
+
+		if (HA_ATOMIC_LOAD(&s->counters.shared.tg[tgid - 1]->last_sess) != now_sec)
+			HA_ATOMIC_STORE(&s->counters.shared.tg[tgid - 1]->last_sess, now_sec);
+	}
 }
 
 /* returns the current server throttle rate between 0 and 100% */
@@ -270,6 +276,35 @@ static inline void srv_adm_set_ready(struct server *s)
 {
 	srv_clr_admin_flag(s, SRV_ADMF_FDRAIN);
 	srv_clr_admin_flag(s, SRV_ADMF_FMAINT);
+}
+
+static inline void srv_set_init_state(struct server *srv)
+{
+	/* no init-state configured or the server is already disabled: don't eval init-state */
+	if (srv->init_state == SRV_INIT_STATE_NONE ||
+	    srv->next_admin & (SRV_ADMF_CMAINT | SRV_ADMF_FMAINT))
+		return;
+
+	if (srv->init_state == SRV_INIT_STATE_FULLY_UP) {
+		/* initially UP, when all checks fail to bring server DOWN */
+               srv->next_state = SRV_ST_RUNNING;
+               srv->check.health = srv->check.rise + srv->check.fall - 1;
+       }
+       else if (srv->init_state == SRV_INIT_STATE_UP) {
+	        /* initially UP, when one check fails check brings server DOWN */
+               srv->next_state = SRV_ST_RUNNING;
+               srv->check.health = srv->check.rise;
+       }
+       else if (srv->init_state == SRV_INIT_STATE_DOWN) {
+	       /* initially DOWN, when one check is successful bring server UP */
+               srv->next_state = SRV_ST_STOPPED;
+               srv->check.health = srv->check.rise - 1;
+       }
+       else if (srv->init_state == SRV_INIT_STATE_FULLY_DOWN) {
+	       /* initially DOWN, when all checks are successful bring server UP */
+               srv->next_state = SRV_ST_STOPPED;
+               srv->check.health = 0;
+       }
 }
 
 /* appends an initaddr method to the existing list. Returns 0 on failure. */
@@ -349,28 +384,26 @@ static inline int srv_is_transparent(const struct server *srv)
 	       (srv->flags & SRV_F_MAPPORTS);
 }
 
-/* Detach server from proxy list. It is supported to call this
- * even if the server is not yet in the list
- * Must be called under thread isolation or when it is safe to assume
- * that the parent proxy doesn't is not skimming through the server list
+/* Detach <srv> server from its parent proxy list.
+ *
+ * Must be called under thread isolation.
  */
 static inline void srv_detach(struct server *srv)
 {
 	struct proxy *px = srv->proxy;
+	struct server *prev;
 
-	if (px->srv == srv)
+	if (px->srv == srv) {
 		px->srv = srv->next;
+	}
 	else {
-		struct server *prev;
-
 		for (prev = px->srv; prev && prev->next != srv; prev = prev->next)
 			;
-
-		BUG_ON(!prev);
-
+		BUG_ON(!prev); /* Server instance not found in proxy list ? */
 		prev->next = srv->next;
 	}
-	/* reset the proxy's ready_srv if it was this one */
+
+	/* Reset the proxy's ready_srv if it was this one. */
 	HA_ATOMIC_CAS(&px->ready_srv, &srv, NULL);
 }
 

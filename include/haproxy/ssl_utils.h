@@ -34,10 +34,10 @@ int cert_get_pkey_algo(X509 *crt, struct buffer *out);
 int ssl_sock_get_serial(X509 *crt, struct buffer *out);
 int ssl_sock_crt2der(X509 *crt, struct buffer *out);
 int ssl_sock_get_time(ASN1_TIME *tm, struct buffer *out);
-int ssl_sock_get_dn_entry(X509_NAME *a, const struct buffer *entry, int pos,
+int ssl_sock_get_dn_entry(__X509_NAME_CONST__ X509_NAME *a, const struct buffer *entry, int pos,
                           struct buffer *out);
-int ssl_sock_get_dn_formatted(X509_NAME *a, const struct buffer *format, struct buffer *out);
-int ssl_sock_get_dn_oneline(X509_NAME *a, struct buffer *out);
+int ssl_sock_get_dn_formatted(__X509_NAME_CONST__ X509_NAME *a, const struct buffer *format, struct buffer *out);
+int ssl_sock_get_dn_oneline(__X509_NAME_CONST__ X509_NAME *a, struct buffer *out);
 X509* ssl_sock_get_peer_certificate(SSL *ssl);
 X509* ssl_sock_get_verified_chain_root(SSL *ssl);
 unsigned int openssl_version_parser(const char *version);
@@ -56,6 +56,9 @@ int curves2nid(const char *curve);
 const char *nid2nist(int nid);
 const char *sigalg2str(int sigalg);
 const char *curveid2str(int curve_id);
+
+int aes_process(struct buffer *data, struct buffer *nonce, struct buffer *key, int key_size,
+                struct buffer *aead_tag, struct buffer *aad, struct buffer *out, int decrypt, int gcm);
 
 #endif /* _HAPROXY_SSL_UTILS_H */
 #endif /* USE_OPENSSL */

@@ -37,7 +37,7 @@ static void _counters_shared_drop(void *counters)
 	if (!shared)
 		return;
 
-	while (it < global.nbtgroups && shared->tg[it]) {
+	while (it < global.nbtgroups && shared->tg && shared->tg[it]) {
 		if (shared->flags & COUNTERS_SHARED_F_LOCAL) {
 			/* memory was allocated using calloc(), simply free it */
 			free(shared->tg[it]);
@@ -53,6 +53,7 @@ static void _counters_shared_drop(void *counters)
 		}
 		it += 1;
 	}
+	free(shared->tg);
 }
 
 /* release a shared fe counters struct */
@@ -86,6 +87,14 @@ static int _counters_shared_prepare(struct counters_shared *shared,
 	if (!guid->key || !shm_stats_file_hdr)
 		shared->flags |= COUNTERS_SHARED_F_LOCAL;
 
+	if (!shared->tg) {
+		shared->tg = calloc(global.nbtgroups, sizeof(*shared->tg));
+		if (!shared->tg) {
+			memprintf(errmsg, "couldn't allocate memory for shared counters");
+			return 0;
+		}
+	}
+
 	while (it < global.nbtgroups) {
 		if (shared->flags & COUNTERS_SHARED_F_LOCAL) {
 			size_t tg_size;
@@ -100,7 +109,7 @@ static int _counters_shared_prepare(struct counters_shared *shared,
 
 			shm_obj = shm_stats_file_add_object(errmsg);
 			if (shm_obj) {
-				snprintf(shm_obj->guid, sizeof(shm_obj->guid)- 1, "%s", guid_get(guid));
+				snprintf(shm_obj->guid, sizeof(shm_obj->guid), "%s", guid_get(guid));
 				if (is_be) {
 					shm_obj->type = SHM_STATS_FILE_OBJECT_TYPE_BE;
 					be_shared = (struct be_counters_shared *)shared;

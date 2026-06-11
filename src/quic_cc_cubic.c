@@ -390,7 +390,10 @@ static inline void quic_cubic_update(struct quic_cc *cc, uint32_t acked)
 
 static void quic_cc_cubic_slow_start(struct quic_cc *cc)
 {
+	struct quic_cc_path *path = container_of(cc, struct quic_cc_path, cc);
+
 	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
+	quic_cc_path_reset(path);
 	quic_cc_cubic_reset(cc);
 	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc);
 }
@@ -412,13 +415,13 @@ static void quic_enter_recovery(struct quic_cc *cc)
 	 * to allow the new flow some room for growth if the existing flows have
 	 * been using all the network bandwidth. To speed up this bandwidth release
 	 * by existing flows, the following fast convergence mechanism SHOULD be
-	 * implemented.With fast convergence, when a congestion event occurs, Wmax
+	 * implemented. With fast convergence, when a congestion event occurs, Wmax
 	 * is updated as follows, before the window reduction described in Section
 	 * 4.6.
 	 *
-	 *       if cwnd < Wmax and fast convergence enabled, further reduce Wax:
+	 *       if cwnd < Wmax and fast convergence enabled, further reduce Wmax:
 	 *              Wmax = cwnd * (1 + beta_cubic)
-	 *       otherwise, remember cwn before reduction:
+	 *       otherwise, remember cwnd before reduction:
 	 *              Wmax = cwnd
 	 */
 	if (path->cwnd < c->last_w_max) {
@@ -604,6 +607,7 @@ static void quic_cc_cubic_rp_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 
 		c->state = QUIC_CC_ST_CA;
 		c->recovery_start_time = TICK_ETERNITY;
+		c->consecutive_losses = 0;
 		break;
 	case QUIC_CC_EVT_LOSS:
 		break;
@@ -667,7 +671,7 @@ static void quic_cc_cubic_state_cli(struct buffer *buf, const struct quic_cc_pat
 	              (long long)(path->cwnd - c->last_w_max));
 }
 
-struct quic_cc_algo quic_cc_algo_cubic = {
+const struct quic_cc_algo quic_cc_algo_cubic = {
 	.type        = QUIC_CC_ALGO_TP_CUBIC,
 	.flags       = QUIC_CC_ALGO_FL_OPT_PACING,
 	.init        = quic_cc_cubic_init,

@@ -40,7 +40,7 @@
  *  | HTX |  PAYLOADS ==> |                              | <== HTX_BLKs |
  *  +-----+---------------+------------------------------+--------------+
  *        ^
- *        blocks[] (the beginning of the bocks array)
+ *        blocks[] (the beginning of the blocks array)
  *
  *
  * The blocks part remains linear and sorted. You may think about it as an array
@@ -84,7 +84,7 @@
  * At the end, if payload wrapping or blocks defragmentation is not enough, some
  * free space may be get back with a full defragmentation. This way, the holes in
  * the middle are not reusable but count in the available free space. The only
- * way to reuse this lost space is to fully defragmenate the HTX message.
+ * way to reuse this lost space is to fully defragment the HTX message.
  *
  *                                   - * -
  *
@@ -113,11 +113,10 @@
  *     - 0000 = request  start-line
  *     - 0001 = response start-line
  *     - 0010 = header
- *     - 0011 = pseudo-header ou "special" header
- *     - 0100 = end-of-headers
- *     - 0101 = data
- *     - 0110 = trailer
- *     - 0111 = end-of-trailers
+ *     - 0011 = end-of-headers
+ *     - 0100 = data
+ *     - 0101 = trailer
+ *     - 0110 = end-of-trailers
  *       ...
  *     - 1111 = unused
  *
@@ -128,7 +127,7 @@
  */
 #define HTX_SL_F_NONE           0x00000000
 #define HTX_SL_F_IS_RESP        0x00000001 /* It is the response start-line (unset means the request one) */
-#define HTX_SL_F_XFER_LEN       0x00000002 /* The message xfer size can be dertermined */
+#define HTX_SL_F_XFER_LEN       0x00000002 /* The message xfer size can be determined */
 #define HTX_SL_F_XFER_ENC       0x00000004 /* The transfer-encoding header was found in message */
 #define HTX_SL_F_CLEN           0x00000008 /* The content-length header was found in message */
 #define HTX_SL_F_CHNK           0x00000010 /* The message payload is chunked */
@@ -140,7 +139,9 @@
 #define HTX_SL_F_HAS_AUTHORITY  0x00000400 /* The request authority is explicitly specified */
 #define HTX_SL_F_NORMALIZED_URI 0x00000800 /* The received URI is normalized (an implicit absolute-uri form) */
 #define HTX_SL_F_CONN_UPG       0x00001000 /* The message contains "connection: upgrade" header */
-#define HTX_SL_F_BODYLESS_RESP  0x00002000 /* The response to this message is bodyloess (only for reqyest) */
+#define HTX_SL_F_BODYLESS_RESP  0x00002000 /* The response to this message is bodyless (only for request) */
+#define HTX_SL_F_NOT_HTTP       0x00004000 /* Not an HTTP message (e.g "RTSP", only possible if invalid message are accepted) */
+#define HTX_SL_F_UPG_HDR        0x00008000 /* non-empty Upgrapde header found */
 
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -157,7 +158,8 @@ static forceinline char *hsl_show_flags(char *buf, size_t len, const char *delim
 	_(HTX_SL_F_CLEN, _(HTX_SL_F_CHNK, _(HTX_SL_F_VER_11,
 	_(HTX_SL_F_BODYLESS, _(HTX_SL_F_HAS_SCHM, _(HTX_SL_F_SCHM_HTTP,
 	_(HTX_SL_F_SCHM_HTTPS, _(HTX_SL_F_HAS_AUTHORITY,
-	_(HTX_SL_F_NORMALIZED_URI, _(HTX_SL_F_CONN_UPG)))))))))))));
+	_(HTX_SL_F_NORMALIZED_URI, _(HTX_SL_F_CONN_UPG, _(HTX_SL_F_BODYLESS_RESP,
+	_(HTX_SL_F_NOT_HTTP, _(HTX_SL_F_UPG_HDR))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -177,7 +179,7 @@ static forceinline char *hsl_show_flags(char *buf, size_t len, const char *delim
 #define HTX_FL_PARSING_ERROR     0x00000001 /* Set when a parsing error occurred */
 #define HTX_FL_PROCESSING_ERROR  0x00000002 /* Set when a processing error occurred */
 #define HTX_FL_FRAGMENTED        0x00000004 /* Set when the HTX buffer is fragmented */
-/* 0x00000008 unused */
+#define HTX_FL_UNORDERED         0x00000008 /* Set when the HTX buffer are not ordered */
 #define HTX_FL_EOM               0x00000010 /* Set when end-of-message is reached from the HTTP point of view
 					     * (at worst, on the EOM block is missing)
 					     */
@@ -192,7 +194,7 @@ static forceinline char *htx_show_flags(char *buf, size_t len, const char *delim
 	_(0);
 	/* flags */
 	_(HTX_FL_PARSING_ERROR, _(HTX_FL_PROCESSING_ERROR,
-	_(HTX_FL_FRAGMENTED, _(HTX_FL_EOM))));
+	_(HTX_FL_FRAGMENTED, _(HTX_FL_UNORDERED, _(HTX_FL_EOM)))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -270,7 +272,7 @@ struct htx {
 	/* XXX 4 bytes unused */
 
 	/* Blocks representing the HTTP message itself */
-	char blocks[VAR_ARRAY] __attribute__((aligned(8)));
+	char blocks[VAR_ARRAY] ALIGNED(8);
 };
 
 #endif /* _HAPROXY_HTX_T_H */

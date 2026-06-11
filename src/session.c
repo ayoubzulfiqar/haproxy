@@ -30,7 +30,7 @@
 
 
 DECLARE_TYPED_POOL(pool_head_session, "session", struct session);
-DECLARE_TYPED_POOL(pool_head_sess_priv_conns, "session priv conns list", struct sess_priv_conns);
+DECLARE_TYPED_POOL(pool_head_sess_priv_conns, "sess_priv_conns", struct sess_priv_conns);
 
 int conn_complete_session(struct connection *conn);
 
@@ -39,7 +39,7 @@ static const struct trace_event sess_trace_events[] = {
 	{ .mask = SESS_EV_NEW,      .name = "sess_new",     .desc = "new session creation" },
 #define           SESS_EV_END       (1ULL <<  1)
 	{ .mask = SESS_EV_END,      .name = "sess_end",     .desc = "session termination" },
-#define           SESS_EV_ERR       (1ULL <<  1)
+#define           SESS_EV_ERR       (1ULL <<  2)
 	{ .mask = SESS_EV_ERR,      .name = "sess_err",     .desc = "session error" },
 	{ }
 };
@@ -99,8 +99,12 @@ struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type
 		sess->flags = SESS_FL_NONE;
 		sess->src = NULL;
 		sess->dst = NULL;
-		sess->fe_tgcounters = sess->fe->fe_counters.shared.tg[tgid - 1];
-		if (sess->listener && sess->listener->counters)
+		if (sess->fe->fe_counters.shared.tg)
+			sess->fe_tgcounters = sess->fe->fe_counters.shared.tg[tgid - 1];
+		else
+			sess->fe_tgcounters = NULL;
+
+		if (sess->listener && sess->listener->counters && sess->listener->counters->shared.tg)
 			sess->li_tgcounters = sess->listener->counters->shared.tg[tgid - 1];
 		else
 			sess->li_tgcounters = NULL;
@@ -134,7 +138,7 @@ void session_free(struct session *sess)
 	vars_prune_per_sess(&sess->vars);
 	conn = objt_conn(sess->origin);
 	if (conn != NULL && conn->mux)
-		conn->mux->destroy(conn->ctx);
+		CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
 
 	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	list_for_each_entry_safe(pconns, pconns_back, &sess->priv_conns, sess_el) {
@@ -242,6 +246,12 @@ int session_accept_fd(struct connection *cli_conn)
 			if (xprt_add_hs(cli_conn) != 0)
 				goto out_free_conn;
 		}
+
+		/* Add handshake layer prior to MUX init if required. Does nothing if SSL layer is active though. */
+		if (l->bind_conf->mux_proto && l->bind_conf->mux_proto->init_xprt) {
+			if (xprt_add_l6hs(cli_conn, l->bind_conf->mux_proto->init_xprt))
+				goto out_free_conn;
+		}
 	}
 
 	/* Reversed conns already have an assigned session, do not recreate it. */
@@ -344,7 +354,7 @@ int session_accept_fd(struct connection *cli_conn)
 	 *           v       |           |        |
 	 *          conn -- owner ---> task <-----+
 	 */
-	if (cli_conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS)) {
+	if (cli_conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS | CO_FL_WAIT_XPRT_L6)) {
 		int timeout;
 		int clt_tmt = p->timeout.client;
 		int hs_tmt = p->timeout.client_hs;
@@ -495,7 +505,8 @@ static void session_kill_embryonic(struct session *sess, unsigned int state)
 		if (!conn->err_code ||
 		    conn->err_code == CO_ER_PRX_EMPTY || conn->err_code == CO_ER_PRX_ABORT ||
 		    conn->err_code == CO_ER_CIP_EMPTY || conn->err_code == CO_ER_CIP_ABORT ||
-		    conn->err_code == CO_ER_SSL_EMPTY || conn->err_code == CO_ER_SSL_ABORT)
+		    conn->err_code == CO_ER_SSL_EMPTY || conn->err_code == CO_ER_SSL_ABORT ||
+		    conn->err_code == CO_ER_QMUX)
 			log = 0;
 	}
 
@@ -507,6 +518,8 @@ static void session_kill_embryonic(struct session *sess, unsigned int state)
 				conn->err_code = CO_ER_CIP_TIMEOUT;
 			else if (conn->flags & CO_FL_SSL_WAIT_HS)
 				conn->err_code = CO_ER_SSL_TIMEOUT;
+			else if (conn->flags & CO_FL_QMUX_RECV)
+				conn->err_code = CO_ER_QMUX;
 		}
 
 		sess_log_embryonic(sess);
@@ -673,11 +686,18 @@ int session_add_conn(struct session *sess, struct connection *conn)
 
 	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 
-	/* Already attach to the session */
+	/* Already attached to the session */
 	if (!LIST_ISEMPTY(&conn->sess_el)) {
 		ret = 1;
 		goto out;
 	}
+
+	/* Ensure owner is set for connection. It could have been reset upon a
+	 * session_add_conn() failure. We want to set it even if allocation
+	 * below fails so that the session that is expected to manage this
+	 * connection is always known.
+	 */
+	conn->owner = sess;
 
 	pconns = sess_get_sess_conns(sess, conn->target);
 	if (!pconns) {
@@ -687,10 +707,6 @@ int session_add_conn(struct session *sess, struct connection *conn)
 	}
 
 	LIST_APPEND(&pconns->conn_list, &conn->sess_el);
-	/* Ensure owner is set for connection. It could have been reset
-	 * prior on after a session_add_conn() failure.
-	 */
-	conn->owner = sess;
 	ret = 1;
 
  out:
@@ -737,7 +753,7 @@ int session_reinsert_idle_conn(struct session *sess, struct connection *conn)
  * target server will be incremented.
  *
  * Returns 0 if the connection is kept, else non-zero if the connection was
- * explicitely removed from session.
+ * explicitly removed from session.
  */
 int session_check_idle_conn(struct session *sess, struct connection *conn)
 {
@@ -852,7 +868,7 @@ void session_unown_conn(struct session *sess, struct connection *conn)
  * session_unown_conn(), this function is not protected by a lock, so the
  * caller is responsible to properly use idle_conns_lock prior to calling it.
  *
- * Another notable difference is that <owner> member of <conn> is not resetted.
+ * Another notable difference is that <owner> member of <conn> is not reset.
  * This is a convenience as this function usage is generally coupled with a
  * following session_reinsert_idle_conn().
  *

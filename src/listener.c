@@ -66,7 +66,7 @@ const char* li_status_st[LI_STATE_COUNT] = {
 
 #if defined(USE_THREAD)
 
-struct accept_queue_ring accept_queue_rings[MAX_THREADS] __attribute__((aligned(64))) = { };
+struct accept_queue_ring accept_queue_rings[MAX_THREADS] THREAD_ALIGNED();
 
 /* dequeue and process a pending connection from the local accept queue (single
  * consumer). Returns the accepted connection or NULL if none was found.
@@ -172,11 +172,12 @@ struct task *accept_queue_process(struct task *t, void *context, unsigned int st
 		 * connection.
 		 */
 		if (!(li->bind_conf->options & BC_O_UNLIMITED)) {
-			HA_ATOMIC_UPDATE_MAX(&global.sps_max,
-			                     update_freq_ctr(&global.sess_per_sec, 1));
+			uint newfreq = update_freq_ctr(&global.sess_per_sec, 1);
+
+			COUNTERS_UPDATE_MAX(&global.sps_max, newfreq);
 			if (li->bind_conf->options & BC_O_USE_SSL) {
-				HA_ATOMIC_UPDATE_MAX(&global.ssl_max,
-				                     update_freq_ctr(&global.ssl_per_sec, 1));
+				newfreq = update_freq_ctr(&global.ssl_per_sec, 1);
+				COUNTERS_UPDATE_MAX(&global.ssl_max, newfreq);
 			}
 		}
 	}
@@ -229,7 +230,7 @@ REGISTER_POST_DEINIT(accept_queue_deinit);
  */
 int li_init_per_thr(struct listener *li)
 {
-	int nbthr = MIN(global.nbthread, MAX_THREADS_PER_GROUP);
+	int nbthr = MIN(global.nbthread, global.maxthrpertgroup);
 	int i;
 
 	/* allocate per-thread elements for listener */
@@ -846,7 +847,7 @@ int create_listeners(struct bind_conf *bc, const struct sockaddr_storage *ss,
 		proto->add(proto, l);
 
 		if (fd != -1)
-			l->rx.flags |= RX_F_INHERITED;
+			l->rx.flags |= RX_F_INHERITED_FD|RX_F_INHERITED_SOCK;
 
 		guid_init(&l->guid);
 
@@ -879,12 +880,15 @@ struct shard_info *shard_info_attach(struct receiver *rx, struct shard_info *si)
 			return NULL;
 
 		si->ref = rx;
+		si->members = calloc(global.nbtgroups, sizeof(*si->members));
+		if (si->members == NULL) {
+			free(si);
+			return NULL;
+		}
 	}
 
 	rx->shard_info = si;
-	BUG_ON (si->tgroup_mask & 1UL << (rx->bind_tgroup - 1));
-	si->tgroup_mask |= 1UL << (rx->bind_tgroup - 1);
-	si->nbgroups     = my_popcountl(si->tgroup_mask);
+	si->nbgroups++;
 	si->nbthreads   += my_popcountl(rx->bind_thread);
 	si->members[si->nbgroups - 1] = rx;
 	return si;
@@ -913,8 +917,7 @@ void shard_info_detach(struct receiver *rx)
 	BUG_ON(gr == MAX_TGROUPS);
 
 	si->nbthreads   -= my_popcountl(rx->bind_thread);
-	si->tgroup_mask &= ~(1UL << (rx->bind_tgroup - 1));
-	si->nbgroups     = my_popcountl(si->tgroup_mask);
+	si->nbgroups--;
 
 	/* replace the member by the last one. If we removed the reference, we
 	 * have to switch to another one. It's always the first entry so we can
@@ -924,8 +927,10 @@ void shard_info_detach(struct receiver *rx)
 	si->members[si->nbgroups] = NULL;
 	si->ref = si->members[0];
 
-	if (!si->nbgroups)
+	if (!si->nbgroups) {
+		free(si->members);
 		free(si);
+	}
 }
 
 /* clones listener <src> and returns the new one. All dynamically allocated
@@ -1113,7 +1118,7 @@ void listener_accept(struct listener *l)
 		int max = 0;
 		int it;
 
-		for (it = 0; (it < global.nbtgroups && p->fe_counters.shared.tg[it]); it++)
+		for (it = 0; (it < global.nbtgroups && p->fe_counters.shared.tg && p->fe_counters.shared.tg[it]); it++)
 			max += freq_ctr_remain(&p->fe_counters.shared.tg[it]->sess_per_sec, p->fe_sps_lim, 0);
 
 		if (unlikely(!max)) {
@@ -1223,16 +1228,16 @@ void listener_accept(struct listener *l)
 
 		/* The connection was accepted, it must be counted as such */
 		if (l->counters)
-			HA_ATOMIC_UPDATE_MAX(&l->counters->conn_max, next_conn);
+			COUNTERS_UPDATE_MAX(&l->counters->conn_max, next_conn);
 
 		if (p) {
-			HA_ATOMIC_UPDATE_MAX(&p->fe_counters.conn_max, next_feconn);
+			COUNTERS_UPDATE_MAX(&p->fe_counters.conn_max, next_feconn);
 			proxy_inc_fe_conn_ctr(l, p);
 		}
 
 		if (!(l->bind_conf->options & BC_O_UNLIMITED)) {
 			count = update_freq_ctr(&global.conn_per_sec, 1);
-			HA_ATOMIC_UPDATE_MAX(&global.cps_max, count);
+			COUNTERS_UPDATE_MAX(&global.cps_max, count);
 		}
 
 		_HA_ATOMIC_INC(&activity[tid].accepted);
@@ -1394,7 +1399,7 @@ void listener_accept(struct listener *l)
 							/* no more threads here, switch to
 							 * last thread of previous group.
 							 */
-							t2 = MAX_THREADS_PER_GROUP - 1;
+							t2 = global.maxthrpertgroup - 1;
 							if (l->rx.shard_info)
 								r2--;
 							/* loop again */
@@ -1456,10 +1461,10 @@ void listener_accept(struct listener *l)
 						new_li = l->rx.shard_info->members[r1]->owner;
 
 					t2--;
-					if (t2 >= MAX_THREADS_PER_GROUP) {
+					if (t2 >= global.maxthrpertgroup) {
 						if (l->rx.shard_info)
 							r2--;
-						t2 = MAX_THREADS_PER_GROUP - 1;
+						t2 = global.maxthrpertgroup - 1;
 					}
 				}
 				else if (q1 - q2 > 0) {
@@ -1480,7 +1485,7 @@ void listener_accept(struct listener *l)
 						new_li = l->rx.shard_info->members[r1]->owner;
 				updt_t1:
 					t1++;
-					if (t1 >= MAX_THREADS_PER_GROUP) {
+					if (t1 >= global.maxthrpertgroup) {
 						if (l->rx.shard_info)
 							r1++;
 						t1 = 0;
@@ -1571,13 +1576,13 @@ void listener_accept(struct listener *l)
 		 */
 		if (!(l->bind_conf->options & BC_O_UNLIMITED)) {
 			count = update_freq_ctr(&global.sess_per_sec, 1);
-			HA_ATOMIC_UPDATE_MAX(&global.sps_max, count);
+			COUNTERS_UPDATE_MAX(&global.sps_max, count);
 		}
 #ifdef USE_OPENSSL
 		if (!(l->bind_conf->options & BC_O_UNLIMITED) &&
 		    l->bind_conf && l->bind_conf->options & BC_O_USE_SSL) {
 			count = update_freq_ctr(&global.ssl_per_sec, 1);
-			HA_ATOMIC_UPDATE_MAX(&global.ssl_max, count);
+			COUNTERS_UPDATE_MAX(&global.ssl_max, count);
 		}
 #endif
 
@@ -1752,7 +1757,8 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 	struct listener *li, *new_li, *ref;
 	struct thread_set new_ts;
 	int shard, shards, todo, done, grp, dups;
-	ulong mask, gmask, bit;
+	ulong mask, bit;
+	int nbgrps;
 	int cfgerr = 0;
 	char *err;
 
@@ -1784,7 +1790,7 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 			}
 		}
 		else if (shards == -2)
-			shards = protocol_supports_flag(li->rx.proto, PROTO_F_REUSEPORT_SUPPORTED) ? my_popcountl(bind_conf->thread_set.grps) : 1;
+			shards = protocol_supports_flag(li->rx.proto, PROTO_F_REUSEPORT_SUPPORTED) ? bind_conf->thread_set.nbgrps : 1;
 
 		/* no more shards than total threads */
 		if (shards > todo)
@@ -1817,25 +1823,25 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 
 				/* take next unassigned bit */
 				bit = (bind_conf->thread_set.rel[grp] & ~mask) & -(bind_conf->thread_set.rel[grp] & ~mask);
+				if (!new_ts.rel[grp])
+					new_ts.nbgrps++;
 				new_ts.rel[grp] |= bit;
 				mask |= bit;
-				new_ts.grps |= 1UL << grp;
 
 				done += shards;
 			};
 
-			BUG_ON(!new_ts.grps); // no more bits left unassigned
+			BUG_ON(!new_ts.nbgrps); // no more group ?
 
 			/* Create all required listeners for all bound groups. If more than one group is
 			 * needed, the first receiver serves as a reference, and subsequent ones point to
 			 * it. We already have a listener available in new_li() so we only allocate a new
-			 * one if we're not on the last one. We count the remaining groups by copying their
-			 * mask into <gmask> and dropping the lowest bit at the end of the loop until there
-			 * is no more. Ah yes, it's not pretty :-/
+			 * one if we're not on the last one.
+			 *
 			 */
 			ref = new_li;
-			gmask = new_ts.grps;
-			for (dups = 0; gmask; dups++) {
+			nbgrps = new_ts.nbgrps;
+			for (dups = 0; nbgrps; dups++) {
 				/* assign the first (and only) thread and group */
 				new_li->rx.bind_thread = thread_set_nth_tmask(&new_ts, dups);
 				new_li->rx.bind_tgroup = thread_set_nth_group(&new_ts, dups);
@@ -1844,10 +1850,16 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 					/* it has been allocated already in the previous round */
 					shard_info_attach(&new_li->rx, ref->rx.shard_info);
 					new_li->rx.flags |= RX_F_MUST_DUP;
+					/* taking the other one's FD will result in it being marked
+					 * extern and being dup()ed. Let's mark the receiver as
+					 * inherited so that it properly bypasses all second-stage
+					 * setup/unbind and avoids being passed to new processes.
+					 */
+					new_li->rx.flags |= ref->rx.flags & RX_F_INHERITED_SOCK;
 				}
 
-				gmask &= gmask - 1; // drop lowest bit
-				if (gmask) {
+				nbgrps--;
+				if (nbgrps) {
 					/* yet another listener expected in this shard, let's
 					 * chain it.
 					 */
@@ -2619,6 +2631,16 @@ static int bind_parse_proto(char **args, int cur_arg, struct proxy *px, struct b
 		memprintf(err, "'%s' :  unknown MUX protocol '%s'", args[cur_arg], args[cur_arg+1]);
 		return ERR_ALERT | ERR_FATAL;
 	}
+
+	if (conf->mux_proto->mux->flags & MX_FL_EXPERIMENTAL) {
+		if (!experimental_directives_allowed) {
+			memprintf(err, "'%s' : '%s' protocol is experimental, must be allowed via a global 'expose-experimental-directives'.",
+			          args[cur_arg], args[cur_arg + 1]);
+			return ERR_ALERT | ERR_FATAL;
+		}
+		mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
+	}
+
 	return 0;
 }
 
@@ -2662,7 +2684,7 @@ static int bind_parse_thread(char **args, int cur_arg, struct proxy *px, struct 
 
 	l = LIST_NEXT(&conf->listeners, struct listener *, by_bind);
 	if (l->rx.addr.ss_family == AF_CUST_RHTTP_SRV &&
-	    atleast2(conf->thread_set.grps)) {
+	    conf->thread_set.nbgrps >= 2) {
 		memprintf(err, "'%s' : reverse HTTP bind cannot span multiple thread groups.", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}

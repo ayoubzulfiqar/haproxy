@@ -31,6 +31,7 @@ enum quic_dump_format {
 /* appctx context used by "show quic" command */
 struct show_quic_ctx {
 	unsigned int epoch;
+	struct list *list;
 	struct bref bref; /* back-reference to the quic-conn being dumped */
 	unsigned int thr;
 	int flags;
@@ -39,7 +40,9 @@ struct show_quic_ctx {
 	int fields;
 };
 
-#define QC_CLI_FL_SHOW_ALL 0x1 /* show closing/draining connections */
+#define QC_CLI_FL_SHOW_ALL 0x0001 /* show all connections including closing ones */
+#define QC_CLI_FL_SHOW_CLO 0x0002 /* show closing connections */
+#define QC_CLI_FL_SHOW_BE  0x0004 /* show backend connections */
 
 /* Returns the output format for show quic. If specified explicitly use it as
  * set. Else format depends if filtering on a single connection instance. If
@@ -93,9 +96,11 @@ static int cli_parse_show_quic(char **args, char *payload, struct appctx *appctx
 			     "             of levels among 'tp', 'sock', 'pktns', 'cc', or 'mux'\n"
 			     "  help       display this help\n"
 			     "Available output filters:\n"
-			     "  all        dump all connections (the default)\n"
+			     "  all        dump all connections\n"
+			     "  clo        dump frontend closing connections\n"
+			     "  be         dump backend connections\n"
 			     "  <id>       dump only the connection matching this identifier (0x...)\n"
-			     "Without any argument, all connections are dumped using the oneline format.\n");
+			     "Without any argument, active frontend connections are dumped using the oneline format.\n");
 		return cli_err(appctx, trash.area);
 	}
 	else if (*args[argc]) {
@@ -162,6 +167,12 @@ static int cli_parse_show_quic(char **args, char *payload, struct appctx *appctx
 		else if (istmatch(istarg, ist("all"))) {
 			ctx->flags |= QC_CLI_FL_SHOW_ALL;
 		}
+		else if (istmatch(istarg, ist("clo"))) {
+			ctx->flags |= QC_CLI_FL_SHOW_CLO;
+		}
+		else if (istmatch(istarg, ist("be"))) {
+			ctx->flags |= QC_CLI_FL_SHOW_BE;
+		}
 		else {
 			cli_err(appctx, "Invalid argument, use 'help' for more options.\n");
 			return 1;
@@ -183,7 +194,8 @@ static void dump_quic_oneline(struct show_quic_ctx *ctx, struct quic_conn *qc)
 	unsigned char cid_len;
 	struct listener *l = qc->li;
 
-	ret = chunk_appendf(&trash, "%p[%02u]/%-.12s ", qc, ctx->thr,
+	ret = chunk_appendf(&trash, "%p[%02u]%s/%-.12s ", qc, ctx->thr,
+	                    qc_is_back(qc) ? "(B)" : "",
 	                    l ? l->bind_conf->frontend->id :
 	                    qc->conn ? __objt_server(qc->conn->target)->id : "UNKNOWN");
 
@@ -278,7 +290,8 @@ static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
 
 	addnl = 0;
 	/* CIDs */
-	chunk_appendf(&trash, "* %p[%02u]: scid=", qc, ctx->thr);
+	chunk_appendf(&trash, "* %p[%02u]%s: scid=", qc, ctx->thr,
+	              qc_is_back(qc) ? "(B)" : "");
 	for (cid_len = 0; cid_len < qc->scid.len; ++cid_len)
 		chunk_appendf(&trash, "%02x", qc->scid.data[cid_len]);
 	while (cid_len++ < 20)
@@ -434,6 +447,17 @@ static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
 	chunk_appendf(&trash, "\n");
 }
 
+static inline struct list *cli_quic_get_list(int flags, int thr)
+{
+	if (flags & QC_CLI_FL_SHOW_BE)
+		return &ha_thread_ctx[thr].quic_conns_be;
+	else if (flags & QC_CLI_FL_SHOW_CLO)
+		return &ha_thread_ctx[thr].quic_conns_clo;
+	else
+		return &ha_thread_ctx[thr].quic_conns_fe;
+
+}
+
 static int cli_io_handler_dump_quic(struct appctx *appctx)
 {
 	struct show_quic_ctx *ctx = appctx->svcctx;
@@ -452,7 +476,8 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 	}
 	else if (!ctx->bref.ref) {
 		/* First invocation. */
-		ctx->bref.ref = ha_thread_ctx[ctx->thr].quic_conns.n;
+		ctx->list = cli_quic_get_list(ctx->flags, ctx->thr);
+		ctx->bref.ref = ctx->list->n;
 
 		/* Print legend for oneline format. */
 		if (cli_show_quic_format(ctx) == QUIC_DUMP_FMT_ONELINE) {
@@ -470,23 +495,27 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 	while (1) {
 		int done = 0;
 
-		if (ctx->bref.ref == &ha_thread_ctx[ctx->thr].quic_conns) {
+		if (ctx->bref.ref == ctx->list) {
 			/* If closing connections requested through "all" or a
 			 * specific connection is filtered, move to
 			 * quic_conns_clo list after browsing quic_conns. Else
 			 * move directly to the next quic_conns thread.
 			 */
-			if (ctx->flags & QC_CLI_FL_SHOW_ALL || ctx->ptr) {
-				ctx->bref.ref = ha_thread_ctx[ctx->thr].quic_conns_clo.n;
+			if (ctx->bref.ref == &ha_thread_ctx[ctx->thr].quic_conns_clo) {
+				/* Closing list entirely browsed, go to next
+				 * quic_conns thread.
+				 */
+				done = 1;
+			}
+			else if ((ctx->flags & QC_CLI_FL_SHOW_ALL) || ctx->ptr) {
+				if (ctx->bref.ref == &ha_thread_ctx[ctx->thr].quic_conns_fe)
+					ctx->list = &ha_thread_ctx[ctx->thr].quic_conns_be;
+				else if (ctx->bref.ref == &ha_thread_ctx[ctx->thr].quic_conns_be)
+					ctx->list = &ha_thread_ctx[ctx->thr].quic_conns_clo;
+				ctx->bref.ref = ctx->list->n;
 				continue;
 			}
 
-			done = 1;
-		}
-		else if (ctx->bref.ref == &ha_thread_ctx[ctx->thr].quic_conns_clo) {
-			/* Closing list entirely browsed, go to next quic_conns
-			 * thread.
-			 */
 			done = 1;
 		}
 		else {
@@ -505,7 +534,8 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 			if (ctx->thr >= global.nbthread)
 				break;
 			/* Switch to next thread quic_conns list. */
-			ctx->bref.ref = ha_thread_ctx[ctx->thr].quic_conns.n;
+			ctx->list = cli_quic_get_list(ctx->flags, ctx->thr);
+			ctx->bref.ref = ctx->list->n;
 			continue;
 		}
 
@@ -572,7 +602,8 @@ static void cli_quic_init()
 	int thr;
 
 	for (thr = 0; thr < MAX_THREADS; ++thr) {
-		LIST_INIT(&ha_thread_ctx[thr].quic_conns);
+		LIST_INIT(&ha_thread_ctx[thr].quic_conns_fe);
+		LIST_INIT(&ha_thread_ctx[thr].quic_conns_be);
 		LIST_INIT(&ha_thread_ctx[thr].quic_conns_clo);
 	}
 }

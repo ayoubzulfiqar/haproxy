@@ -1,7 +1,7 @@
                              ------------------------
                              HAProxy Management Guide
                              ------------------------
-                                   version 3.3
+                                   version 3.5
 
 
 This document describes how to start, stop, manage, and troubleshoot HAProxy,
@@ -214,6 +214,18 @@ list of options is :
   -d : enable debug mode. This disables daemon mode, forces the process to stay
     in foreground and to show incoming and outgoing events. It must never be
     used in an init script.
+
+  -dA[file] : dump an archive of all dependencies detected at boot time in the
+    designated file in tar format, immediately after the configuration is done
+    loading. This is equivalent to "set-dumpable libs", but instead of keeping
+    the libs in memory, it dumps them into a file. This may be used after a
+    core dump, in order to provide all necessary libraries to developers to
+    permit them to exploit the core. This may not be available on all operating
+    systems. It is highly recommended to use this with the regular
+    configuration files, and optionally with "-c" when used manually, to make
+    haproxy immediately exit after the dump, without starting. Example:
+
+       $ haproxy -dA/tmp/libs.tar -c -f /etc/haproxy/haproxy.cfg
 
   -dC[key] : dump the configuration file. It is performed after the lines are
     tokenized, so comments are stripped and indenting is forced. If a non-zero
@@ -1646,16 +1658,20 @@ a payload, it needs to end with an empty line.
 
 The payload pattern can be customized in order to change the way the payload
 ends. In order to end a payload with something else than an empty line, a
-customized pattern can be set between '<<' and '\n'. Only 7 characters can be
-used in addiction to '<<', otherwise this won't be considered a payload.
-For example, to use a PEM file that contains empty lines and comments:
+customized pattern can be set between '<<' and '\n'. Up to 64 characters can be
+used in addition to '<<', otherwise this won't be considered a payload. It
+should be enough to use random payload patterns. For example, to use a PEM file
+that contains empty lines and comments:
 
   # echo -e "set ssl cert common.pem <<%EOF%\n$(cat common.pem)\n%EOF%\n" | \
   socat /var/run/haproxy.stat -
 
-Limitations do exist: the length of the whole buffer passed to the CLI must
-not be greater than tune.bfsize and the pattern "<<" must not be glued to the
-last word of the line.
+Limitations do exist: The pattern "<<" must not be glued to the last word of the
+line. The length of a command line must not be greater than tune.bufsize,
+including the pattern starting the payload, but excluding the payload
+itself. The payload size is limited to 128KB by default. This can be changed by
+setting "tune.cli.max-payload-size" global parameter, with some cautions. Note
+the pattern marking the end of the payload is part of this limit.
 
 When entering a payload while in interactive mode, the prompt will change from
 "> " to "+ ".
@@ -1724,6 +1740,27 @@ add acl [@<ver>] <acl> <pattern>
   "show acl @<ver>" command, and cleared using a "clear acl @<ver>" command.
   This command cannot be used if the reference <acl> is a name also used with
   a map. In this case, the "add map" command must be used instead.
+
+add backend <name> from <defproxy> [mode <mode>] [guid <guid>] [ EXPERIMENTAL ]
+  Instantiate a new backend proxy with the name <name>.
+
+  Only TCP or HTTP proxies can be created. All of the settings are inherited
+  from <defproxy> default proxy instance. By default, it is mandatory to
+  specify the backend mode via the argument of the same name, unless <defproxy>
+  already defines it explicitly. It is also possible to use an optional GUID
+  argument if wanted.
+
+  Servers can be added via the command "add server". The backend is initialized
+  in the unpublished state. Once considered ready for traffic, use "publish
+  backend" to expose the newly created instance.
+
+  All named default proxies can be used, given that they validate the same
+  inheritance rules applied during configuration parsing. There is some
+  exceptions though, for example when the mode is neither TCP nor HTTP.
+
+  This command is restricted and can only be issued on sockets configured for
+  level "admin". Moreover, this feature is still considered in development so it
+  also requires experimental mode (see "experimental-mode on").
 
 add map [@<ver>] <map> <key> <value>
 add map [@<ver>] <map> <payload>
@@ -2100,6 +2137,30 @@ del acl <acl> [<key>|#<ref>]
   listing the content of the acl. Note that if the reference <acl> is a name and
   is shared with a map, the entry will be also deleted in the map.
 
+del backend <name>
+  Removes the backend proxy with the name <name>.
+
+  This operation is only possible for TCP or HTTP proxies. To succeed, the
+  backend instance must have been first unpublished. Also, all of its servers
+  must first be removed (via "del server" CLI). Finally, no stream must still
+  be attached to the backend instance.
+
+  There is additional restrictions which prevent backend removal. First, a
+  backend cannot be removed if it is explicitly referenced by config elements,
+  for example via a use_backend rule or in sample expressions. Some proxies
+  options are also incompatible with runtime deletion. Currently, this is the
+  case when deprecated dispatch or option transparent are used. Also, a backend
+  cannot be removed if there is a stick-table declared in it. Finally, it is
+  impossible for now to remove a backend if QUIC servers were present in it.
+
+  It can be useful to use "wait be-removable" prior to this command to check
+  for the aforementioned requisites. This also provides a method to wait for
+  the final closure of the streams attached to the target backend.
+
+  This command is restricted and can only be issued on sockets configured for
+  level "admin". Moreover, this feature is still considered in development so it
+  also requires experimental mode (see "experimental-mode on").
+
 del map <map> [<key>|#<ref>]
   Delete all the map entries from the map <map> corresponding to the key <key>.
   <map> is the #<id> or the <name> returned by "show map". If the <ref> is used,
@@ -2474,6 +2535,11 @@ prompt [help | n | i | p | timed]*
   advanced scripts, and the non-interactive mode (default) to basic scripts.
   Note that the non-interactive mode is not available for the master socket.
 
+publish backend <backend>
+  Activates content switching to a backend instance. This is the reverse
+  operation of "unpublish backend" command. This command is restricted and can
+  only be issued on sockets configured for levels "operator" or "admin".
+
 quit
   Close the connection when in interactive mode.
 
@@ -2529,7 +2595,8 @@ set maxconn global <maxconn>
   delayed until the threshold is reached. A value of zero restores the initial
   setting.
 
-set profiling { tasks | memory } { auto | on | off }
+set profiling memory { on | off }
+set profiling tasks { auto | on | off | lock | no-lock | memory | no-memory }
   Enables or disables CPU or memory profiling for the indicated subsystem. This
   is equivalent to setting or clearing the "profiling" settings in the "global"
   section of the configuration file. Please also see "show profiling". Note
@@ -2538,6 +2605,13 @@ set profiling { tasks | memory } { auto | on | off }
   The memory profiling is limited to certain operating systems (known to work
   on the linux-glibc target), and requires USE_MEMORY_PROFILING to be set at
   compile time.
+
+. For tasks profiling, it is possible to enable or disable the collection of
+  per-task lock and memory timings at runtime, but the change is only taken
+  into account next time the profiler switches from off/auto to on (either
+  automatically or manually). Thus when using "no-lock" to disable per-task
+  lock profiling and save CPU cycles, it is recommended to flip the task
+  profiling off then on to commit the change.
 
 set rate-limit connections global <value>
   Change the process-wide connection rate limit, which is set by the global
@@ -2842,6 +2916,13 @@ operator
   increased. It also drops expert and experimental mode. See also "show cli
   level".
 
+unpublish backend <backend>
+  Marks the backend as unqualified for future traffic selection. In effect,
+  use_backend / default_backend rules which reference it are ignored and the
+  next content switching rules are evaluated. Contrary to disabled backends,
+  servers health checks remain active. This command is restricted and can only
+  be issued on sockets configured for levels "operator" or "admin".
+
 user
   Decrease the CLI level of the current CLI session to user. It can't be
   increased. It also drops expert and experimental mode. See also "show cli
@@ -3026,37 +3107,40 @@ show events [<sink>] [-w] [-n] [-0]
   delimited by a line feed character ('\n' or 10 or 0x0A). It is possible to
   change this to the NUL character ('\0' or 0) by passing the "-0" argument.
 
-show fd [-!plcfbsd]* [<fd>]
+show fd [-!plcfbsd]* [[<tgid>]/[<fd>] | <fd>]
   Dump the list of either all open file descriptors or just the one number <fd>
-  if specified. A set of flags may optionally be passed to restrict the dump
-  only to certain FD types or to omit certain FD types. When '-' or '!' are
-  encountered, the selection is inverted for the following characters in the
-  same argument. The inversion is reset before each argument word delimited by
-  white spaces. Selectable FD types include 'p' for pipes, 'l' for listeners,
-  'c' for connections (any type), 'f' for frontend connections, 'b' for backend
-  connections (any type), 's' for connections to servers, 'd' for connections
-  to the "dispatch" address or the backend's transparent address. With this,
-  'b' is a shortcut for 'sd' and 'c' for 'fb' or 'fsd'. 'c!f' is equivalent to
-  'b' ("any connections except frontend connections" are indeed backend
-  connections). This is only aimed at developers who need to observe internal
-  states in order to debug complex issues such as abnormal CPU usages. One fd
-  is reported per lines, and for each of them, its state in the poller using
-  upper case letters for enabled flags and lower case for disabled flags, using
-  "P" for "polled", "R" for "ready", "A" for "active", the events status using
-  "H" for "hangup", "E" for "error", "O" for "output", "P" for "priority" and
-  "I" for "input", a few other flags like "N" for "new" (just added into the fd
-  cache), "U" for "updated" (received an update in the fd cache), "L" for
-  "linger_risk", "C" for "cloned", then the cached entry position, the pointer
-  to the internal owner, the pointer to the I/O callback and its name when
-  known. When the owner is a connection, the connection flags, and the target
-  are reported (frontend, proxy or server). When the owner is a listener, the
-  listener's state and its frontend are reported. There is no point in using
-  this command without a good knowledge of the internals. It's worth noting
-  that the output format may evolve over time so this output must not be parsed
-  by tools designed to be durable. Some internal structure states may look
-  suspicious to the function listing them, in this case the output line will be
-  suffixed with an exclamation mark ('!'). This may help find a starting point
-  when trying to diagnose an incident.
+  if specified. The form "<tgid>/<fd>" is also accepted, where either side may
+  be empty as a wildcard ("/<fd>" for fd <fd> across thread groups, "<tgid>/"
+  for all fds of <tgid>). The <tgid> is currently parsed but ignored, pending
+  future support for per-thread-group fd tables. A set of flags may optionally
+  be passed to restrict the dump only to certain FD types or to omit certain FD
+  types. When '-' or '!' are encountered, the selection is inverted for the
+  following characters in the same argument. The inversion is reset before each
+  argument word delimited by white spaces. Selectable FD types include 'p' for
+  pipes, 'l' for listeners, 'c' for connections (any type), 'f' for frontend
+  connections, 'b' for backend connections (any type), 's' for connections to
+  servers, 'd' for connections to the "dispatch" address or the backend's
+  transparent address. With this, 'b' is a shortcut for 'sd' and 'c' for 'fb' or
+  'fsd'. 'c!f' is equivalent to 'b' ("any connections except frontend
+  connections" are indeed backend connections). This is only aimed at developers
+  who need to observe internal states in order to debug complex issues such as
+  abnormal CPU usages. One fd is reported per lines, and for each of them, its
+  state in the poller using upper case letters for enabled flags and lower case
+  for disabled flags, using "P" for "polled", "R" for "ready", "A" for "active",
+  the events status using "H" for "hangup", "E" for "error", "O" for "output",
+  "P" for "priority" and "I" for "input", a few other flags like "N" for "new"
+  (just added into the fd cache), "U" for "updated" (received an update in the
+  fd cache), "L" for "linger_risk", "C" for "cloned", then the cached entry
+  position, the pointer to the internal owner, the pointer to the I/O callback
+  and its name when known. When the owner is a connection, the connection flags,
+  and the target are reported (frontend, proxy or server). When the owner is a
+  listener, the listener's state and its frontend are reported. There is no
+  point in using this command without a good knowledge of the internals. It's
+  worth noting that the output format may evolve over time so this output must
+  not be parsed by tools designed to be durable. Some internal structure states
+  may look suspicious to the function listing them, in this case the output line
+  will be suffixed with an exclamation mark ('!'). This may help find a starting
+  point when trying to diagnose an incident.
 
 show info [typed|json] [desc] [float]
   Dump info about haproxy status on current process. If "typed" is passed as an
@@ -3291,7 +3375,7 @@ show pools [byname|bysize|byusage] [detailed] [match <pfx>] [<nb>]
       - Pool quic_conn_c (152 bytes) : 1337 allocated (203224 bytes), ...
     Total: 15 pools, 109578176 bytes allocated, 109578176 used ...
 
-show profiling [{all | status | tasks | memory}] [byaddr|bytime|aggr|<max_lines>]*
+show profiling [{all | status | tasks | memory}] [byaddr|bytime|byctx|aggr|<max_lines>]*
   Dumps the current profiling settings, one per line, as well as the command
   needed to change them. When tasks profiling is enabled, some per-function
   statistics collected by the scheduler will also be emitted, with a summary
@@ -3300,14 +3384,15 @@ show profiling [{all | status | tasks | memory}] [byaddr|bytime|aggr|<max_lines>
   allocations/releases and their sizes will be reported. It is possible to
   limit the dump to only the profiling status, the tasks, or the memory
   profiling by specifying the respective keywords; by default all profiling
-  information are dumped. It is also possible to limit the number of lines
+  information are dumped. It is also possible to limit the number of lines of
   of output of each category by specifying a numeric limit. If is possible to
-  request that the output is sorted by address or by total execution time
-  instead of usage, e.g. to ease comparisons between subsequent calls or to
-  check what needs to be optimized, and to aggregate task activity by called
-  function instead of seeing the details. Please note that profiling is
-  essentially aimed at developers since it gives hints about where CPU cycles
-  or memory are wasted in the code. There is nothing useful to monitor there.
+  request that the output is sorted by address, by total execution time, or by
+  calling context instead of usage, e.g. to ease comparisons between subsequent
+  calls or to check what needs to be optimized, and to aggregate task activity
+  by called function instead of seeing the details. Please note that profiling
+  is essentially aimed at developers since it gives hints about where CPU
+  cycles or memory are wasted in the code. There is nothing useful to monitor
+  there.
 
 show resolvers [<resolvers section id>]
   Dump statistics for the given resolvers section, or all resolvers sections
@@ -3342,9 +3427,10 @@ show quic [<format>] [<filter>]
   in the format will instead show a more detailed help message.
 
   The final argument is used to restrict or extend the connection list. By
-  default, connections on closing or draining state are not displayed. Use the
-  extra argument "all" to include them in the output. It's also possible to
-  restrict to a single connection by specifying its hexadecimal address.
+  default, active frontend connections only are displayed. Use the extra
+  argument "clo" to list instead closing frontend connections, "be" for backend
+  connections or "all" for every categories. It's also possible to restrict to
+  a single connection by specifying its hexadecimal address.
 
 show servers conn [<backend>]
   Dump the current and idle connections state of the servers belonging to the
@@ -3614,7 +3700,7 @@ show stat [domain <resolvers|proxy>] [{<iid>|<proxy>} <type> <sid>] \
   format" described in the section above. In short, the second column (after the
   first ':') indicates the origin, nature, scope and persistence state of the
   variable. The third column indicates the field type, among "s32", "s64",
-  "u32", "u64", "flt' and "str". Then the fourth column is the value itself,
+  "u32", "u64", "flt" and "str". Then the fourth column is the value itself,
   which the consumer knows how to parse thanks to column 3 and how to process
   thanks to column 2.
 
@@ -4480,6 +4566,13 @@ wait { -h | <delay> } [<condition> [<args>...]]
   With a condition and optional arguments, the command will wait for the
   specified condition to be satisfied, to unrecoverably fail, or to remain
   unsatisfied for the whole <delay> duration. The supported conditions are:
+
+  - be-removable <proxy> : this will wait for the specified proxy backend to be
+    removable by the "del backend" command. Some conditions will never be
+    accepted (e.g. backend not yet unpublished or with servers in it) and will
+    cause the report of a specific error message indicating what condition is
+    not met. If everything is OK before the delay, a success is returned and
+    the operation is terminated.
 
   - srv-removable <proxy>/<server> : this will wait for the specified server to
     be removable by the "del server" command, i.e. be in maintenance and no

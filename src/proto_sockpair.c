@@ -151,12 +151,6 @@ int sockpair_bind_receiver(struct receiver *rx, char **errmsg)
 			err |= ERR_RETRYABLE;
 			goto bind_ret_err;
 		}
-		/* taking the other one's FD will result in it being marked
-		 * extern and being dup()ed. Let's mark the receiver as
-		 * inherited so that it properly bypasses all second-stage
-		 * setup and avoids being passed to new processes.
-		 */
-		rx->flags |= RX_F_INHERITED;
 		rx->fd = rx->shard_info->ref->fd;
 	}
 
@@ -243,11 +237,14 @@ int send_fd_uxst(int fd, int send_fd)
 	struct iovec iov;
 	struct msghdr msghdr;
 
-	char cmsgbuf[CMSG_SPACE(sizeof(int))] = {0};
-	char buf[CMSG_SPACE(sizeof(int))] = {0};
+	char cmsgbuf[CMSG_SPACE(sizeof(int))];
+	char buf[CMSG_SPACE(sizeof(int))];
 	struct cmsghdr *cmsg = (void *)buf;
 
 	int *fdptr;
+
+	memset(cmsgbuf, 0, sizeof(cmsgbuf));
+	memset(buf, 0, sizeof(buf));
 
 	iov.iov_base = iobuf;
 	iov.iov_len = sizeof(iobuf);
@@ -491,8 +488,11 @@ struct connection *sockpair_accept_conn(struct listener *l, int *status)
 	int ret;
 	int cfd;
 
-	if ((cfd = recv_fd_uxst(l->rx.fd)) != -1)
+	if ((cfd = recv_fd_uxst(l->rx.fd)) != -1) {
 		fd_set_nonblock(cfd);
+		if (master)
+			fd_set_cloexec(cfd);
+	}
 
 	if (likely(cfd != -1)) {
 		/* Perfect, the connection was accepted */

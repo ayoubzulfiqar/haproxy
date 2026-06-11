@@ -1,5 +1,5 @@
 /*
- * include/haproxy/dns-t.h
+ * include/haproxy/resolvers-t.h
  * This file provides structures and types for DNS.
  *
  * Copyright (C) 2014 Baptiste Assmann <bedis9@gmail.com>
@@ -27,7 +27,6 @@
 #include <haproxy/connection-t.h>
 #include <haproxy/dns-t.h>
 #include <haproxy/obj_type-t.h>
-#include <haproxy/stats-t.h>
 #include <haproxy/task-t.h>
 #include <haproxy/thread.h>
 
@@ -73,6 +72,7 @@ extern struct pool_head *resolv_requester_pool;
 /* dns record types (non exhaustive list) */
 #define DNS_RTYPE_A             1       /* IPv4 address */
 #define DNS_RTYPE_CNAME         5       /* canonical name */
+#define DNS_RTYPE_TXT           16      /* TXT */
 #define DNS_RTYPE_AAAA          28      /* IPv6 address */
 #define DNS_RTYPE_SRV           33      /* SRV record */
 #define DNS_RTYPE_OPT           41      /* OPT */
@@ -114,7 +114,7 @@ struct resolv_answer_item {
 	char            name[DNS_MAX_NAME_SIZE+1];   /* answer name */
 	int16_t         type;                        /* question type */
 	int16_t         class;                       /* query class */
-	int32_t         ttl;                         /* response TTL */
+	uint32_t        ttl;                         /* response TTL */
 	int16_t         priority;                    /* SRV type priority */
 	uint16_t        weight;                      /* SRV type weight */
 	uint16_t        port;                        /* SRV type port */
@@ -281,7 +281,7 @@ enum {
 	                            * matching preference was found.
 	                            */
 	RSLV_UPD_SRVIP_NOT_FOUND,  /* provided IP not found
-	                            * OR provided IP found and preference is not match and an IP
+	                            * OR provided IP found and preference is not matched and an IP
 	                            * matching preference was found.
 	                            */
 	RSLV_UPD_NO_IP_FOUND,      /* no IP could be found in the response */

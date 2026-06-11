@@ -183,8 +183,10 @@ int httpclient_res_xfer(struct httpclient *hc, struct buffer *dst)
 	/* call the client once we consumed all data */
 	if (!b_data(&hc->res.buf)) {
 		b_free(&hc->res.buf);
-		if (ret && hc->appctx)
+		if (ret && hc->appctx) {
+			applet_will_consume(hc->appctx);
 			appctx_wakeup(hc->appctx);
+		}
 	}
 	return ret;
 }
@@ -374,7 +376,7 @@ out:
  * This function tries to destroy the httpclient if it wasn't running.
  * If it was running, stop the client and ask it to autodestroy itself.
  *
- * Once this function is used, all pointer sto the client must be removed
+ * Once this function is used, all pointers to the client must be removed
  *
  */
 void httpclient_stop_and_destroy(struct httpclient *hc)
@@ -604,10 +606,7 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 						htx_to_buf(htx, outbuf);
 						b_xfer(outbuf, &hc->req.buf, b_data(&hc->req.buf));
 					} else {
-						struct htx_ret ret;
-
-						ret = htx_xfer_blks(htx, hc_htx, htx_used_space(hc_htx), HTX_BLK_UNUSED);
-						if (!ret.ret) {
+						if (!htx_xfer(htx, hc_htx, htx_used_space(hc_htx), HTX_XFER_DEFAULT)) {
 							applet_have_more_data(appctx);
 							goto out;
 						}
@@ -651,14 +650,14 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 					break;
 				}
 
-				/* copy the start line in the hc structure,then remove the htx block */
+				/* copy the start line in the hc structure, then remove the htx block */
 				htx = htxbuf(inbuf);
 				if (htx_get_head_type(htx) != HTX_BLK_RES_SL)
 					goto error;
 				blk = DISGUISE(htx_get_head_blk(htx));
 				sl = htx_get_blk_ptr(htx, blk);
 
-				/* Skipp any 1XX interim responses */
+				/* Skip any 1XX interim responses */
 				if (sl->info.res.status < 200) {
 					/* Upgrade are not supported. Report an error */
 					if (sl->info.res.status == 101)
@@ -711,7 +710,6 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 				if (hc->options & HTTPCLIENT_O_RES_HTX) {
 					/* HTX mode transfers the header to the hc buffer */
 					struct htx *hc_htx;
-					struct htx_ret ret;
 
 					if (!b_alloc(&hc->res.buf, DB_MUX_TX)) {
 						applet_wont_consume(appctx);
@@ -720,8 +718,7 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 					hc_htx = htxbuf(&hc->res.buf);
 
 					/* xfer the headers */
-					ret = htx_xfer_blks(hc_htx, htx, htx_used_space(htx), HTX_BLK_EOH);
-					if (!ret.ret) {
+					if (!htx_xfer(hc_htx, htx, htx_used_space(htx), HTX_XFER_HDRS_ONLY)) {
 						applet_need_more_data(appctx);
 						goto out;
 					}
@@ -735,7 +732,7 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 
 				} else {
 				/* first copy the headers in a local hdrs
-				 * structure, once we the total numbers of the
+				 * structure, once we have the total numbers of the
 				 * header we allocate the right size and copy
 				 * them. The htx block of the headers are
 				 * removed each time one is read  */
@@ -781,7 +778,6 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 				} else {
 					appctx->st0 = HTTPCLIENT_S_RES_BODY;
 				}
-
 				htx_to_buf(htx, inbuf);
 				break;
 
@@ -795,7 +791,7 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 
 				/*
 				 * The IO handler removes the htx blocks in the response buffer and
-				 * push them in the hc->res.buf buffer in a raw format.
+				 * pushes them in the hc->res.buf buffer in a raw format.
 				 */
 				htx = htxbuf(inbuf);
 				if (htx_is_empty(htx)) {
@@ -809,14 +805,12 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 				}
 
 				if (hc->options & HTTPCLIENT_O_RES_HTX) {
-					/* HTX mode transfers the header to the hc buffer */
+					/* HTX mode transfers the body to the hc buffer */
 					struct htx *hc_htx;
-					struct htx_ret ret;
 
 					hc_htx = htxbuf(&hc->res.buf);
 
-					ret = htx_xfer_blks(hc_htx, htx, htx_used_space(htx), HTX_BLK_UNUSED);
-					if (!ret.ret)
+					if (!htx_xfer(hc_htx, htx, htx_used_space(htx), HTX_XFER_DEFAULT))
 						applet_wont_consume(appctx);
 					else
 						applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
@@ -881,6 +875,10 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 	}
 
 out:
+	if (appctx->st0 != HTTPCLIENT_S_RES_END && !b_is_null(&hc->res.buf)) {
+		/* Don't accept more data while the httpclient response buffer is not empty */
+		applet_wont_consume(appctx);
+	}
 	return;
 
 error:
@@ -951,8 +949,14 @@ int httpclient_applet_init(struct appctx *appctx)
 
 	s = appctx_strm(appctx);
 	s->target = target;
-	if (objt_server(s->target))
-		s->sv_tgcounters = __objt_server(s->target)->counters.shared.tg[tgid - 1];
+	if (objt_server(s->target)) {
+		struct server *srv = __objt_server(s->target);
+
+		if (srv->counters.shared.tg)
+			s->sv_tgcounters = __objt_server(s->target)->counters.shared.tg[tgid - 1];
+		else
+			s->sv_tgcounters = NULL;
+	}
 
 	/* set the "timeout server" */
 	s->scb->ioto = hc->timeout_server;
@@ -1208,7 +1212,7 @@ err:
 	if (err_code & ERR_CODE) {
 		ha_alert("httpclient: cannot initialize: %s\n", errmsg);
 		free(errmsg);
-		free_proxy(px);
+		proxy_drop(px);
 
 		return NULL;
 	}

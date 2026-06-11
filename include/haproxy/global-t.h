@@ -67,7 +67,7 @@
 #define GTUNE_USE_SYSTEMD        (1<<10)
 
 #define GTUNE_BUSY_POLLING       (1<<11)
-/* (1<<12) unused */
+#define GTUNE_PURGE_DEFAULTS     (1<<12)
 #define GTUNE_SET_DUMPABLE       (1<<13)
 #define GTUNE_USE_EVPORTS        (1<<14)
 #define GTUNE_STRICT_LIMITS      (1<<15)
@@ -79,13 +79,14 @@
 #define GTUNE_DISABLE_H2_WEBSOCKET (1<<21)
 #define GTUNE_DISABLE_ACTIVE_CLOSE (1<<22)
 #define GTUNE_QUICK_EXIT         (1<<23)
-/* (1<<24) unused */
+#define GTUNE_COLLECT_LIBS       (1<<24)
 /* (1<<25) unused */
 #define GTUNE_USE_FAST_FWD       (1<<26)
 #define GTUNE_LISTENER_MQ_FAIR   (1<<27)
 #define GTUNE_LISTENER_MQ_OPT    (1<<28)
 #define GTUNE_LISTENER_MQ_ANY    (GTUNE_LISTENER_MQ_FAIR | GTUNE_LISTENER_MQ_OPT)
 #define GTUNE_NO_KTLS            (1<<29)
+#define GTUNE_NO_MAX_COUNTER     (1<<30)
 
 /* subsystem-specific debugging options for tune.debug */
 #define GDBG_CPU_AFFINITY           (1U<< 0)
@@ -179,6 +180,7 @@ struct global {
 		uint recv_enough;  /* how many input bytes at once are "enough" */
 		uint bufsize;      /* buffer size in bytes, defaults to BUFSIZE */
 		uint bufsize_small;/* small buffer size in bytes */
+		uint bufsize_large;/* large buffer size in bytes */
 		int maxrewrite;    /* buffer max rewrite size in bytes, defaults to MAXREWRITE */
 		int reserved_bufs; /* how many buffers can only be allocated for response */
 		int buf_limit;     /* if not null, how many total buffers may only be allocated */
@@ -213,6 +215,8 @@ struct global {
 		int default_shards; /* default shards for listeners, or -1 (by-thread) or -2 (by-group) */
 		uint max_checks_per_thread; /* if >0, no more than this concurrent checks per thread */
 		uint ring_queues;   /* if >0, #ring queues, otherwise equals #thread groups */
+		uint cli_max_payload_sz; /* The max payload size for the CLI */
+		int streams_elasticity;  /* percent of advertised streams to connection; 0=no limit */
 		enum threadgroup_takeover tg_takeover; /* Policy for threadgroup takeover */
 	} tune;
 	struct {
@@ -261,6 +265,7 @@ struct global {
 	unsigned int req_count; /* request counter (HTTP or TCP session) for logs and unique_id */
 	int last_checks;
 	uint32_t anon_key;
+	int maxthrpertgroup; /* Maximum number of threads per thread group */
 
 	/* leave this at the end to make sure we don't share this cache line by accident */
 	ALWAYS_ALIGN(64);

@@ -28,13 +28,13 @@
 #include <import/ebtree-t.h>
 
 #include <haproxy/api-t.h>
+#include <haproxy/counters-t.h>
 #include <haproxy/guid-t.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_sock-t.h>
 #include <haproxy/quic_tp-t.h>
 #include <haproxy/receiver-t.h>
-#include <haproxy/stats-t.h>
 #include <haproxy/thread.h>
 
 /* Some pointer types reference below */
@@ -186,7 +186,7 @@ struct bind_conf {
 #endif
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters. */
-	struct quic_cc_algo *quic_cc_algo; /* QUIC control congestion algorithm */
+	const struct quic_cc_algo *quic_cc_algo; /* QUIC control congestion algorithm */
 	size_t max_cwnd;                   /* QUIC maximumu congestion control window size (kB) */
 	enum quic_sock_mode quic_mode;     /* QUIC socket allocation strategy */
 #endif
@@ -204,6 +204,7 @@ struct bind_conf {
 	unsigned int backlog;      /* if set, listen backlog */
 	int maxconn;               /* maximum connections allowed on this listener */
 	int (*accept)(struct connection *conn); /* upper layer's accept() */
+	int tcp_ss;                /* for TCP, Save SYN */
 	int level;                 /* stats access level (ACCESS_LVL_*) */
 	int severity_output;       /* default severity output format in cli feedback messages */
 	short int nice;            /* nice value to assign to the instantiated tasks */
@@ -262,6 +263,7 @@ struct listener {
 
 	struct li_per_thread *per_thr;  /* per-thread fields (one per thread in the group) */
 
+	char *extra_counters_storage;   /* storage for extra_counters */
 	EXTRA_COUNTERS(extra_counters);
 };
 
@@ -309,7 +311,7 @@ struct bind_kw_list {
 struct accept_queue_ring {
 	uint32_t idx;             /* (head << 16) | tail */
 	struct tasklet *tasklet;  /* tasklet of the thread owning this ring */
-	struct connection *entry[ACCEPT_QUEUE_SIZE] __attribute((aligned(64)));
+	struct connection *entry[ACCEPT_QUEUE_SIZE] THREAD_ALIGNED();
 };
 
 

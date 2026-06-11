@@ -238,6 +238,11 @@ static inline int http_path_has_forbidden_char(const struct ist ist, const char 
  * fall back to the slow path and decide. Brackets are used for IP-literal and
  * deserve special case, that is better handled in the slow path. The function
  * returns 0 if no forbidden char is presnet, non-zero otherwise.
+ *
+ * There is a special case for the comma (','). While it is allowed, we reject
+ * it because the authority is higly linked with the host header. The comma is
+ * also the header value separator. So it is highly ambiguous to use it for the
+ * authority/host value.
  */
 static inline int http_authority_has_forbidden_char(const struct ist ist)
 {
@@ -257,6 +262,7 @@ static inline int http_authority_has_forbidden_char(const struct ist ist)
 		c = p[ofs];
 
 		if (unlikely(c < 0x21 || c > 0x7e ||
+			     c == ',' ||  /* Special case: forbidden because it is ambiguous for the host header value */
 			     c == '#' || c == '/' || c == '?' || c == '@' ||
 			     c == '[' || c == '\\' || c == ']')) {
 			/* all of them must be rejected, except '[' which may
@@ -288,6 +294,80 @@ static inline int http_status_matches(const long *array, uint status)
 		return 0;
 
 	return ha_bit_test(status - 100, array);
+}
+
+/* This function returns 1 if the header is one of the immutable headers.
+ * Forbidden headers are the ones that must not be rewritten. Function returns
+ * 0 if a header can be rewritten
+*/
+static inline int is_immutable_header(struct ist hdr)
+{
+	switch (hdr.len) {
+	case 6:
+		return isteqi(hdr, ist("expect"));
+	case 7:
+		return isteqi(hdr, ist("trailer")) ||
+				isteqi(hdr, ist("upgrade"));
+	case 10:
+		return isteqi(hdr, ist("connection")) ||
+				isteqi(hdr, ist("keep-alive"));
+	case 14:
+		return isteqi(hdr, ist("content-length"));
+	case 16:
+		return isteqi(hdr, ist("proxy-connection"));
+	case 17:
+		return isteqi(hdr, ist("transfer-encoding"));
+	case 18:
+		return isteqi(hdr, ist("proxy-authenticate"));
+	case 19:
+		return isteqi(hdr, ist("proxy-authorization"));
+	default:
+			return 0;
+	}
+}
+
+/* This function parses comma-separated values from <hv> and rewrite it in place,
+ * skip all occurrences of <value>. It is the caller responsibility to deal with
+ * empty header value.
+ */
+static inline void http_remove_header_value(struct ist *hv, struct ist value)
+{
+	char *e, *n, *p;
+	struct ist word;
+
+	word.ptr = hv->ptr - 1; // -1 for next loop's pre-increment
+	p = hv->ptr;
+	e = hv->ptr + hv->len;
+	hv->len = 0;
+
+	while (++word.ptr < e) {
+		/* skip leading delimiter and blanks */
+		if (HTTP_IS_LWS(*word.ptr))
+			continue;
+
+		n = http_find_hdr_value_end(word.ptr, e); // next comma or end of line
+		word.len = n - word.ptr;
+
+		/* trim trailing blanks */
+		while (word.len && HTTP_IS_LWS(word.ptr[word.len-1]))
+			word.len--;
+
+		if (isteqi(word, value))
+			goto skip_val;
+
+		if (hv->ptr + hv->len == p) {
+			/* no rewrite done till now */
+			hv->len = n - hv->ptr;
+		}
+		else {
+			if (hv->len)
+				hv->ptr[hv->len++] = ',';
+			istcat(hv, word, e - hv->ptr);
+		}
+
+	  skip_val:
+		word.ptr = p = n;
+	}
 }
 
 #endif /* _HAPROXY_HTTP_H */

@@ -77,6 +77,8 @@ struct initcall {
 	void *arg1;
 	void *arg2;
 	void *arg3;
+	const char *loc_file; /* file where the call is declared, or NULL */
+	int loc_line;         /* line where the call is declared, or NULL */
 #if defined(USE_OBSOLETE_LINKER)
 	void *next;
 #endif
@@ -107,6 +109,8 @@ struct initcall {
 		.arg1 = (void *)(a1),                              \
 		.arg2 = (void *)(a2),                              \
 		.arg3 = (void *)(a3),                              \
+		.loc_file = __FILE__,                              \
+		.loc_line = linenum,                               \
 	} : NULL
 
 
@@ -131,6 +135,8 @@ __attribute__((constructor)) static void __initcb_##linenum()      \
 		.arg1 = (void *)(a1),                              \
 		.arg2 = (void *)(a2),                              \
 		.arg3 = (void *)(a3),                              \
+		.loc_file = __FILE__,                              \
+		.loc_line = linenum,                               \
 	};                                                         \
 	if (stg < STG_SIZE) {                                      \
 		entry.next = __initstg[stg];                       \
@@ -147,14 +153,14 @@ __attribute__((constructor)) static void __initcb_##linenum()      \
 #define _DECLARE_INITCALL(...) \
 	__DECLARE_INITCALL(__VA_ARGS__)
 
-/* This requires that function <function> is called with pointer argument
- * <argument> during init stage <stage> which must be one of init_stage.
+/* This requires that function <function> is called without arguments
+ * during init stage <stage> which must be one of init_stage.
  */
 #define INITCALL0(stage, function)                                     \
 	_DECLARE_INITCALL(stage, __LINE__, function, 0, 0, 0)
 
 /* This requires that function <function> is called with pointer argument
- * <argument> during init stage <stage> which must be one of init_stage.
+ * <arg1> during init stage <stage> which must be one of init_stage.
  */
 #define INITCALL1(stage, function, arg1)                               \
 	_DECLARE_INITCALL(stage, __LINE__, function, arg1, 0, 0)
@@ -229,8 +235,15 @@ extern struct initcall *__initstg[STG_SIZE];
 		const struct initcall **ptr;                                   \
 		if (stg >= STG_SIZE)                                           \
 			break;                                                 \
-		FOREACH_INITCALL(ptr, stg)                                     \
+		FOREACH_INITCALL(ptr, stg) {                                   \
+			caller_initcall = *ptr;                                \
+			caller_file = (*ptr)->loc_file;                        \
+			caller_line = (*ptr)->loc_line;                        \
 			(*ptr)->fct((*ptr)->arg1, (*ptr)->arg2, (*ptr)->arg3); \
+			caller_initcall = NULL;                                \
+			caller_file = NULL;                                    \
+			caller_line = 0;                                       \
+		}                                                              \
 	} while (0)
 
 #else // USE_OBSOLETE_LINKER
@@ -243,8 +256,15 @@ extern struct initcall *__initstg[STG_SIZE];
 		const struct initcall *ptr;                                    \
 		if (stg >= STG_SIZE)                                           \
 			break;                                                 \
-		FOREACH_INITCALL(ptr, stg)                                     \
+		FOREACH_INITCALL(ptr, stg) {                                   \
+			caller_initcall = ptr;                                 \
+			caller_file = (ptr)->loc_file;                         \
+			caller_line = (ptr)->loc_line;                         \
 			(ptr)->fct((ptr)->arg1, (ptr)->arg2, (ptr)->arg3);     \
+			caller_initcall = NULL;                                \
+			caller_file = NULL;                                    \
+			caller_line = 0;                                       \
+		}                                                              \
 	} while (0)
 
 #endif // USE_OBSOLETE_LINKER

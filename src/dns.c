@@ -194,7 +194,7 @@ int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
 		struct ist myist;
 
 		myist = ist2(buf, len);
-                ret = dns_ring_write(ns->stream->ring_req, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
+		ret = dns_ring_write(ns->stream->ring_req, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
 		if (!ret) {
 			ns->counters->snd_error++;
 			return -1;
@@ -215,10 +215,12 @@ void dns_session_free(struct dns_session *);
  */
 ssize_t dns_recv_nameserver(struct dns_nameserver *ns, void *data, size_t size)
 {
-        ssize_t ret = -1;
+	ssize_t ret = -1;
 
 	if (ns->dgram) {
 		struct dgram_conn *dgram = &ns->dgram->conn;
+		struct sockaddr_storage from = {0};
+		socklen_t fromlen = sizeof(from);
 		int fd;
 
 		HA_SPIN_LOCK(DNS_LOCK, &dgram->lock);
@@ -228,7 +230,7 @@ ssize_t dns_recv_nameserver(struct dns_nameserver *ns, void *data, size_t size)
 			return -1;
 		}
 
-		if ((ret = recv(fd, data, size, 0)) < 0) {
+		if ((ret = recvfrom(fd, data, size, 0, (struct sockaddr *)&from, &fromlen)) < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				fd_cant_recv(fd);
 				HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
@@ -238,6 +240,12 @@ ssize_t dns_recv_nameserver(struct dns_nameserver *ns, void *data, size_t size)
 			dgram->t.sock.fd = -1;
 			HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 			return -1;
+		}
+		if ((dgram->addr.to.ss_family == AF_INET || dgram->addr.to.ss_family == AF_INET6) &&
+		    ipcmp(&from, &dgram->addr.to, 1) != 0) {
+			/* reply from unexpected source -- silently discard */
+			fd_want_recv(fd);
+			ret = 0;
 		}
 		HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 	}
@@ -467,7 +475,6 @@ int dns_dgram_init(struct dns_nameserver *ns, struct sockaddr_storage *sk)
 	dgram->conn.t.sock.fd = -1;
 	dgram->conn.addr.to = *sk;
 	HA_SPIN_INIT(&dgram->conn.lock);
-	ns->dgram = dgram;
 
 	dgram->ofs_req = ~0; /* init ring offset */
 	dgram->ring_req = dns_ring_new(2*DNS_TCP_MSG_RING_MAX_SIZE);
@@ -482,6 +489,7 @@ int dns_dgram_init(struct dns_nameserver *ns, struct sockaddr_storage *sk)
 		ha_alert("nameserver sets too many watchers > 255 on ring. This is a bug and should not happen.\n");
 		goto out;
 	}
+	ns->dgram = dgram;
 	return 0;
 out:
 	dns_ring_free(dgram->ring_req);
@@ -905,6 +913,7 @@ static int dns_session_init(struct appctx *appctx)
 	return 0;
 
   error:
+	sockaddr_free(&addr);
 	return -1;
 }
 
@@ -1337,8 +1346,8 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 {
 	struct dns_stream_server *dss = NULL;
 
-        dss = calloc(1, sizeof(*dss));
-        if (!dss) {
+	dss = calloc(1, sizeof(*dss));
+	if (!dss) {
 		ha_alert("memory allocation error initializing dns tcp server '%s'.\n", srv->id);
 		goto out;
 	}
@@ -1354,7 +1363,7 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 	}
 	/* Create the task associated to the resolver target handling conns */
 	if ((dss->task_req = task_new_anywhere()) == NULL) {
-		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
+		ha_alert("memory allocation error initializing req task for dns tcp server '%s'.\n", srv->id);
 		goto out;
 	}
 
@@ -1371,7 +1380,7 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 
 	/* Create the task associated to the resolver target handling conns */
 	if ((dss->task_rsp = task_new_anywhere()) == NULL) {
-		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
+		ha_alert("memory allocation error initializing rsp task for dns tcp server '%s'.\n", srv->id);
 		goto out;
 	}
 
@@ -1381,7 +1390,7 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 
 	/* Create the task associated to the resolver target handling conns */
 	if ((dss->task_idle = task_new_anywhere()) == NULL) {
-		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
+		ha_alert("memory allocation error initializing idle task for dns tcp server '%s'.\n", srv->id);
 		goto out;
 	}
 
@@ -1417,7 +1426,7 @@ int init_dns_buffers()
 	if (!dns_msg_trash)
 		return 0;
 
-        return 1;
+	return 1;
 }
 
 void deinit_dns_buffers()
