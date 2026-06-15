@@ -290,6 +290,16 @@ struct event_hdl_sub {
 #define EVENT_HDL_SUB_PAT_REF_COMMIT                    EVENT_HDL_SUB_TYPE(2,4)
 #define EVENT_HDL_SUB_PAT_REF_CLEAR                     EVENT_HDL_SUB_TYPE(2,5)
 
+/* ACME family, published in global subscription list.
+ * Provides event_hdl_cb_data_acme_deploy and event_hdl_cb_data_acme_newcert
+ * structs (defined in haproxy/acme-t.h).
+ */
+#define EVENT_HDL_SUB_ACME                              EVENT_HDL_SUB_FAMILY(3)
+/* a new certificate was successfully installed */
+#define EVENT_HDL_SUB_ACME_NEWCERT                      EVENT_HDL_SUB_TYPE(3,1)
+/* dns-01 challenge must be deployed externally */
+#define EVENT_HDL_SUB_ACME_DEPLOY                       EVENT_HDL_SUB_TYPE(3,2)
+
 /*	---------------------------------------        */
 
 /* Please reflect changes above in event_hdl_sub_type_map defined

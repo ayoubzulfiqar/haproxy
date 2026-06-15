@@ -91,14 +91,13 @@ extern struct pool_head *pool_head_task;
 extern struct pool_head *pool_head_tasklet;
 extern struct pool_head *pool_head_notification;
 
-__decl_thread(extern HA_RWLOCK_T wq_lock THREAD_ALIGNED());
-
 void __tasklet_wakeup_on(struct tasklet *tl, int thr);
 struct list *__tasklet_wakeup_after(struct list *head, struct tasklet *tl);
 void task_kill(struct task *t);
 void tasklet_kill(struct tasklet *t);
 void __task_wakeup(struct task *t);
-void __task_queue(struct task *task, struct eb_root *wq);
+void __task_queue(struct task *task);
+static inline void _task_queue(struct task *task, const struct ha_caller *caller);
 
 unsigned int run_tasks_from_lists(unsigned int budgets[]);
 
@@ -118,7 +117,7 @@ void process_runnable_tasks(void);
 void wake_expired_tasks(void);
 
 /* Checks the next timer for the current thread by looking into its own timer
- * list and the global one. It may return TICK_ETERNITY if no timer is present.
+ * list. It may return TICK_ETERNITY if no timer is present.
  * Note that the next timer might very well be slightly in the past.
  */
 int next_timer_expiry(void);
@@ -205,6 +204,77 @@ static inline uint64_t task_mono_time(void)
 	return th_ctx->sched_call_date;
 }
 
+#if !defined(HA_CAS_IS_8B) && !defined(HA_HAVE_CAS_DW)
+__decl_thread(extern HA_SPINLOCK_T task_state_tid);
+#endif
+
+static inline int __task_set_state_and_tid(struct task *t, int expected_tid, int new_tid, unsigned int current, unsigned int wanted)
+{
+#if defined(HA_CAS_IS_8B) || defined(HA_HAVE_CAS_DW)
+	uint64_t expected_value;
+	uint64_t new_value;
+
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	expected_value = ((uint64_t)(current) << 32) | (uint32_t)expected_tid;
+#else
+	expected_value = current | ((uint64_t)expected_tid << 32);
+#endif
+	do {
+		int tid_seen;
+
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+		tid_seen = (expected_value & 0xffffffff);
+		if (tid_seen != expected_tid)
+                        return 0;
+                if ((expected_value >> 32) != current)
+                        return 0;
+                new_value = ((uint64_t)wanted << 32) | (uint32_t)new_tid;
+
+#else
+		tid_seen = (expected_value >> 32);
+		if (tid_seen != expected_tid)
+			return 0;
+		if ((expected_value & 0xffffffff) != current)
+			return 0;
+		new_value = wanted | ((uint64_t)new_tid << 32);
+#endif
+#if defined(HA_CAS_IS_8B)
+	} while (!HA_ATOMIC_CAS((uint64_t *)&t->state, &expected_value, new_value) && __ha_cpu_relax());
+#elif defined(HA_HAVE_CAS_DW)
+	} while (!HA_ATOMIC_DWCAS((uint64_t *)&t->state, &expected_value, &new_value) && __ha_cpu_relax());
+#endif
+	return 1;
+#else /* !HA_CAS_IS_8B && !HA_HAVE_CAS_DW */
+	int old_state;
+	int ret = 0;
+
+	HA_SPIN_LOCK(OTHER_LOCK, &task_state_tid);
+	if (_HA_ATOMIC_LOAD(&t->tid) == expected_tid) {
+		old_state = _HA_ATOMIC_LOAD(&t->state);
+		if (old_state == current && HA_ATOMIC_CAS(&t->state, &old_state, wanted)) {
+			_HA_ATOMIC_STORE(&t->tid, new_tid);
+			ret = 1;
+		}
+	}
+	HA_SPIN_UNLOCK(OTHER_LOCK, &task_state_tid);
+	return ret;
+#endif
+}
+
+static inline int __task_get_new_tid_field(int curtid)
+{
+	if (curtid >= 0 || curtid < -1)
+		return curtid;
+	return -2 - tid;
+}
+
+static inline int __task_get_current_owner(int curtid)
+{
+	if (curtid >= 0 || curtid == -1)
+		return curtid;
+	return ~(curtid + 1);
+}
+
 /* puts the task <t> in run queue with reason flags <f>, and returns <t> */
 /* This will put the task in the local runqueue if the task is only runnable
  * by the current thread, in the global runqueue otherwies. With DEBUG_TASK,
@@ -220,7 +290,9 @@ static inline void _task_wakeup(struct task *t, unsigned int f, const struct ha_
 
 	state = _HA_ATOMIC_OR_FETCH(&t->state, f);
 	while (!(state & (TASK_RUNNING | TASK_QUEUED))) {
-		if (_HA_ATOMIC_CAS(&t->state, &state, state | TASK_QUEUED)) {
+		int expected_tid = _HA_ATOMIC_LOAD(&t->tid);
+
+		if (__task_set_state_and_tid(t, expected_tid, __task_get_new_tid_field(expected_tid), state, state | TASK_QUEUED)) {
 			if (likely(caller)) {
 				caller = HA_ATOMIC_XCHG(&t->caller, caller);
 				BUG_ON((ulong)caller & 1);
@@ -231,6 +303,7 @@ static inline void _task_wakeup(struct task *t, unsigned int f, const struct ha_
 			__task_wakeup(t);
 			break;
 		}
+		state = _HA_ATOMIC_LOAD(&t->state);
 	}
 }
 
@@ -245,14 +318,28 @@ static inline void task_drop_running(struct task *t, unsigned int f)
 {
 	unsigned int state, new_state;
 
-	state = _HA_ATOMIC_LOAD(&t->state);
 
 	while (1) {
-		new_state = state | f;
+		int cur_tid, new_tid;
+
+		state = _HA_ATOMIC_LOAD(&t->state);
+		new_state = (state | f) &~ TASK_RUNNING;
+		cur_tid = t->tid;
+		if ((new_state & TASK_WOKEN_WQ) && __task_get_current_owner(cur_tid) == tid) {
+			_task_queue(t, NULL);
+			new_state &= ~TASK_WOKEN_WQ;
+		}
 		if (new_state & TASK_WOKEN_ANY)
 			new_state |= TASK_QUEUED;
 
-		if (_HA_ATOMIC_CAS(&t->state, &state, new_state & ~TASK_RUNNING))
+
+		if ((new_state & TASK_QUEUED) || cur_tid >= 0 || task_in_wq(t) ||
+		    __task_get_current_owner(cur_tid) != tid)
+			new_tid = cur_tid;
+		else
+			new_tid = -1;
+
+		if (__task_set_state_and_tid(t, cur_tid, new_tid, state, new_state))
 			break;
 		__ha_cpu_relax();
 	}
@@ -273,31 +360,21 @@ static inline struct task *__task_unlink_wq(struct task *t)
 	return t;
 }
 
-/* remove a task from its wait queue. It may either be the local wait queue if
- * the task is bound to a single thread or the global queue. If the task uses a
- * shared wait queue, the global wait queue lock is used.
+/* remove a task from its wait queue, which during normal operations will be
+ * the current thread's wait queue.
  */
 static inline struct task *task_unlink_wq(struct task *t)
 {
-	unsigned long locked;
 
 	if (likely(task_in_wq(t))) {
-		locked = t->tid < 0;
-		BUG_ON(t->tid >= 0 && t->tid != tid && !(global.mode & MODE_STOPPING));
-		if (locked)
-			HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
+		BUG_ON(__task_get_current_owner(t->tid) != tid && !(global.mode & MODE_STOPPING));
 		__task_unlink_wq(t);
-		if (locked)
-			HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
 	}
 	return t;
 }
 
 /* Place <task> into the wait queue, where it may already be. If the expiration
  * timer is infinite, do nothing and rely on wake_expired_task to clean up.
- * If the task uses a shared wait queue, it's queued into the global wait queue,
- * protected by the global wq_lock, otherwise by it necessarily belongs to the
- * current thread'sand is queued without locking.
  */
 #define task_queue(t) \
 	_task_queue(t, MK_CALLER(WAKEUP_TYPE_TASK_QUEUE, 0, 0))
@@ -316,34 +393,17 @@ static inline void _task_queue(struct task *task, const struct ha_caller *caller
 	if (!tick_isset(task->expire))
 		return;
 
-#ifdef USE_THREAD
-	if (task->tid < 0) {
-		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
-			if (likely(caller)) {
-				caller = HA_ATOMIC_XCHG(&task->caller, caller);
-				BUG_ON((ulong)caller & 1);
+	BUG_ON(task->tid >= 0 && task->tid != tid);
+
+	if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
+		if (likely(caller)) {
+			caller = HA_ATOMIC_XCHG(&task->caller, caller);
+			BUG_ON((ulong)caller & 1);
 #ifdef DEBUG_TASK
-				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
+			HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
 #endif
-			}
-			__task_queue(task, &tg_ctx->timers);
 		}
-		HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
-	} else
-#endif
-	{
-		BUG_ON(task->tid != tid);
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
-			if (likely(caller)) {
-				caller = HA_ATOMIC_XCHG(&task->caller, caller);
-				BUG_ON((ulong)caller & 1);
-#ifdef DEBUG_TASK
-				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
-#endif
-			}
-			__task_queue(task, &th_ctx->timers);
-		}
+		__task_queue(task);
 	}
 }
 
@@ -363,6 +423,11 @@ static inline void task_set_thread(struct task *t, int thr)
 	/* no shared queue without threads */
 	thr = 0;
 #endif
+	/*
+	 * Nothing to do, the task is only temporarily owned
+	 */
+	if (thr == -1 && t->tid == -2 - tid)
+		return;
 	if (unlikely(task_in_wq(t))) {
 		task_unlink_wq(t);
 		t->tid = thr;
@@ -440,24 +505,30 @@ static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, uint f, const
 static inline void _task_instant_wakeup(struct task *t, unsigned int f, const struct ha_caller *caller)
 {
 	int thr = t->tid;
+	int newtid;
 	unsigned int state;
-
-	if (thr < 0)
-		thr = tid;
 
 	/* first, let's update the task's state with the wakeup condition */
 	state = _HA_ATOMIC_OR_FETCH(&t->state, f);
-
 	/* next we need to make sure the task was not/will not be added to the
 	 * run queue because the tasklet list's mt_list uses the same storage
 	 * as the task's run_queue.
 	 */
 	do {
+		state = _HA_ATOMIC_LOAD(&t->state);
+		thr = t->tid;
+		if (thr == -1)
+			newtid = -2 - tid;
+		else
+			newtid = thr;
+
 		/* do nothing if someone else already added it */
 		if (state & (TASK_QUEUED|TASK_RUNNING))
 			return;
-	} while (!_HA_ATOMIC_CAS(&t->state, &state, state | TASK_QUEUED));
+	} while (!__task_set_state_and_tid(t, thr, newtid, state, state | TASK_QUEUED));
 
+	if (newtid < 0)
+		thr = __task_get_current_owner(newtid);
 	BUG_ON_HOT(task_in_rq(t));
 
 	/* at this point we're the first ones to add this task to the list */
@@ -707,11 +778,11 @@ static inline void tasklet_set_tid(struct tasklet *tl, int tid)
 
 static inline void _task_schedule(struct task *task, int when, const struct ha_caller *caller)
 {
+	int did_lock = 0;
 	/* TODO: mthread, check if there is no task with this test */
 	if (task_in_rq(task))
 		return;
 
-#ifdef USE_THREAD
 	if (task->tid < 0) {
 		/*
 		 * If the task is already running, then just wake it up, just
@@ -729,44 +800,26 @@ static inline void _task_schedule(struct task *task, int when, const struct ha_c
 			task_wakeup(task, TASK_WOKEN_OTHER);
 			return;
 		}
-
-		/* FIXME: is it really needed to lock the WQ during the check ? */
-		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
-		if (task_in_wq(task))
-			when = tick_first(when, task->expire);
-
-		task->expire = when;
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
-			if (likely(caller)) {
-				caller = HA_ATOMIC_XCHG(&task->caller, caller);
-				BUG_ON((ulong)caller & 1);
-#ifdef DEBUG_TASK
-				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
-#endif
-			}
-			__task_queue(task, &tg_ctx->timers);
-		}
-		task_drop_running(task, 0);
-		HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
+		did_lock = 1;
 	} else
-#endif
-	{
 		BUG_ON(task->tid != tid);
-		if (task_in_wq(task))
-			when = tick_first(when, task->expire);
 
-		task->expire = when;
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
-			if (likely(caller)) {
-				caller = HA_ATOMIC_XCHG(&task->caller, caller);
-				BUG_ON((ulong)caller & 1);
+	if (task_in_wq(task))
+		when = tick_first(when, task->expire);
+
+	task->expire = when;
+	if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
+		if (likely(caller)) {
+			caller = HA_ATOMIC_XCHG(&task->caller, caller);
+			BUG_ON((ulong)caller & 1);
 #ifdef DEBUG_TASK
-				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
+			HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
 #endif
-			}
-			__task_queue(task, &th_ctx->timers);
 		}
+		__task_queue(task);
 	}
+	if (did_lock)
+		task_drop_running(task, 0);
 }
 
 /* returns the string corresponding to a task type as found in the task caller

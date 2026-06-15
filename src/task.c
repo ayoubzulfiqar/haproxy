@@ -35,17 +35,14 @@ DECLARE_TYPED_POOL(pool_head_tasklet, "tasklet", struct tasklet, 0, 64);
  */
 DECLARE_TYPED_POOL(pool_head_notification, "notification", struct notification);
 
-/* The lock protecting all wait queues at once. For now we have no better
- * alternative since a task may have to be removed from a queue and placed
- * into another one. Storing the WQ index into the task doesn't seem to be
- * sufficient either.
- */
-__decl_aligned_rwlock(wq_lock);
-
 /* used to detect if the scheduler looks stuck (for warnings) */
 static struct {
 	int sched_stuck THREAD_ALIGNED();
 } sched_ctx[MAX_THREADS];
+
+#if !defined(HA_CAS_IS_8B) && !defined(HA_HAVE_CAS_DW)
+__decl_thread(HA_SPINLOCK_T task_state_tid);
+#endif
 
 /* Flags the task <t> for immediate destruction and puts it into its first
  * thread's shared tasklet list if not yet queued/running. This will bypass
@@ -82,7 +79,9 @@ void task_kill(struct task *t)
 			 * Note: that's a task so it must be accounted for as such. Pick
 			 * the task's first thread for the job.
 			 */
-			thr = t->tid >= 0 ? t->tid : tid;
+			thr = __task_get_current_owner(t->tid);
+			if (thr == -1)
+				thr = tid;
 
 			/* Beware: tasks that have never run don't have their ->list empty yet! */
 			MT_LIST_APPEND(&ha_thread_ctx[thr].shared_tasklet_list,
@@ -216,7 +215,13 @@ struct list *__tasklet_wakeup_after(struct list *head, struct tasklet *tl)
 void __task_wakeup(struct task *t)
 {
 	struct eb_root *root = &th_ctx->rqueue;
-	int thr __maybe_unused = t->tid >= 0 ? t->tid : tid;
+	/*
+	 * At this point the task tid should always be set to the relevant
+	 * thread, so we can just use __task_get_current_owner();
+	 */
+	int thr __maybe_unused = __task_get_current_owner(t->tid);
+
+	BUG_ON(t->tid == -1);
 
 #ifdef USE_THREAD
 	if (thr != tid) {
@@ -275,17 +280,37 @@ void __task_wakeup(struct task *t)
  * at all about locking so the caller must be careful when deciding whether to
  * lock or not around this call.
  */
-void __task_queue(struct task *task, struct eb_root *wq)
+void __task_queue(struct task *task)
 {
-#ifdef USE_THREAD
-	BUG_ON((wq == &tg_ctx->timers && task->tid >= 0) ||
-	       (wq == &th_ctx->timers && task->tid < 0) ||
-	       (wq != &tg_ctx->timers && wq != &th_ctx->timers));
-#endif
+	int old_state, new_state;
+	int old_tid;
+	int cur_owner;
+
 	/* if this happens the process is doomed anyway, so better catch it now
 	 * so that we have the caller in the stack.
 	 */
 	BUG_ON(task->expire == TICK_ETERNITY);
+
+	do {
+		new_state = old_state = _HA_ATOMIC_LOAD(&task->state);
+		if (old_state & TASK_KILLED)
+			return;
+		old_tid = _HA_ATOMIC_LOAD(&task->tid);
+		cur_owner = __task_get_current_owner(old_tid);
+		if (old_tid != -1 && cur_owner != tid)
+			new_state |= TASK_WOKEN_WQ;
+	} while (!(__task_set_state_and_tid(task, old_tid, __task_get_new_tid_field(old_tid), old_state, new_state)));
+
+	if (cur_owner != tid && cur_owner != -1) {
+		/*
+		 * If the task has already been woken up to be added in the
+		 * wait queue, nothing left to do, the target thread will
+		 * eventually do the right thing.
+		 */
+		if (!(old_state & TASK_WOKEN_WQ))
+			_task_wakeup(task, 0, NULL);
+		return;
+	}
 
 	if (likely(task_in_wq(task)))
 		__task_unlink_wq(task);
@@ -298,7 +323,7 @@ void __task_queue(struct task *task, struct eb_root *wq)
 		return;
 #endif
 
-	eb32_insert(wq, &task->wq);
+	eb32_insert(&th_ctx->timers, &task->wq);
 }
 
 /*
@@ -311,7 +336,6 @@ void wake_expired_tasks()
 	int max_processed = global.tune.runqueue_depth;
 	struct task *task;
 	struct eb32_node *eb;
-	__decl_thread(int key);
 
 	while (1) {
 		if (max_processed-- <= 0)
@@ -348,9 +372,53 @@ void wake_expired_tasks()
 
 		task = eb32_entry(eb, struct task, wq);
 		if (tick_is_expired(task->expire, now_ms)) {
+			int set_running = 0;
+
 			/* expired task, wake it up */
 			__task_unlink_wq(task);
-			_task_wakeup(task, TASK_WOKEN_TIMER, 0);
+			/*
+			 * If it's a shared task, see whether we should hand it
+			 * to a less loaded thread.
+			 */
+			if (task->tid < 0) {
+				int attempts = MIN(global.nbthread, 3);
+				while (attempts-- > 0) {
+					uint new_tid = statistical_prng_range(global.nbthread);
+
+					if (new_tid == tid)
+						continue;
+					if (ha_thread_ctx[new_tid].rq_total * 2 < th_ctx->rq_total) {
+						int cur_state;
+						do {
+							cur_state = _HA_ATOMIC_LOAD(&task->state);
+							/*
+							 * Okay the task is already in our runqueue,
+							 * or somebody owns the
+							 * TASK_RUNNING flag because
+							 * it is calling task_schedule(), give up.
+							 */
+							if (cur_state & (TASK_QUEUED | TASK_RUNNING))
+								break;
+							/*
+							 * Make sure we have TASK_RUNNING set
+							 * so that the task don't
+							 * immediately run on the
+							 * new thread and gets
+							 * freed.
+							 */
+							if (__task_set_state_and_tid(task, task->tid, -2 - new_tid, cur_state, cur_state | TASK_RUNNING)) {
+								set_running = 1;
+								break;
+							}
+						} while (1);
+						break;
+					}
+				}
+			}
+			if (set_running)
+				task_drop_running(task, TASK_WOKEN_TIMER);
+			else
+				_task_wakeup(task, TASK_WOKEN_TIMER, 0);
 		}
 		else if (task->expire != eb->key) {
 			/* task is not expired but its key doesn't match so let's
@@ -358,7 +426,7 @@ void wake_expired_tasks()
 			 */
 			__task_unlink_wq(task);
 			if (tick_isset(task->expire))
-				__task_queue(task, &tt->timers);
+				__task_queue(task);
 		}
 		else {
 			/* task not expired and correctly placed. It may not be eternal. */
@@ -366,105 +434,12 @@ void wake_expired_tasks()
 			break;
 		}
 	}
-
-#ifdef USE_THREAD
-	if (eb_is_empty(&tg_ctx->timers))
-		goto leave;
-
-	HA_RWLOCK_RDLOCK(TASK_WQ_LOCK, &wq_lock);
-	eb = eb32_lookup_ge(&tg_ctx->timers, now_ms - TIMER_LOOK_BACK);
-	if (!eb) {
-		eb = eb32_first(&tg_ctx->timers);
-		if (likely(!eb)) {
-			HA_RWLOCK_RDUNLOCK(TASK_WQ_LOCK, &wq_lock);
-			goto leave;
-		}
-	}
-	key = eb->key;
-
-	if (tick_is_lt(now_ms, key)) {
-		HA_RWLOCK_RDUNLOCK(TASK_WQ_LOCK, &wq_lock);
-		goto leave;
-	}
-
-	/* There's really something of interest here, let's visit the queue */
-
-	if (HA_RWLOCK_TRYRDTOSK(TASK_WQ_LOCK, &wq_lock)) {
-		/* if we failed to grab the lock it means another thread is
-		 * already doing the same here, so let it do the job.
-		 */
-		HA_RWLOCK_RDUNLOCK(TASK_WQ_LOCK, &wq_lock);
-		goto leave;
-	}
-
-	while (1) {
-  lookup_next:
-		if (max_processed-- <= 0)
-			break;
-		eb = eb32_lookup_ge(&tg_ctx->timers, now_ms - TIMER_LOOK_BACK);
-		if (!eb) {
-			/* we might have reached the end of the tree, typically because
-			* <now_ms> is in the first half and we're first scanning the last
-			* half. Let's loop back to the beginning of the tree now.
-			*/
-			eb = eb32_first(&tg_ctx->timers);
-			if (likely(!eb))
-				break;
-		}
-
-		task = eb32_entry(eb, struct task, wq);
-
-		/* Check for any competing run of the task (quite rare but may
-		 * involve a dangerous concurrent access on task->expire). In
-		 * order to protect against this, we'll take an exclusive access
-		 * on TASK_RUNNING before checking/touching task->expire. If the
-		 * task is already RUNNING on another thread, it will deal by
-		 * itself with the requeuing so we must not do anything and
-		 * simply quit the loop for now, because we cannot wait with the
-		 * WQ lock held as this would prevent the running thread from
-		 * requeuing the task. One annoying effect of holding RUNNING
-		 * here is that a concurrent task_wakeup() will refrain from
-		 * waking it up. This forces us to check for a wakeup after
-		 * releasing the flag.
-		 */
-		if (HA_ATOMIC_FETCH_OR(&task->state, TASK_RUNNING) & TASK_RUNNING)
-			break;
-
-		if (tick_is_expired(task->expire, now_ms)) {
-			/* expired task, wake it up */
-			HA_RWLOCK_SKTOWR(TASK_WQ_LOCK, &wq_lock);
-			__task_unlink_wq(task);
-			HA_RWLOCK_WRTOSK(TASK_WQ_LOCK, &wq_lock);
-			task_drop_running(task, TASK_WOKEN_TIMER);
-		}
-		else if (task->expire != eb->key) {
-			/* task is not expired but its key doesn't match so let's
-			 * update it and skip to next apparently expired task.
-			 */
-			HA_RWLOCK_SKTOWR(TASK_WQ_LOCK, &wq_lock);
-			__task_unlink_wq(task);
-			if (tick_isset(task->expire))
-				__task_queue(task, &tg_ctx->timers);
-			HA_RWLOCK_WRTOSK(TASK_WQ_LOCK, &wq_lock);
-			task_drop_running(task, 0);
-			goto lookup_next;
-		}
-		else {
-			/* task not expired and correctly placed. It may not be eternal. */
-			BUG_ON(task->expire == TICK_ETERNITY);
-			task_drop_running(task, 0);
-			break;
-		}
-	}
-
-	HA_RWLOCK_SKUNLOCK(TASK_WQ_LOCK, &wq_lock);
-#endif
 leave:
 	return;
 }
 
 /* Checks the next timer for the current thread by looking into its own timer
- * list and the global one. It may return TICK_ETERNITY if no timer is present.
+ * list. It may return TICK_ETERNITY if no timer is present.
  * Note that the next timer might very well be slightly in the past.
  */
 int next_timer_expiry()
@@ -472,7 +447,6 @@ int next_timer_expiry()
 	struct thread_ctx * const tt = th_ctx; // thread's tasks
 	struct eb32_node *eb;
 	int ret = TICK_ETERNITY;
-	__decl_thread(int key = TICK_ETERNITY);
 
 	/* first check in the thread-local timers */
 	eb = eb32_lookup_ge(&tt->timers, now_ms - TIMER_LOOK_BACK);
@@ -487,19 +461,6 @@ int next_timer_expiry()
 	if (eb)
 		ret = eb->key;
 
-#ifdef USE_THREAD
-	if (!eb_is_empty(&tg_ctx->timers)) {
-		HA_RWLOCK_RDLOCK(TASK_WQ_LOCK, &wq_lock);
-		eb = eb32_lookup_ge(&tg_ctx->timers, now_ms - TIMER_LOOK_BACK);
-		if (!eb)
-			eb = eb32_first(&tg_ctx->timers);
-		if (eb)
-			key = eb->key;
-		HA_RWLOCK_RDUNLOCK(TASK_WQ_LOCK, &wq_lock);
-		if (eb)
-			ret = tick_first(ret, key);
-	}
-#endif
 	return ret;
 }
 
@@ -652,6 +613,19 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 			goto next;
 		}
 
+		if (state & TASK_WOKEN_WQ) {
+			/* We should add this task to our wait queue */
+			task_queue(t);
+			/*
+			 * If this is the only reason the task got scheduled,
+			 * then we don't actually have ot run it.
+			 */
+			if ((state & TASK_WOKEN_ANY) == TASK_WOKEN_WQ) {
+				task_drop_running(t, 0);
+				goto next;
+			}
+			state &= ~TASK_WOKEN_WQ;
+		}
 		/* OK now the task or tasklet is well alive and is going to be run */
 		if (state & TASK_F_TASKLET) {
 			/* this is a tasklet */
@@ -680,7 +654,8 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 					__task_free(t);
 				}
 				else {
-					task_queue(t);
+					if (__task_get_current_owner(t->tid) == tid)
+						task_queue(t);
 					task_drop_running(t, 0);
 				}
 			}
@@ -949,13 +924,6 @@ void mworker_cleantasks()
 		tmp_rq = eb32_next(tmp_rq);
 		task_destroy(t);
 	}
-	/* cleanup the timers queue */
-	tmp_wq = eb32_first(&tg_ctx->timers);
-	while (tmp_wq) {
-		t = eb32_entry(tmp_wq, struct task, wq);
-		tmp_wq = eb32_next(tmp_wq);
-		task_destroy(t);
-	}
 #endif
 	/* clean the per thread run queue */
 	for (i = 0; i < global.nbthread; i++) {
@@ -979,9 +947,6 @@ void mworker_cleantasks()
 static void init_task()
 {
 	int i, q;
-
-	for (i = 0; i < MAX_TGROUPS; i++)
-		memset(&ha_tgroup_ctx[i].timers, 0, sizeof(ha_tgroup_ctx[i].timers));
 
 	for (i = 0; i < MAX_THREADS; i++) {
 		for (q = 0; q < TL_CLASSES; q++)

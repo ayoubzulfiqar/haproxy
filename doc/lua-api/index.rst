@@ -893,9 +893,7 @@ Core class
 
   **context**: init, task, action
 
-  This function returns a new object of a *httpclient* class. An *httpclient*
-  object must be used to process one and only one request. It must never be
-  reused to process several requests.
+  This function returns a new object of a *httpclient* class.
 
   :returns: A :ref:`httpclient_class` object.
 
@@ -1031,6 +1029,12 @@ Core class
       Be careful when subscribing to this type since many events might be
       generated.
 
+   **ACME** Family:
+
+    * **ACME_DEPLOY**: when a dns-01 challenge TXT record must be deployed
+      externally before HAProxy can proceed with the ACME challenge
+    * **ACME_NEWCERT**: when a new certificate is successfully installed
+
    .. Note::
      Use **SERVER** in **event_types** to subscribe to all server events types
      at once. Note that this should only be used for testing purposes since a
@@ -1048,7 +1052,8 @@ Core class
   * **event** (*string*): the event type (one of the **event_types** specified
     when subscribing)
   * **event_data**: specific to each event family (For **SERVER** family,
-    a :ref:`server_event_class` object)
+    a :ref:`server_event_class` object; for **ACME** family,
+    a :ref:`acme_event_class` object)
   * **sub**: class to manage the subscription from within the event
     (a :ref:`event_sub_class` object)
   * **when**: timestamp corresponding to the date when the event was generated.
@@ -2580,10 +2585,7 @@ HTTPClient class
 .. js:class:: HTTPClient
 
    The httpclient class allows issue of outbound HTTP requests through a simple
-   API without the knowledge of HAProxy internals. Any instance must be used to
-   process one and only one request. It must never be reused to process several
-   requests.
-
+   API without the knowledge of HAProxy internals.
 .. js:function:: HTTPClient.get(httpclient, request)
 .. js:function:: HTTPClient.head(httpclient, request)
 .. js:function:: HTTPClient.put(httpclient, request)
@@ -2612,7 +2614,8 @@ HTTPClient class
    haproxy address format.
   :param integer request.timeout: Optional timeout parameter, set a
    "timeout server" on the connections.
-  :returns: Lua table containing the response
+  :returns: Lua table containing the response. If an internal error occurs (e.g.
+   connection failure, timeout, etc.), the ``status`` field will be set to 0.
 
 
 .. code-block:: lua
@@ -4738,6 +4741,75 @@ CertCache class
 
     CertCache.set{filename="certs/localhost9994.pem.rsa", crt=crt}
 
+
+ACME class
+==========
+
+.. js:class:: ACME
+
+   This class provides access to the ACME (Automatic Certificate Management
+   Environment) subsystem. It allows Lua scripts to interact with ongoing ACME
+   certificate challenges.
+
+.. js:function:: ACME.challenge_ready(crt, dns)
+
+  Marks the ACME challenge for domain <dns> in certificate <crt> as ready.
+  Returns the number of remaining challenges, or 0 if all challenges are ready
+  and validation has been triggered. Raises a Lua error if the certificate or
+  domain is not found.
+
+  :param string crt: The filename of the certificate.
+  :param string dns: The domain name for which the challenge is ready.
+  :returns: The number of remaining challenges (integer), or 0 when all
+   challenges are done and validation has been triggered.
+
+.. _acme_event_class:
+
+AcmeEvent class
+===============
+
+.. js:class:: AcmeEvent
+
+This class is provided with every **ACME** event.
+
+See :js:func:`core.event_sub()` for more info.
+
+.. js:attribute:: AcmeEvent.crtname
+
+  Contains the certificate store name.
+
+.. js:attribute:: AcmeEvent.domain
+
+  Contains the domain being challenged.
+
+  Only available for **ACME_DEPLOY** events.
+
+.. js:attribute:: AcmeEvent.thumbprint
+
+  Contains the account key JWK thumbprint.
+
+  Only available for **ACME_DEPLOY** events.
+
+.. js:attribute:: AcmeEvent.dns_record
+
+  Contains the DNS TXT record value that must be set at
+  ``_acme-challenge.<domain>``.
+
+  Only available for **ACME_DEPLOY** events.
+
+.. js:attribute:: AcmeEvent.provider
+
+  Contains the DNS provider name configured in the ACME section.
+  Only set if a provider was configured.
+
+  Only available for **ACME_DEPLOY** events.
+
+.. js:attribute:: AcmeEvent.vars
+
+  Contains the ACME vars string configured in the ACME section.
+  Only set if vars were configured.
+
+  Only available for **ACME_DEPLOY** events.
 
 External Lua libraries
 ======================

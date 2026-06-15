@@ -19,6 +19,7 @@
 #include <haproxy/acme-t.h>
 
 #include <haproxy/acme_resolvers.h>
+#include <haproxy/event_hdl.h>
 #include <haproxy/base64.h>
 #include <haproxy/intops.h>
 #include <haproxy/cfgparse.h>
@@ -37,6 +38,12 @@
 #include <haproxy/ssl_utils.h>
 #include <haproxy/tools.h>
 #include <haproxy/trace.h>
+#ifdef USE_LUA
+#include <lua.h>
+#include <lauxlib.h>
+#include <haproxy/hlua.h>
+#include <haproxy/hlua_fcn.h>
+#endif
 
 #define TRACE_SOURCE &trace_acme
 
@@ -1450,6 +1457,27 @@ error:
 	return ret;
 }
 
+/* mfree callback for EVENT_HDL_SUB_ACME_DEPLOY: frees heap-allocated fields */
+static void acme_deploy_event_mfree(const void *data)
+{
+	struct event_hdl_cb_data_acme_deploy *e = (struct event_hdl_cb_data_acme_deploy *)data;
+
+	ha_free(&e->safe.crtname);
+	ha_free(&e->safe.domain);
+	ha_free(&e->safe.thumbprint);
+	ha_free(&e->safe.dns_record);
+	ha_free(&e->safe.provider);
+	ha_free(&e->safe.vars);
+}
+
+/* mfree callback for EVENT_HDL_SUB_ACME_NEWCERT: frees the heap-allocated path */
+static void acme_newcert_event_mfree(const void *data)
+{
+	const struct event_hdl_cb_data_acme_newcert *e = data;
+
+	free(e->safe.crtname);
+}
+
 /*
  * Update every certificate instances for the new store
  *
@@ -1502,6 +1530,15 @@ int acme_update_certificate(struct task *task, struct acme_ctx *ctx, char **errm
 	dpapi = sink_find("dpapi");
 	if (dpapi)
 		sink_write(dpapi, LOG_HEADER_NONE, 0, line, 3);
+
+	{
+		struct event_hdl_cb_data_acme_newcert cb_data = { };
+
+		cb_data.safe.crtname = strdup(ctx->store->path);
+		if (cb_data.safe.crtname)
+			event_hdl_publish(NULL, EVENT_HDL_SUB_ACME_NEWCERT,
+			                  EVENT_HDL_CB_DATA_DM(&cb_data, acme_newcert_event_mfree));
+	}
 
 	ctx->store = NULL;
 
@@ -2182,6 +2219,22 @@ int acme_res_auth(struct task *task, struct acme_ctx *ctx, struct acme_auth *aut
 			dpapi = sink_find("dpapi");
 			if (dpapi)
 				sink_write(dpapi, LOG_HEADER_NONE, 0, line, nmsg);
+
+			{
+				struct event_hdl_cb_data_acme_deploy cb_data = { };
+
+				cb_data.safe.crtname    = strdup(ctx->store->path);
+				cb_data.safe.domain     = isttest(auth->dns) ? strndup(auth->dns.ptr, auth->dns.len) : NULL;
+				cb_data.safe.thumbprint = ctx->cfg->account.thumbprint ? strdup(ctx->cfg->account.thumbprint) : NULL;
+				cb_data.safe.dns_record = strndup(dns_record->area, dns_record->data);
+				cb_data.safe.provider   = ctx->cfg->provider ? strdup(ctx->cfg->provider) : NULL;
+				cb_data.safe.vars       = ctx->cfg->vars ? strdup(ctx->cfg->vars) : NULL;
+				if (cb_data.safe.crtname && cb_data.safe.dns_record)
+					event_hdl_publish(NULL, EVENT_HDL_SUB_ACME_DEPLOY,
+					                  EVENT_HDL_CB_DATA_DM(&cb_data, acme_deploy_event_mfree));
+				else
+					acme_deploy_event_mfree(&cb_data);
+			}
 		}
 		else if (strcasecmp(ctx->cfg->challenge, "http-01") == 0) {
 			/* only useful for http-01 */
@@ -3691,6 +3744,127 @@ static void __acme_init(void)
 	HA_RWLOCK_INIT(&acme_lock);
 }
 INITCALL0(STG_REGISTER, __acme_init);
+
+#ifdef USE_LUA
+
+#define CLASS_ACME_EVENT "AcmeEvent"
+static int class_acme_event_ref;
+
+/* Push a new AcmeEvent object for an ACME_DEPLOY event onto the Lua stack.
+ * The object exposes crtname, domain, thumbprint, dns_record fields, and
+ * optionally provider and vars if they were configured.
+ */
+static void hlua_fcn_new_acme_event_deploy(lua_State *L, const struct event_hdl_cb_data_acme_deploy *e)
+{
+	lua_newtable(L);
+
+	lua_rawgeti(L, LUA_REGISTRYINDEX, class_acme_event_ref);
+	lua_setmetatable(L, -2);
+
+	lua_pushstring(L, e->safe.crtname ? e->safe.crtname : "");
+	lua_setfield(L, -2, "crtname");
+
+	lua_pushstring(L, e->safe.domain ? e->safe.domain : "");
+	lua_setfield(L, -2, "domain");
+
+	lua_pushstring(L, e->safe.thumbprint ? e->safe.thumbprint : "");
+	lua_setfield(L, -2, "thumbprint");
+
+	lua_pushstring(L, e->safe.dns_record ? e->safe.dns_record : "");
+	lua_setfield(L, -2, "dns_record");
+
+	if (e->safe.provider) {
+		lua_pushstring(L, e->safe.provider);
+		lua_setfield(L, -2, "provider");
+	}
+
+	if (e->safe.vars) {
+		lua_pushstring(L, e->safe.vars);
+		lua_setfield(L, -2, "vars");
+	}
+}
+
+/* Push a new AcmeEvent object for an ACME_NEWCERT event onto the Lua stack.
+ * The object exposes a <crtname> field with the certificate store name.
+ */
+static void hlua_fcn_new_acme_event_newcert(lua_State *L, const char *crtname)
+{
+	lua_newtable(L);
+
+	lua_rawgeti(L, LUA_REGISTRYINDEX, class_acme_event_ref);
+	lua_setmetatable(L, -2);
+
+	lua_pushstring(L, crtname);
+	lua_setfield(L, -2, "crtname");
+}
+
+/*
+ * ACME.challenge_ready(crt, dns)
+ *
+ * Marks the ACME challenge for domain <dns> in certificate <crt> as ready.
+ * Returns the number of remaining challenges, or 0 if all challenges are
+ * ready and validation has been triggered.
+ * Raises a Lua error if the certificate or domain is not found.
+ */
+__LJMP static int hlua_acme_challenge_ready(lua_State *L)
+{
+	const char *crt;
+	const char *dns;
+	int ret;
+
+	if (lua_gettop(L) != 2)
+		WILL_LJMP(luaL_error(L, "'ACME.challenge_ready' needs 2 arguments."));
+
+	crt = MAY_LJMP(luaL_checkstring(L, 1));
+	dns = MAY_LJMP(luaL_checkstring(L, 2));
+
+	ret = acme_challenge_ready(crt, dns);
+	if (ret == -2)
+		WILL_LJMP(luaL_error(L, "ACME.challenge_ready: certificate '%s' not found", crt));
+	if (ret == -1)
+		WILL_LJMP(luaL_error(L, "ACME.challenge_ready: domain '%s' not found for certificate '%s'", dns, crt));
+
+	lua_pushinteger(L, ret);
+	return 1;
+}
+
+static int acme_hlua_init_state(lua_State *L, char **errmsg)
+{
+	/* Register AcmeEvent class */
+	lua_newtable(L);
+	class_acme_event_ref = hlua_register_metatable(L, CLASS_ACME_EVENT);
+
+	lua_newtable(L);
+	hlua_class_function(L, "challenge_ready", hlua_acme_challenge_ready);
+	lua_setglobal(L, "ACME");
+	return ERR_NONE;
+}
+
+REGISTER_HLUA_STATE_INIT(acme_hlua_init_state);
+
+/* Push ACME event data as a Lua table for core.event_sub() handlers.
+ * Called from hlua_event_hdl_cb_push_args() when the event family is ACME.
+ */
+void acme_hlua_event_push_args(struct hlua *hlua, struct event_hdl_sub_type event, void *data)
+{
+	if (!lua_checkstack(hlua->T, 3))
+		WILL_LJMP(luaL_error(hlua->T, "Lua out of memory error."));
+
+	if (event_hdl_sub_type_equal(EVENT_HDL_SUB_ACME_DEPLOY, event)) {
+		struct event_hdl_cb_data_acme_deploy *e_acme = data;
+
+		hlua->nargs += 1;
+		MAY_LJMP(hlua_fcn_new_acme_event_deploy(hlua->T, e_acme));
+	}
+	else if (event_hdl_sub_type_equal(EVENT_HDL_SUB_ACME_NEWCERT, event)) {
+		struct event_hdl_cb_data_acme_newcert *e_acme = data;
+
+		hlua->nargs += 1;
+		MAY_LJMP(hlua_fcn_new_acme_event_newcert(hlua->T, e_acme->safe.crtname));
+	}
+}
+
+#endif /* USE_LUA */
 
 #endif /* ! HAVE_ACME */
 
