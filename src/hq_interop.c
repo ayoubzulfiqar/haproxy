@@ -39,12 +39,22 @@ static ssize_t hq_interop_rcv_buf_req(struct qcs *qcs, struct buffer *b, int fin
 	}
 
 	if (!data || !HTTP_IS_SPHT(*ptr)) {
+		if (b_size(b) - b_room(b) >= qcm_stream_rx_bufsz()) {
+			fprintf(stderr, "content too big\n");
+			return -1;
+		}
+
 		fprintf(stderr, "truncated stream\n");
 		return 0;
 	}
 
 	ptr++;
 	if (!--data) {
+		if (b_size(b) - b_room(b) >= qcm_stream_rx_bufsz()) {
+			fprintf(stderr, "content too big\n");
+			return -1;
+		}
+
 		fprintf(stderr, "truncated stream\n");
 		return 0;
 	}
@@ -62,6 +72,11 @@ static ssize_t hq_interop_rcv_buf_req(struct qcs *qcs, struct buffer *b, int fin
 	}
 
 	if (!data) {
+		if (b_size(b) - b_room(b) >= qcm_stream_rx_bufsz()) {
+			fprintf(stderr, "content too big\n");
+			return -1;
+		}
+
 		fprintf(stderr, "truncated stream\n");
 		return 0;
 	}
@@ -100,17 +115,17 @@ static ssize_t hq_interop_rcv_buf_res(struct qcs *qcs, struct buffer *b, int fin
 	struct htx *htx;
 	struct htx_sl *sl;
 	struct buffer *htx_buf;
-	const struct stream *strm = __sc_strm(qcs->sd->sc);
 	const unsigned int flags = HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN;
-	size_t to_copy = b_data(b);
+	size_t to_copy = b_contig_data(b, 0);
 	size_t htx_sent = 0;
 	uint32_t htx_space;
+	char *head;
 
 	htx_buf = qcc_get_stream_rxbuf(qcs);
 	BUG_ON(!htx_buf);
 	htx = htx_from_buf(htx_buf);
 
-	if (htx_is_empty(htx) && !strm->scb->bytes_in) {
+	if (htx_is_empty(htx) && !qcs->rx.offset) {
 		/* First data transfer, add HTX response start-line first. */
 		sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags,
 		                    ist("HTTP/1.0"), ist("200"), ist(""));
@@ -130,21 +145,43 @@ static ssize_t hq_interop_rcv_buf_res(struct qcs *qcs, struct buffer *b, int fin
 		}
 	}
 	else {
-		BUG_ON(b_head(b) + to_copy > b_wrap(b)); /* TODO */
-
+		head = b_head(b);
+ retry:
 		htx_space = htx_free_data_space(htx);
+		if (!htx_space) {
+			qcs->flags |= QC_SF_DEM_FULL;
+			goto out;
+		}
+
 		if (to_copy > htx_space) {
 			to_copy = htx_space;
 			fin = 0;
 		}
 
+		if (b_head(b) + to_copy > b_wrap(b)) {
+			size_t contig = b_wrap(b) - head;
+			htx_sent = htx_add_data(htx, ist2(b_head(b), contig));
+			if (htx_sent < contig) {
+				qcs->flags |= QC_SF_DEM_FULL;
+				goto out;
+			}
+
+			to_copy -= contig;
+			head = b_orig(b);
+			goto retry;
+		}
+
 		htx_sent = htx_add_data(htx, ist2(b_head(b), to_copy));
-		BUG_ON(htx_sent < to_copy); /* TODO */
+		if (htx_sent < to_copy) {
+			qcs->flags |= QC_SF_DEM_FULL;
+			goto out;
+		}
 
 		if (fin && to_copy == htx_sent)
 			htx->flags |= HTX_FL_EOM;
 	}
 
+ out:
 	htx_to_buf(htx, htx_buf);
 	return htx_sent;
 }
@@ -152,9 +189,6 @@ static ssize_t hq_interop_rcv_buf_res(struct qcs *qcs, struct buffer *b, int fin
 /* Returns the amount of decoded bytes from <b> or a negative error code. */
 static ssize_t hq_interop_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 {
-	/* hq-interop parser does not support buffer wrapping. */
-	BUG_ON(b_data(b) != b_contig_data(b, 0));
-
 	return !(qcs->qcc->flags & QC_CF_IS_BACK) ?
 	  hq_interop_rcv_buf_req(qcs, b, fin) :
 	  hq_interop_rcv_buf_res(qcs, b, fin);
@@ -260,6 +294,14 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 
 		/* only body is transferred on HTTP/0.9 */
 		case HTX_BLK_RES_SL:
+			sl = htx_get_blk_ptr(htx, blk);
+			if (!(sl->flags & HTX_SL_F_XFER_LEN))
+				qcs->flags |= QC_SF_UNKNOWN_PL_LENGTH;
+			htx_remove_blk(htx, blk);
+			total += bsize;
+			count -= bsize;
+			break;
+
 		case HTX_BLK_TLR:
 		case HTX_BLK_EOT:
 		default:
