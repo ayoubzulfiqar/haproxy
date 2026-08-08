@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.5
-                              2026/07/22
+                              2026/08/06
 
 
 This document covers the configuration language as implemented in the version
@@ -1891,6 +1891,7 @@ The following keywords are supported in the "global" section :
    - tune.events.max-events-at-once
    - tune.fail-alloc
    - tune.fd.edge-triggered
+   - tune.fd.tables
    - tune.h1.be.glitches-threshold
    - tune.h1.fe.glitches-threshold
    - tune.h1.zero-copy-fwd-recv
@@ -1993,6 +1994,7 @@ The following keywords are supported in the "global" section :
    - tune.ssl.force-private-cache
    - tune.ssl.hard-maxrecord
    - tune.ssl.keylog
+   - tune.ssl.keyupdate-rate-limit
    - tune.ssl.lifetime
    - tune.ssl.maxrecord
    - tune.ssl.ssl-ctx-cache-size
@@ -4223,18 +4225,44 @@ tune.comp.maxlevel <number>
   Each stream using compression initializes the compression algorithm with
   this value. The default value is 1.
 
-tune.defaults.purge
-  For dynamic backends support, all named defaults sections are now kept in
-  memory after parsing. This is necessary as backend added at runtime must be
-  based on a named defaults for its configuration.
+tune.defaults.purge [{ all | none | <element[,...]> }]
+  Define what default instances to purge after configuration parsing.
 
-  This may consume significant memory if the number of defaults instances is
-  important. In this case and if dynamic backend feature is unnecessary, it's
-  possible to use this option to force deletion of defaults section after
-  parsing. It is still mandatory though to keep referenced defaults section
-  which contain settings whose cannot be copied by their referencing proxies.
-  For example, this is the case if the defaults section defines TCP/HTTP rules
-  or a tcpcheck ruleset.
+  Default-server instances are kept in memory after parsing as they may be
+  reused for dynamic servers added at runtime. Similarly, named defaults
+  proxies sections are preserved as dynamic backends rely on them. The command
+  "show default-server" and "show defaults" may be used to list them.
+
+  This may consume a noticeable amount of memory if the number of default
+  instances is important. It's possible to reclaim this memory after the
+  configuration parsing if dynamic features are unneeded.
+
+  In any case, referenced "defaults" sections which contain settings which
+  cannot be copied by their referencing proxies (e.g. TCP/HTTP rules or
+  tcpcheck ruleset) will be preserved, regardless of the global purge setting.
+
+  Here are the values supported as argument :
+  - "all" to purge "defaults" sections and "default-server" instances
+  - "none" to keep these elements, which is also the default behavior when the
+    setting is absent
+
+  Alternatively, a comma-delimited list of tokens can be used for fine-grained
+  control. The currently supported entries are :
+    - "proxies" to purge "defaults" sections
+    - "servers" to purge "default-server" instances
+
+  If no argument is specified, only proxies "defaults" sections will be purged.
+
+  Example:
+      # reclaim the maximum memory possible
+      # both syntax are equivalent
+      tune.defaults.purge all
+      tune.defaults.purge proxies,servers
+
+      # purge proxies defaults sections
+      # both syntax are equivalent
+      tune.defaults.purge
+      tune.defaults.purge proxies
 
 tune.disable-fast-forward
   Disables the data fast-forwarding. It is a mechanism to optimize the data
@@ -4304,6 +4332,14 @@ tune.fd.edge-triggered { on | off }  [ EXPERIMENTAL ]
   reduce the number of epoll_ctl() calls and slightly improve performance in
   certain scenarios. This is still experimental, it may result in frozen
   connections if bugs are still present, and is disabled by default.
+
+tune.fd.tables { shared | per-thread-group }  [ EXPERIMENTAL ]
+  Decide if the file descriptor tables are shared by everybody (shared), or
+  if there is one per thread group (per-thread-group). Having one table per
+  thread group can give a good performance boost with enough threads and
+  thread groups, as there is a lot of contention on the kernel file descriptor
+  tables.
+  The default is "shared".
 
 tune.glitches.kill.cpu-usage <number>
   Sets the minimum CPU usage between 0 and 100, at which connections showing
@@ -4752,6 +4788,9 @@ tune.listener.multi-queue { on | fair | off }
   using "off" for troubleshooting, or for situations where connections are
   short-lived and it is estimated that the operating system already provides a
   good enough distribution. The default is "on".
+  Please not that when tune.fd.tables is set to "per-thread-group",
+  connections will only be load-balanced across threads of a same thread
+  group.
 
 tune.lua.bool-sample-conversion { normal | pre-3.1-bug }
   Explicitly tell haproxy how haproxy sample objects should be handled when
@@ -5565,6 +5604,12 @@ tune.ssl.keylog { on | off }
     $HAPROXY_KEYLOG_FC_LOG_FMT   frontend (client-facing) connection keys
     $HAPROXY_KEYLOG_BC_LOG_FMT   backend (server-facing) connection keys
 
+tune.ssl.keyupdate-rate-limit <limit>
+  Limit the amount of KeyUpdate per second we're willing to accept to <limit>
+  before considering it flood, and killing the connection. Dealing with
+  KeyUpdate is cpu-expensive, and there is little reason to receive a lot of
+  them. Using a value of "0" disables the rate limiting.
+  The default value is 100.
 tune.ssl.lifetime <timeout>
   Sets how long a cached SSL session may remain valid. This time is expressed
   in seconds and defaults to 300 (5 min). It is important to understand that it
@@ -5902,6 +5947,11 @@ of defaults sections. This can be convenient to establish certain configuration
 profiles to carry groups of default settings (e.g. TCP vs HTTP or short vs long
 timeouts) but can quickly become confusing to follow.
 
+By default, named defaults sections are preserved after configuration parsing.
+This allows to reuse them for dynamic backends creation. This behavior can be
+changed globally via "tune.defaults.purge" keyword. It is possible to list the
+preserved instances via the command "show defaults".
+
 All proxy names must be formed from upper and lower case letters, digits,
 '-' (dash), '_' (underscore) , '.' (dot) and ':' (colon). ACL names are
 case-sensitive, which means that "www" and "WWW" are two different proxies.
@@ -6025,6 +6075,7 @@ Note: Some dangerous and not recommended directives are intentionnaly not
 acl                                       X (!)      X         X         X
 backlog                                   X          X         X         -
 balance                                   X          -         X         X
+be-unpublished                            -          -         X         X
 bind                                      -          X         X         -
 capture cookie                            -          X         X         -
 capture request header                    -          X         X         -
@@ -6624,6 +6675,26 @@ balance url_param <param> [check_post]
       type message bodies.
 
   See also : "cookie", "hash-type".
+
+
+be-unpublished
+  Instructs the backend to start in the unpublished state.
+
+  May be used in the following contexts: tcp, http, log
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                  no   |    no    |   yes  |   yes
+
+  In effect, any use_backend and default_backend rules from another proxy which
+  reference the current proxy are ignored and the next content switching rules
+  are evaluated. This can be bypassed though via a "force-be-switch" rule.
+
+  This state is similar to the disabled one but with some differences. First,
+  an unpublished backend will still be fully initialized, including the server
+  health checks which remain active. Finally, a backend can be publicly exposed
+  via the command "publish backend" on the CLI. See the management manual.
+
+  See also : "force-be-switch"
 
 
 bind [<address>]:<port_range> [, ...] [param*]
@@ -7315,8 +7386,8 @@ declare capture [ request | response ] len <length>
             "http-request capture" and "http-response capture".
 
 
-default-server [param*]
-  Change default options for a server in a backend
+default-server [name <name>] [from <origin>] [param*]
+  Changes a set of options reusable for future server declarations.
 
   May be used in the following contexts: tcp, http
 
@@ -7324,6 +7395,14 @@ default-server [param*]
                                  yes   |    no    |   yes  |   yes
 
   Arguments:
+    <name>    specifies a named default-instance instead of the default
+              anonymous one.
+
+    <origin>  instructs to reinitialize first the set of options to their
+              default values and then reusing the settings from the designated
+              server or default-server instance. See section 5.2 about server
+              options for a complete description of the supported arguments.
+
     <param*>  is a list of parameters for this server. The "default-server"
               keyword accepts an important number of options and has a complete
               section dedicated to it. Please refer to section 5 for more
@@ -7332,7 +7411,27 @@ default-server [param*]
   Example :
         default-server inter 1000 weight 13
 
-  See also: "server" and section 5 about server options
+  Several sets of options can be defined per backend instance. A backend always
+  contains an unnamed default-server which is selected when <name> argument is
+  not present. A named default-server can be created by specifying the <name>
+  argument with a value. This name must not collide with servers in the same
+  backend.
+
+  The same default-server can be defined over multiple lines, with each line
+  completing the previous one. This set of options can be reset by using the
+  "from none" keyword value.
+
+  By default, all default-server named and unnamed are preserved after
+  configuration parsing. This allows to reuse them for dynamic servers
+  creation. This behavior can be changed globally via "tune.defaults.purge"
+  keyword. An unnamed default-server with no parameter set will automatically
+  be purged after parsing. As such, a final "default-server from none"
+  statement will be sufficient to release this unused memory, regardless of the
+  global setting. It is possible to list the preserved instances via the
+  command "show default-server".
+
+  See also: "server", section 5 about server options and global
+    "tune.defaults.purge" option
 
 
 default_backend <backend>
@@ -7863,7 +7962,7 @@ force-be-switch { if | unless } <condition>
   May be used in sections:    defaults | frontend | listen | backend
                                  no    |   yes    |   yes  |   no
 
-  See also : "disabled"
+  See also : "be-unpublished", "disabled"
 
 
 filter <name> [param*]
@@ -12488,7 +12587,7 @@ server-state-file-name [ { use-backend-name | <file> } ]
   See also: "server-state-base", "load-server-state-from-file", and
   "show servers state"
 
-server-template <prefix> <num | range> <fqdn>[:<port>] [params*]
+server-template <prefix> <num | range> <fqdn>[:<port>] [from <origin>] [params*]
   Set a template to initialize servers with shared parameters.
   The names of these servers are built from <prefix> and <num | range> parameters.
 
@@ -12509,6 +12608,10 @@ server-template <prefix> <num | range> <fqdn>[:<port>] [params*]
     <fqdn>    A FQDN for all the servers this template initializes.
 
     <port>    Same meaning as "server" <port> argument (see "server" keyword).
+
+    <origin>  instructs to reuse the settings from the designated server or
+              default-server instance. See section 5.2 about server options for
+              a complete description of the supported arguments.
 
     <params*>
               Remaining server parameters among all those supported by "server"
@@ -17454,7 +17557,11 @@ ech <dir> [ EXPERIMENTAL ]
   "expose-experimental-directives" option in the global section.
   It also necessitates an OpenSSL version that supports ECH
   ( https://github.com/openssl/openssl/tree/feature/ech), and HAProxy must be
-  compiled with USE_ECH=1. The ECH API of AWS-LC is not supported.
+  compiled with USE_ECH=1.
+
+  AWS-LC is also supported, with a lighter implementation: runtime ECH store
+  management ("show/add/set/del ssl ech" on the CLI) and ECH status/outer-SNI
+  reporting are not available in that case.
 
   Example:
     $ openssl ech -public_name foobar.com -out /etc/haproxy/echkeydir/foobar.com.ech
@@ -18127,16 +18234,46 @@ which are all passed as arguments on the server line. The order in which those
 arguments appear does not count, and they are all optional. Some of those
 settings are single words (booleans) while others expect one or several values
 after them. In this case, the values must immediately follow the setting name.
+
 Except default-server, all those settings must be specified after the server's
-address if they are used:
+address if they are used. Before any of those settings, the extra keyword
+"from" may be used both on "server" and "default-server" lines to preset
+its settings.
 
-  server <name> <address>[:port] [settings ...]
-  default-server [settings ...]
+  server <name> <address>[:port] [from <origin>] [settings ...]
+  default-server [name <name>] [from <origin>] [settings ...]
 
-Note that all these settings are supported both by "server" and "default-server"
-keywords, except "id" which is only supported by "server".
+from <origin>
+  Preinitialize the server settings by copying values from another server or
+  default-server instance. This keyword is positional : it must be specified
+  before any other server settings.
 
-The currently supported settings are the following ones.
+  Here is the list of the supported values for the "from" keyword :
+  - none
+      resets all settings to the documented defaults. This prevents a server
+      defined in the configuration from automatically reusing a default-server
+      instance. This is already the default behavior for dynamically created
+      servers. This value is also directly useful on a default-server line,
+      to reset its set of options to their documented values, before eventually
+      configuring new settings.
+  - be:[<bename>]
+      instructs to reuse the settings from the final state of the designated
+      backend's default-server resulting from the processing of all its unnamed
+      default-server directives. If no backend is specified, the parent proxy
+      of the currently configured server is selected : this is the default
+      behavior for servers defined in the configuration file. This empty value
+      is mostly useful for dynamic servers created on the CLI which by default
+      ignore any default-server, which is equivalent to the "none" value.
+  - srv:[<bename>/]<srvname>
+      instructs to reuse the settings from the designated backend's server or named
+      default-server resulting from the processing of all its default-server
+      directives using the same name. The backend name is optional. If unset,
+      this designates the proxy where the currently newly defined server will
+      be attached.
+
+The currently supported server settings are the following ones. Note that all
+these settings are supported both by "server" and "default-server" keywords,
+except "id" which is only supported by "server".
 
 addr <ipv4|ipv6>
   May be used in the following contexts: tcp, http, log
@@ -22470,7 +22607,12 @@ param(<name>[,<delim>])
   where parameters are delimited by <delim>, which defaults to "&", and the name
   and value of the parameter are separated by a "=". If there is no "=" and
   value before the end of the parameter segment, it is treated as equivalent to
-  a value of an empty string.
+  a value of an empty string. The delimiter must be either a single character,
+  or it can be the hexadecimal encoding of the delimiter's ASCII code in the
+  form "0xHH" (either upper or lower case). The hex form may sometimes be
+  needed to represent a NUL character or more generally control characters that
+  cannot be expressed in the configuration, and that can be found in request
+  bodies (see req.body).
 
   This can be useful for extracting parameters from a query string, or possibly
   a x-www-form-urlencoded body. In particular, `query,param(<name>)` can be used

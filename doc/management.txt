@@ -1766,7 +1766,9 @@ add backend <name> from <defproxy> [mode <mode>] [guid <guid>]
 
   All named default proxies can be used, given that they validate the same
   inheritance rules applied during configuration parsing. There is some
-  exceptions though, for example when the mode is neither TCP nor HTTP.
+  exceptions though, for example when the mode is neither TCP nor HTTP. The
+  available default proxy instances can be listed via the "show defaults"
+  additional command.
 
   This command is restricted and can only be issued on sockets configured for
   level "admin".
@@ -1809,8 +1811,12 @@ add server <backend>/<server> [args]*
   restriction is put on the backend which must used a dynamic load-balancing
   algorithm. A subset of keywords from the server config file statement can be
   used to configure the server behavior (see "add server help" to list them).
-  Also note that no settings will be reused from an hypothetical
-  'default-server' statement in the same backend.
+
+  By default, 'default-server' is ignored by a dynamically created server.
+  However, it is possible to use the 'from' server positional keyword to
+  explicitely preset the settings of the newly created server from another
+  server or a default-server instance, either named or unnamed. The additional
+  command "show default-server" lists the available entries.
 
   Currently a dynamic server is statically initialized with the "none"
   init-addr method. This means that no resolution will be undertaken if a FQDN
@@ -1890,7 +1896,8 @@ add ssl ech <bind> <payload>
 
   Necessitates an OpenSSL version that supports ECH, and HAProxy must be
   compiled with USE_ECH=1. This command is only supported on a CLI connection
-  running in experimental mode (see "experimental-mode on").
+  running in experimental mode (see "experimental-mode on"). Not available
+  when HAProxy is built with AWS-LC.
 
   See also "show ssl ech" and "ech" in the Section 5.1 of the configuration
   manual.
@@ -1921,6 +1928,30 @@ clear counters all
   Clear all statistics counters in each proxy (frontend & backend) and in each
   server. This has the same effect as restarting. This command is restricted
   and can only be issued on sockets configured for level "admin".
+
+clear counters server <backend>/<server> [force]
+  Reset the statistics counters of a single server. This command is useful when
+  a server slot is being reused to represent a different logical entity (e.g.
+  a different Kubernetes pod occupying the same slot after a rename via
+  "set server <b>/<s> name") and per-entity counter attribution is required.
+  It behaves like "clear counters all" but scoped to one server rather than the
+  whole process.
+
+  The reset covers both accumulated counters (bytes, sessions, requests,
+  errors, response codes) and max values, as well as the extra counters
+  registered by modules (e.g. mux stats) for that server. As for the plain
+  "clear counters", only clearable modules are reset. It does not affect the
+  server's runtime state (address, weight, admin state) or health checks.
+
+  When the server's counters are stored in a shared-memory stats file (see
+  "shm-stats-file"), clearing them breaks the monotonicity that monitoring
+  tools consuming the shared stats rely on, and the reset is visible to every
+  process attached to the same object. For this reason the command refuses to
+  clear such a server unless the "force" keyword is appended.
+
+  Because it clears accumulated counters, this command is restricted and can
+  only be issued on sockets configured for level "admin", like "clear counters
+  all".
 
 clear acl [@<ver>] <acl>
   Remove all entries from the acl <acl>. <acl> is the #<id> or the <name>
@@ -2209,7 +2240,8 @@ del ssl ech <bind>
 
   Necessitates an OpenSSL version that supports ECH, and HAProxy must be
   compiled with USE_ECH=1. This command is only supported on a CLI connection
-  running in experimental mode (see "experimental-mode on").
+  running in experimental mode (see "experimental-mode on"). Not available
+  when HAProxy is built with AWS-LC.
 
   See also "show ssl ech", "add ssl ech" and "ech" in the Section 5.1 of the
   configuration manual.
@@ -2832,7 +2864,8 @@ set ssl ech <bind> <payload>
 
   Necessitates an OpenSSL version that supports ECH, and HAProxy must be
   compiled with USE_ECH=1. This command is only supported on a CLI connection
-  running in experimental mode (see "experimental-mode on").
+  running in experimental mode (see "experimental-mode on"). Not available
+  when HAProxy is built with AWS-LC.
 
   See also "show ssl ech", "add ssl ech" and "ech" in the Section 5.1 of the
   configuration manual.
@@ -3034,6 +3067,16 @@ show cache
   5. number of blocks used for the object
   6. number of transactions using the entry
   7. expiration time, can be negative if already expired
+
+show default-server [<backend>]
+  Dump the list of default-server instances still present in a backend after
+  configuration parsing. These instances can be referenced via the server
+  keyword from during "add server".
+
+show defaults
+  Dump the list of named defaults proxies instances still present after
+  configuration parsing. These instances can be reused with "add backend"
+  command to serve as configuration for the newly created proxy.
 
 show dev
   This command is meant to centralize some information that HAProxy developers
@@ -4003,7 +4046,8 @@ show ssl ech [<name>]
   Necessitates an OpenSSL version that supports ECH, and HAProxy must be
   compiled with USE_ECH=1.
   This command is only supported on a CLI connection running in experimental
-  mode (see "experimental-mode on").
+  mode (see "experimental-mode on"). Not available when HAProxy is built with
+  AWS-LC.
 
   See also "ech" in the Section 5.1 of the configuration manual.
 

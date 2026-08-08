@@ -1108,7 +1108,8 @@ static struct fcgi_strm *fcgi_stconn_new(struct fcgi_conn *fconn, struct stconn 
 
   out:
 	TRACE_DEVEL("leaving on error", FCGI_EV_FSTRM_NEW|FCGI_EV_FSTRM_END|FCGI_EV_FSTRM_ERR, fconn->conn);
-	fcgi_strm_destroy(fstrm);
+	if (fstrm)
+		fcgi_strm_destroy(fstrm);
 	return NULL;
 }
 
@@ -1328,7 +1329,8 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 		/* Decode the path. it must first be copied to keep the URI
 		 * untouched.
 		 */
-		chunk_istcat(params->p, path);
+		if (!chunk_istcat(params->p, path))
+			goto error;
 		path.ptr = b_tail(params->p) - path.len;
 		len = url_decode(ist0(path), 0);
 		if (len < 0)
@@ -1380,10 +1382,15 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 		 */
 		if (istlen(fconn->app->index) && params->scriptname.ptr[len-1] == '/') {
 			struct ist sn = params->scriptname;
+			char *ptr = b_tail(params->p);
 
-			params->scriptname = ist2(b_tail(params->p), len+fconn->app->index.len);
-			chunk_istcat(params->p, sn);
-			chunk_istcat(params->p, fconn->app->index);
+			/* both appends must succeed, otherwise scriptname would
+			 * advertise more bytes than what was really stored.
+			 */
+			if (!chunk_istcat(params->p, sn) ||
+			    !chunk_istcat(params->p, fconn->app->index))
+				goto error;
+			params->scriptname = ist2(ptr, len + fconn->app->index.len);
 		}
 	}
 
@@ -2449,7 +2456,7 @@ static int fcgi_strm_handle_stderr(struct fcgi_conn *fconn, struct fcgi_strm *fs
 {
 	struct buffer *dbuf;
 	struct buffer tag;
-	size_t ret;
+	size_t ret, i;
 
 	TRACE_ENTER(FCGI_EV_RX_RECORD|FCGI_EV_RX_STDERR, fconn->conn, fstrm);
 	dbuf = &fconn->dbuf;
@@ -2469,6 +2476,11 @@ static int fcgi_strm_handle_stderr(struct fcgi_conn *fconn, struct fcgi_strm *fs
 		goto fail;
 	fconn->drl -= ret;
 	TRACE_PROTO("FCGI STDERR record rcvd", FCGI_EV_RX_RECORD|FCGI_EV_RX_STDERR, fconn->conn, fstrm, 0, (size_t[]){ret});
+
+	for (i = 0; i < ret; i++) {
+		if (iscntrl((unsigned char)trash.area[i]))
+			trash.area[i] = '.';
+	}
 
 	trash.area[ret]   = '\n';
 	trash.area[ret+1] = '\0';

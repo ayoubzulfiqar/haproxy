@@ -385,8 +385,12 @@ void sock_unbind(struct receiver *rx)
 		return;
 
 	rx->flags &= ~RX_F_BOUND;
-	if (rx->fd != -1)
-		fd_delete(rx->fd);
+	if (rx->fd != -1) {
+		if (tg_agents_enabled)
+			rx_agent_close(rx);
+		else
+			fd_delete(rx->fd);
+	}
 	rx->fd = -1;
 }
 
@@ -478,7 +482,7 @@ int sock_get_old_sockets(const char *unixsocket)
 	int fd_nb;
 	int got_fd = 0;
 	int cur_fd = 0;
-	size_t maxoff = 0, curoff = 0;
+	size_t maxoff = 0, curoff = 0, tmpbuf_sz;
 
 	if (strncmp("sockpair@", unixsocket, strlen("sockpair@")) == 0) {
 		/* sockpair for master-worker usage */
@@ -575,10 +579,22 @@ int sock_get_old_sockets(const char *unixsocket)
 
 	msghdr.msg_control = cmsgbuf;
 	msghdr.msg_controllen = CMSG_SPACE(sizeof(int)) * MAX_SEND_FD;
-	iov.iov_len = MAX_SEND_FD * (1 + MAXPATHLEN + 1 + IFNAMSIZ + sizeof(int));
+	tmpbuf_sz = (size_t)fd_nb * (1 + MAXPATHLEN + 1 + IFNAMSIZ + sizeof(int));
 
 	do {
 		int ret3;
+
+		/* never let the peer write more than what was allocated for the
+		 * announced number of FDs.
+		 */
+		iov.iov_len = MAX_SEND_FD * (1 + MAXPATHLEN + 1 + IFNAMSIZ + sizeof(int));
+		if (iov.iov_len > tmpbuf_sz - curoff)
+			iov.iov_len = tmpbuf_sz - curoff;
+
+		if (!iov.iov_len) {
+			ha_warning("Received more data than expected while receiving sockets\n");
+			goto out;
+		}
 
 		iov.iov_base = tmpbuf + curoff;
 
@@ -901,6 +917,22 @@ void sock_conn_ctrl_init(struct connection *conn)
 void sock_conn_ctrl_close(struct connection *conn)
 {
 	BUG_ON(conn->flags & CO_FL_FDLESS);
+	if (unlikely(fdtab[conn->handle.fd].state & FD_HAS_PORT)) {
+		struct server *srv = objt_server(conn->target);
+		struct proxy *be;
+		struct port_range *port_range;
+
+		BUG_ON(srv == NULL);
+		be = srv->proxy;
+		if (srv->conn_src.opts & CO_SRC_BIND)
+			port_range = srv->conn_src.sport_range;
+		else if (be->conn_src.opts & CO_SRC_BIND)
+			port_range = be->conn_src.sport_range;
+		else
+			ABORT_NOW();
+		_HA_ATOMIC_OR(&fdtab[conn->handle.fd].state, FD_OWNER_PR);
+		fdtab[conn->handle.fd].owner = port_range;
+	}
 	fd_delete(conn->handle.fd);
 	conn->handle.fd = DEAD_FD_MAGIC;
 }

@@ -47,6 +47,7 @@
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
+#include <haproxy/stats-proxy.h>
 #include <haproxy/stats.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stconn.h>
@@ -78,7 +79,7 @@ struct srv_kw_list srv_keywords = {
 
 struct eb_root idle_conn_srv[MAX_THREADS];
 struct task *idle_conn_task[MAX_THREADS] __read_mostly = {};
-struct mt_list servers_list = MT_LIST_HEAD_INIT(servers_list);
+struct mt_list all_servers = MT_LIST_HEAD_INIT(all_servers);
 static struct task *server_atomic_sync_task = NULL;
 static event_hdl_async_equeue server_atomic_sync_queue;
 
@@ -550,8 +551,7 @@ static inline void srv_check_for_dup_dyncookie(struct server *s)
 	struct proxy *p = s->proxy;
 	struct server *tmpserv;
 
-	for (tmpserv = p->srv; tmpserv != NULL;
-	    tmpserv = tmpserv->next) {
+	list_for_each_entry(tmpserv, &p->servers, el_px) {
 		if (tmpserv == s)
 			continue;
 		if (tmpserv->next_admin & SRV_ADMF_FMAINT)
@@ -2135,9 +2135,10 @@ void srv_shutdown_backup_streams(struct proxy *px, int why)
 {
 	struct server *srv;
 
-	for (srv = px->srv; srv != NULL; srv = srv->next)
+	list_for_each_entry(srv, &px->servers, el_px) {
 		if (srv->flags & SRV_F_BACKUP)
 			srv_shutdown_streams(srv, why);
+	}
 }
 
 static void srv_append_op_chg_cause(struct buffer *msg, struct server *s, enum srv_op_st_chg_cause cause)
@@ -2393,7 +2394,7 @@ void srv_compute_all_admin_states(struct proxy *px)
 {
 	struct server *srv;
 
-	for (srv = px->srv; srv; srv = srv->next) {
+	list_for_each_entry(srv, &px->servers, el_px) {
 		if (srv->track)
 			continue;
 		srv_propagate_admin_state(srv);
@@ -2884,12 +2885,17 @@ int srv_prepare_for_resolution(struct server *srv, const char *hostname)
  */
 void srv_settings_init(struct server *srv)
 {
+	/* Mark server as reset. A default-server will be purged on post parsing. */
+	srv->flags &= ~SRV_F_UMODIFIED;
+
 	srv->check.inter = DEF_CHKINTR;
 	srv->check.fastinter = 0;
 	srv->check.downinter = 0;
 	srv->check.rise = DEF_RISETIME;
 	srv->check.fall = DEF_FALLTIME;
 	srv->check.port = 0;
+	/* Automatically activate check-reuse-pool for rhttp@ servers. */
+	srv->check.reuse_pool = srv->flags & SRV_F_RHTTP ? 1 : 0;
 
 	srv->agent.inter = DEF_CHKINTR;
 	srv->agent.fastinter = 0;
@@ -2953,6 +2959,7 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 		srv->addr = src->addr;
 		srv->addr_type = src->addr_type;
 		srv->svc_port = src->svc_port;
+		srv->alt_proto = src->alt_proto;
 	}
 
 	srv->pp_opts = src->pp_opts;
@@ -2997,8 +3004,12 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 			srv->check.tcpcheck = tcpcheck;
 	}
 
-	if (!(srv->flags & SRV_F_RHTTP))
-		srv->check.reuse_pool = src->check.reuse_pool;
+	/* For rHTTP check-reuse-pool is forcefully set. Duplicate the source
+	 * value in other cases as expected.
+	 */
+	srv->check.reuse_pool = srv->flags & SRV_F_RHTTP ?
+	                        1 : src->check.reuse_pool;
+
 	if (src->check.pool_conn_name)
 		srv->check.pool_conn_name = strdup(src->check.pool_conn_name);
 	/* Note: 'flags' field has potentially been already initialized. */
@@ -3135,7 +3146,7 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	}
 }
 
-/* Allocates a server, attaches it to the global servers_list
+/* Allocates a server, attaches it to the global <all_servers> list
  * and adds it to <proxy> server list. Before deleting the server with
  * srv_drop(), srv_detach() must be called to remove it from the parent
  * proxy list
@@ -3154,7 +3165,8 @@ struct server *new_server(struct proxy *proxy)
 
 	srv->obj_type = OBJ_TYPE_SERVER;
 	srv->proxy = proxy;
-	MT_LIST_APPEND(&servers_list, &srv->global_list);
+	LIST_APPEND(&proxy->servers, &srv->el_px);
+	MT_LIST_APPEND(&all_servers, &srv->global_list);
 	LIST_INIT(&srv->srv_rec_item);
 	LIST_INIT(&srv->ip_rec_item);
 	LIST_INIT(&srv->pp_tlvs);
@@ -3184,24 +3196,6 @@ struct server *new_server(struct proxy *proxy)
 	HA_RWLOCK_INIT(&srv->ssl_ctx.lock);
 #endif
 
-	// add server to proxy list:
-	/* TODO use a double-linked list for px->srv */
-	if (!(proxy->flags & PR_FL_CHECKED) || !proxy->srv) {
-		/* they are linked backwards first during parsing
-		 * This will be restablished after parsing.
-		 */
-		srv->next = proxy->srv;
-		proxy->srv = srv;
-	}
-	else {
-		struct server *sv = proxy->srv;
-
-		// runtime, add the server at the end of the list
-		while (sv && sv->next)
-			sv = sv->next;
-		sv->next = srv;
-	}
-
 	HA_RWLOCK_INIT(&srv->path_params.param_lock);
 
 	return srv;
@@ -3218,6 +3212,7 @@ void srv_free_params(struct server *srv)
 {
 	struct srv_pp_tlv_list *srv_tlv = NULL;
 
+	free(srv->id);
 	free(srv->cookie);
 	free(srv->rdr_pfx);
 	free(srv->hostname);
@@ -3239,10 +3234,9 @@ void srv_free_params(struct server *srv)
 	}
 	free(srv->tmpl_info.prefix);
 
+	/* QUIC servers are also updated here. */
 	if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->destroy_srv)
 		xprt_get(XPRT_SSL)->destroy_srv(srv);
-	else if (xprt_get(XPRT_QUIC) && xprt_get(XPRT_QUIC)->destroy_srv)
-		xprt_get(XPRT_QUIC)->destroy_srv(srv);
 
 	while (!LIST_ISEMPTY(&srv->pp_tlvs)) {
 		srv_tlv = LIST_ELEM(srv->pp_tlvs.n, struct srv_pp_tlv_list *, list);
@@ -3260,20 +3254,14 @@ void srv_free_params(struct server *srv)
  *
  * A general rule is to assume that proxy may already be freed, so cleanup checks
  * must not depend on the proxy
- *
- * As a convenience, <srv.next> is returned if srv is not NULL. It may be useful
- * when calling srv_drop on the list of servers.
  */
-struct server *srv_drop(struct server *srv)
+void srv_drop(struct server *srv)
 {
-	struct server *next = NULL;
 	struct proxy *px = NULL;
 	int i __maybe_unused;
 
 	if (!srv)
-		goto end;
-
-	next = srv->next;
+		return;
 
 	/* If srv was deleted, a proxy refcount must be dropped. */
 	if (srv->flags & SRV_F_DELETED)
@@ -3283,7 +3271,7 @@ struct server *srv_drop(struct server *srv)
 	 * server when reaching zero.
 	 */
 	if (HA_ATOMIC_SUB_FETCH(&srv->refcount, 1))
-		goto end;
+		return;
 
 	/* This BUG_ON() is invalid for now as server released on deinit will
 	 * trigger it as they are not properly removed from their tree.
@@ -3301,8 +3289,6 @@ struct server *srv_drop(struct server *srv)
 		tasklet_kill(srv->requeue_tasklet);
 	task_destroy(srv->warmup);
 	task_destroy(srv->srvrq_check);
-
-	free(srv->id);
 
 #ifdef USE_QUIC
 	if (srv->per_thr) {
@@ -3322,9 +3308,6 @@ struct server *srv_drop(struct server *srv)
 	srv_free(&srv);
 
 	proxy_drop(px);
-
- end:
-	return next;
 }
 
 /* Remove a server <srv> from a tracking list if <srv> is tracking another
@@ -3383,22 +3366,13 @@ static int _srv_parse_tmpl_range(struct server *srv, const char *arg,
 	return 0;
 }
 
-/* Parse as much as possible such a range string argument: low[-high]
- * Set <nb_low> and <nb_high> values so that they may be reused by this loop
- * for(int i = nb_low; i <= nb_high; i++)... with nb_low >= 1.
- *
- * This function is first intended to be used through parse_server to
- * initialize a new server on startup.
- *
- * Fails if 'low' < 0 or 'high' is present and not higher than 'low'.
- * Returns 0 if succeeded, -1 if not.
+/* Generate a server ID from <prefix> and <nb>. Used for server-template.
+ * Returns a newly allocated string or NULL.
  */
-static inline void _srv_parse_set_id_from_prefix(struct server *srv,
-                                                 const char *prefix, int nb)
+static inline char *server_set_id_from_prefix(const char *prefix, int nb)
 {
 	chunk_printf(&trash, "%s%d", prefix, nb);
-	free(srv->id);
-	srv->id = strdup(trash.area);
+	return strdup(trash.area);
 }
 
 /* Parse the sni and pool-conn-name expressions. Returns 0 on success and non-zero on
@@ -3459,6 +3433,16 @@ int srv_configure_auto_sni(struct server *srv, int *err_code, char **err)
 	return 0;
 }
 
+/* Insert <srv> server into <px> proxy name tree. Caller must ensure the name
+ * is unique prior to this.
+ */
+static void _srv_register_name(struct server *srv, struct proxy *px)
+{
+	struct server *node __maybe_unused;
+	node = cebuis_item_insert(&px->conf.used_server_name, conf.name_node, id, srv);
+	BUG_ON(srv != node);
+}
+
 /* Initialize as much as possible servers from <srv> server template.
  * Note that a server template is a special server with
  * a few different parameters than a server which has
@@ -3467,23 +3451,41 @@ int srv_configure_auto_sni(struct server *srv, int *err_code, char **err)
  * This function is first intended to be used through parse_server to
  * initialize a new server on startup.
  *
- * Returns the number of servers successfully allocated,
- * 'srv' template included.
+ * A mask of errors is returned. ERR_FATAL is set if the parsing should be
+ * interrupted.
  */
 static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 {
-	int i;
-	struct server *newsrv;
+	int err_code = ERR_NONE, i = 0;
+	struct server *newsrv = NULL, *other;
+	char *msg = NULL;
 
 	/* Set the first server's ID. */
-	_srv_parse_set_id_from_prefix(srv, srv->tmpl_info.prefix, srv->tmpl_info.nb_low);
-	cebis_item_insert(&curproxy->conf.used_server_name, conf.name_node, id, srv);
+	srv->id = server_set_id_from_prefix(srv->tmpl_info.prefix,
+	                                    srv->tmpl_info.nb_low);
+	if (!srv->id) {
+		ha_alert("out of memory");
+		err_code = ERR_ALERT | ERR_ABORT;
+		goto out;
+	}
+
+	if ((other = server_find_by_name2(px, srv->id))) {
+		ha_alert("another server named '%s' was already defined at line %d, please use a distinct name.\n",
+		         srv->id, other->conf.line);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	_srv_register_name(srv, curproxy);
 
 	/* then create other servers from this one */
 	for (i = srv->tmpl_info.nb_low + 1; i <= srv->tmpl_info.nb_high; i++) {
 		newsrv = new_server(px);
-		if (!newsrv)
-			goto err;
+		if (!newsrv) {
+			ha_alert("out of memory.\n");
+			err_code = ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
 
 		newsrv->conf.file = strdup(srv->conf.file);
 		newsrv->conf.line = srv->conf.line;
@@ -3491,31 +3493,36 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 		srv_settings_cpy(newsrv, srv, 1);
 		srv_prepare_for_resolution(newsrv, srv->hostname);
 
-	        if (server_parse_exprs(newsrv, px, NULL))
-			goto err;
+	        if ((err_code = server_parse_exprs(newsrv, px, &msg))) {
+			ha_alert("failed to parse auto SNI expression: %s", msg);
+			ha_free(&msg);
+			goto out;
+		}
 
 		/* append to list of servers available to receive an hostname */
 		if (newsrv->srvrq)
 			LIST_APPEND(&newsrv->srvrq->attached_servers, &newsrv->srv_rec_item);
 
 		/* Set this new server ID. */
-		_srv_parse_set_id_from_prefix(newsrv, srv->tmpl_info.prefix, i);
+		newsrv->id = server_set_id_from_prefix(srv->tmpl_info.prefix, i);
+		if (!newsrv->id) {
+			ha_alert("out of memory");
+			err_code = ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
 
-		cebis_item_insert(&curproxy->conf.used_server_name, conf.name_node, id, newsrv);
+		if ((other = server_find_by_name2(px, newsrv->id))) {
+			ha_alert("another server named '%s' was already defined at line %d, please use a distinct name.\n",
+			         newsrv->id, other->conf.line);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		_srv_register_name(newsrv, curproxy);
 	}
 
-	return i - srv->tmpl_info.nb_low;
-
- err:
-	if (newsrv)  {
-		release_sample_expr(newsrv->ssl_ctx.sni);
-		free_check(&newsrv->agent);
-		free_check(&newsrv->check);
-		MT_LIST_DELETE(&newsrv->global_list);
-		srv_detach(newsrv);
-	}
-	srv_drop(newsrv);
-	return i - srv->tmpl_info.nb_low;
+ out:
+	return err_code;
 }
 
 /* Ensure server config will work with effective proxy mode
@@ -3683,7 +3690,7 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
                            struct proxy *curproxy,
                            int parse_flags)
 {
-	struct server *newsrv = NULL;
+	struct server *newsrv = NULL, *other;
 	const char *err = NULL;
 	int err_code = 0;
 	char *fqdn = NULL;
@@ -3758,14 +3765,29 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 		if (parse_flags & SRV_PARSE_DYNAMIC)
 			newsrv->flags |= SRV_F_DYNAMIC;
 
-		/* Note: for a server template, its id is its prefix.
-		 * This is a temporary id which will be used for server allocations to come
-		 * after parsing.
-		 */
-		if (!(parse_flags & SRV_PARSE_TEMPLATE))
+		if (!(parse_flags & SRV_PARSE_TEMPLATE)) {
 			newsrv->id = strdup(args[1]);
-		else
+			if (!newsrv->id) {
+				ha_alert("out of memory.\n");
+				err_code |= ERR_ALERT | ERR_ABORT;
+				goto out;
+			}
+
+			if ((other = server_find_by_name2(curproxy, newsrv->id))) {
+				ha_alert("another server named '%s' was already defined at line %d, please use a distinct name.\n",
+				         args[1], other->conf.line);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		}
+		else {
 			newsrv->tmpl_info.prefix = strdup(args[1]);
+			if (!newsrv->tmpl_info.prefix) {
+				ha_alert("out of memory.\n");
+				err_code |= ERR_ALERT | ERR_ABORT;
+				goto out;
+			}
+		}
 
 		/* several ways to check the port component :
 		 *  - IP    => port=+0, relative (IPv4 only)
@@ -3804,10 +3826,6 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
-
-			mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
-			newsrv->xprt = xprt_get(XPRT_QUIC);
-			quic_transport_params_init(&newsrv->quic_params, 0);
 		}
 #else
 		if (srv_is_quic(newsrv)) {
@@ -3826,8 +3844,6 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 			}
 			else {
 				newsrv->flags |= SRV_F_RHTTP;
-				/* Automatically activate check-reuse-pool for rhttp@ servers. */
-				newsrv->check.reuse_pool = 1;
 			}
 		}
 
@@ -3873,32 +3889,68 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 
 		(*cur_arg)++;
  skip_addr:
-		if (!(parse_flags & SRV_PARSE_DYNAMIC)) {
-			/* Copy default server settings to new server */
-			srv_settings_cpy(newsrv, curproxy->defsrv, 0);
-		} else
-			srv_settings_init(newsrv);
 		HA_SPIN_INIT(&newsrv->lock);
 	}
 	else {
-		/* This is a "default-server" line. Let's make certain the
-		 * current proxy's default server exists, otherwise it's
-		 * time to allocate it now.
-		 */
-		newsrv = curproxy->defsrv;
+		char *name;
+
+		/* Parse optional "name" default-server keyword. */
+		if (*args[1] && strcmp(args[1], "name") == 0) {
+			if (!*args[2]) {
+				ha_alert("default-server name: missing value.\n");
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			*cur_arg = 3;
+			name = strdup(args[2]);
+			if (!name) {
+				ha_alert("out of memory.\n");
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			/* Retrieve default-server by its name. */
+			newsrv = cebuis_item_lookup(&curproxy->defsrv_by_name,
+			                            conf.name_node, id, name,
+			                            struct server);
+		}
+		else {
+			/* unnamed default-server instance */
+			*cur_arg = 1;
+			name = NULL;
+			newsrv = curproxy->defsrv;
+		}
+
 		if (!newsrv) {
+			/* Allocate non-existing yet default-server instance. */
+			struct server *srv_other;
+
+			if (name && (srv_other = server_find_by_name(curproxy, name))) {
+				ha_alert("default-server name '%s' conflicts with server defined at line %d.\n",
+				         name, srv_other->conf.line);
+				err_code |= ERR_ALERT | ERR_ABORT;
+				goto out;
+			}
+
 			newsrv = srv_alloc();
 			if (!newsrv) {
 				ha_alert("out of memory.\n");
 				err_code |= ERR_ALERT | ERR_ABORT;
 				goto out;
 			}
-			newsrv->id = "default-server";
+			newsrv->id = name;
 			srv_settings_init(newsrv);
-			curproxy->defsrv = newsrv;
+
+			if (newsrv->id) {
+				cebuis_item_insert(&curproxy->defsrv_by_name,
+				                   conf.name_node, id, newsrv);
+			}
+			else {
+				curproxy->defsrv = newsrv;
+			}
 		}
 		*srv = newsrv;
-		*cur_arg = 1;
 	}
 
 	free(fqdn);
@@ -3906,6 +3958,137 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 
 out:
 	free(fqdn);
+	return err_code;
+}
+
+/* Look up a server according to <sv_name> argument of the form [<be>/]<srv>.
+ * Both standard and default-server are searched. If the proxy is not
+ * specified, caller must set <curproxy> as a default value. If the server is
+ * not found, <msg> is allocated to indicate the failure reason.
+ *
+ * Returns the server instance or NULL if not found.
+ */
+static struct server *lookup_srv_be_arg(struct ist sv_name,
+                                        struct proxy *curproxy,
+                                        char **msg)
+{
+	struct server *srv;
+	struct ist be_name;
+	struct proxy *px = curproxy;
+
+	if (istchr(sv_name, '/')) {
+		be_name = istsplit(&sv_name, '/');
+		px = proxy_be_by_name(ist0(be_name));
+		if (!px) {
+			memprintf(msg, "unknown backend '%s'", istptr(be_name));
+			return NULL;
+		}
+	}
+
+	if (!istlen(sv_name) || !px) {
+		memprintf(msg, "require <backend>/<server>");
+		return NULL;
+	}
+
+	srv = server_find_by_name2(px, istptr(sv_name));
+	if (!srv) {
+		memprintf(msg, "unknown server '%s' in backend '%s'",
+		          istptr(sv_name), px->id);
+	}
+
+	return srv;
+}
+
+/* Try to parse optional positional "from" keyword for <srv> server instance.
+ * The keyword is read from <args>. If found <cur_arg> is incremented to the
+ * next argument.
+ *
+ * On return, <from> will point to a server or default-instance from with
+ * settings must be copied. If NULL the server settings must be initialized to
+ * default clean values. If <from> points to <srv>, the caller must neither
+ * reinit or copy settings.
+ *
+ * A mask of errors is returned. ERR_FATAL is set on parsing error.
+ */
+static int _srv_parse_from(struct server *srv, char **args, int *cur_arg,
+                           struct proxy *curproxy, struct server **from,
+                           int parse_flags)
+{
+	int err_code = ERR_NONE;
+
+	if (strcmp(args[*cur_arg], "from") == 0) {
+		if (!*args[*cur_arg + 1]) {
+			ha_alert("from: missing value.\n");
+			err_code |= ERR_FATAL | ERR_ALERT;
+			goto out;
+		}
+		else if (strcmp(args[*cur_arg + 1], "none") == 0) {
+			*from = NULL;
+		}
+		else if (strncmp(args[*cur_arg + 1], "be:", 3) == 0) {
+			struct ist be_name = istadv(ist(args[*cur_arg + 1]), 3);
+			struct proxy *px = curproxy;
+
+			if (istlen(be_name)) {
+				px = proxy_be_by_name(istptr(be_name));
+				if (!px) {
+					ha_alert("from: unknown backend instance '%s'.\n",
+					         istptr(be_name));
+					err_code = ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+			}
+
+			*from = px->defsrv;
+		}
+		else if (strncmp(args[*cur_arg + 1], "srv:", 4) == 0) {
+			struct ist sv_name = istadv(ist(args[*cur_arg + 1]), 4);
+			char *errmsg = NULL;
+
+			*from = lookup_srv_be_arg(sv_name, curproxy, &errmsg);
+			if (!*from) {
+				ha_alert("from: %s.\n", errmsg);
+				ha_free(&errmsg);
+				err_code = ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		}
+		else {
+			ha_alert("invalid '%s' value for 'from' keyword.\n", args[*cur_arg + 1]);
+			err_code |= ERR_FATAL | ERR_ALERT;
+			goto out;
+		}
+
+		*cur_arg += 2;
+
+		/* detect duplicate 'from' keyword usage. */
+		if (strcmp(args[*cur_arg], "from") == 0) {
+			ha_alert("'from' keyword can only be specified once.\n");
+			err_code |= ERR_FATAL | ERR_ALERT;
+			goto out;
+		}
+	}
+	else {
+		/* from keyword not used : fallback to the default behavior. */
+		if (parse_flags & SRV_PARSE_DEFAULT_SERVER) {
+			/* default-server can be defined on multiple lines with settings overriding.
+			 * In this case, caller do not have to reinit or copy the settings.
+			 */
+			*from = srv;
+		}
+		else if (!(parse_flags & SRV_PARSE_DYNAMIC)) {
+			/* Reuses the unnamed default-server in the same proxy
+			 * for servers declared in the configuration files.
+			 */
+			*from = curproxy->defsrv;
+		}
+		else {
+			/* Servers added at runtime to not inherit by default from the default-server. */
+			*from = NULL;
+		}
+	}
+
+ out:
 	return err_code;
 }
 
@@ -4098,6 +4281,7 @@ int parse_server(const char *file, int linenum, char **args,
                  int parse_flags)
 {
 	struct server *newsrv = NULL;
+	struct server *from = NULL;
 	int err_code = 0;
 
 	int cur_arg;
@@ -4122,9 +4306,18 @@ int parse_server(const char *file, int linenum, char **args,
 
 	err_code = _srv_parse_init(&newsrv, args, &cur_arg, curproxy,
 	                           parse_flags);
-
 	if (err_code & ERR_CODE)
 		goto out;
+
+	err_code = _srv_parse_from(newsrv, args, &cur_arg, curproxy, &from,
+	                           parse_flags);
+	if (err_code & ERR_FATAL)
+		goto out;
+
+	if (newsrv != from) {
+		/* This will copy <from> settings or init them if NULL. */
+		srv_settings_cpy(newsrv, from, !!(parse_flags & SRV_PARSE_TEMPLATE));
+	}
 
 	if (!newsrv->conf.file) // note: do it only once for default-server
 		newsrv->conf.file = strdup(file);
@@ -4135,6 +4328,11 @@ int parse_server(const char *file, int linenum, char **args,
 		                         parse_flags);
 		if (err_code & ERR_FATAL)
 			goto out;
+
+		/* Mark server as modified by a keyword. Prevents a
+		 * default-server to be purged on post parsing.
+		 */
+		newsrv->flags |= SRV_F_UMODIFIED;
 	}
 
 	if (!(parse_flags & SRV_PARSE_DEFAULT_SERVER)) {
@@ -4144,10 +4342,12 @@ int parse_server(const char *file, int linenum, char **args,
 	}
 
 	if (parse_flags & SRV_PARSE_TEMPLATE) {
-		_srv_parse_tmpl_init(newsrv, curproxy);
+		err_code |= _srv_parse_tmpl_init(newsrv, curproxy);
+		if (err_code & ERR_FATAL)
+			goto out;
 	}
 	else if (!(parse_flags & SRV_PARSE_DEFAULT_SERVER)) {
-		cebis_item_insert(&curproxy->conf.used_server_name, conf.name_node, id, newsrv);
+		_srv_register_name(newsrv, curproxy);
 	}
 
 	/* If the server id is fixed, insert it in the proxy used_id tree.
@@ -4198,7 +4398,22 @@ struct server *server_find_by_name(struct proxy *px, const char *name)
 	if (!px)
 		return NULL;
 
-	return cebis_item_lookup(&px->conf.used_server_name, conf.name_node, id, name, struct server);
+	return cebuis_item_lookup(&px->conf.used_server_name, conf.name_node, id, name, struct server);
+}
+
+/* Equivalent to server_find_by_name() excepts it also lookup in the named
+ * default-server tree.
+ */
+struct server *server_find_by_name2(struct proxy *px, const char *name)
+{
+	struct server *srv;
+
+	srv = server_find_by_name(px, name);
+	if (srv)
+		return srv;
+
+	return cebuis_item_lookup(&px->defsrv_by_name, conf.name_node, id, name,
+	                          struct server);
 }
 
 /*
@@ -5203,7 +5418,7 @@ struct server *snr_check_ip_callback(struct server *srv, void *ip, unsigned char
 		return NULL;
 
 	be = srv->proxy;
-	for (tmpsrv = be->srv; tmpsrv; tmpsrv = tmpsrv->next) {
+	list_for_each_entry(tmpsrv, &be->servers, el_px) {
 		/* we found the current server is the same, ignore it */
 		if (srv == tmpsrv)
 			continue;
@@ -5462,23 +5677,19 @@ int srv_init_addr(void)
 	struct proxy *curproxy;
 	int return_code = 0;
 
-	curproxy = proxies_list;
-	while (curproxy) {
+	list_for_each_entry(curproxy, &main_proxies, el) {
 		struct server *srv;
 
 		/* servers are in backend only */
 		if (!(curproxy->cap & PR_CAP_BE) || (curproxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
-			goto srv_init_addr_next;
+			continue;
 
-		for (srv = curproxy->srv; srv; srv = srv->next) {
+		list_for_each_entry(srv, &curproxy->servers, el_px) {
 			set_usermsgs_ctx(srv->conf.file, srv->conf.line, &srv->obj_type);
 			if (srv->hostname || srv->srvrq)
 				return_code |= srv_iterate_initaddr(srv);
 			reset_usermsgs_ctx();
 		}
-
- srv_init_addr_next:
-		curproxy = curproxy->next;
 	}
 
 	return return_code;
@@ -5596,7 +5807,7 @@ static const char *srv_update_server_name(struct server *srv, const char *new_na
 	/* re-check for name conflict under isolation — another rename or
 	 * add server could have raced before we isolated.
 	 */
-	if (server_find_by_name(be, new_name)) {
+	if (server_find_by_name2(be, new_name)) {
 		thread_release();
 		free(dup);
 		return "A server with the same name already exists in this backend.\n";
@@ -5607,9 +5818,9 @@ static const char *srv_update_server_name(struct server *srv, const char *new_na
 	old_name = srv->id;
 
 	/* re-index in the name tree */
-	cebis_item_delete(&be->conf.used_server_name, conf.name_node, id, srv);
+	cebuis_item_delete(&be->conf.used_server_name, conf.name_node, id, srv);
 	srv->id = dup;
-	cebis_item_insert(&be->conf.used_server_name, conf.name_node, id, srv);
+	_srv_register_name(srv, be);
 
 	/* publish rename event with both old and new names */
 	{
@@ -6353,7 +6564,7 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 {
 	struct add_srv_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct proxy *be;
-	struct server *srv;
+	struct server *srv, *from = NULL;
 	char *be_name, *sv_name, *errmsg;
 	int errcode, argc;
 	const int parse_flags = SRV_PARSE_DYNAMIC|SRV_PARSE_PARSE_ADDR;
@@ -6406,7 +6617,7 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	/*
 	 * If a server with the same name is found, reject the new one.
 	 */
-	if (server_find(be, sv_name)) {
+	if (server_find_by_name2(be, sv_name)) {
 		thread_release();
 		cli_err(appctx, "Already exists a server with the same name in backend.\n");
 		return 1;
@@ -6416,6 +6627,11 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	errcode = _srv_parse_init(&srv, args, &argc, be, parse_flags);
 	if (errcode)
 		goto out;
+
+	errcode = _srv_parse_from(srv, args, &argc, be, &from, parse_flags);
+	if (errcode)
+		goto out;
+	srv_settings_cpy(srv, from, 0);
 
 	while (*args[argc]) {
 		errcode = _srv_parse_kw(srv, args, &argc, be, parse_flags);
@@ -6475,12 +6691,9 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 
 	if (srv->use_ssl == 1 || (srv->check.tcpcheck->flags & TCPCHK_FL_USE_SSL) ||
 	    srv->check.use_ssl == 1) {
+		/* QUIC servers are also updated here. */
 		if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->prepare_srv) {
 			if (xprt_get(XPRT_SSL)->prepare_srv(srv))
-				goto out;
-		}
-		else if (xprt_get(XPRT_QUIC) && xprt_get(XPRT_QUIC)->prepare_srv) {
-			if (xprt_get(XPRT_QUIC)->prepare_srv(srv))
 				goto out;
 		}
 	}
@@ -6558,7 +6771,7 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 
 	/* insert the server in the backend trees */
 	server_index_id(be, srv);
-	cebis_item_insert(&be->conf.used_server_name, conf.name_node, id, srv);
+	_srv_register_name(srv, be);
 	/* addr_key could be NULL if FQDN resolution is postponed (ie: add server from cli) */
 	if (srv->addr_key)
 		cebuis_item_insert(&be->used_server_addr, addr_node, addr_key, srv);
@@ -6712,7 +6925,7 @@ leave:
 static int cli_parse_delete_server(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct proxy *be;
-	struct server *srv;
+	struct server *srv, *next;
 	struct ist be_name, sv_name;
 	struct watcher *srv_watch;
 	const char *msg;
@@ -6763,10 +6976,11 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	if (srv->proxy->lbprm.ops && srv->proxy->lbprm.ops->server_deinit)
 		srv->proxy->lbprm.ops->server_deinit(srv);
 
+	next = proxy_next_server(srv);
+	BUG_ON(next && next->flags & SRV_F_DELETED);
 	while (!MT_LIST_ISEMPTY(&srv->watcher_list)) {
 		srv_watch = MT_LIST_NEXT(&srv->watcher_list, struct watcher *, el);
-		BUG_ON(srv->next && srv->next->flags & SRV_F_DELETED);
-		watcher_next(srv_watch, srv->next);
+		watcher_next(srv_watch, next);
 	}
 
 	/* detach the server from the proxy linked list
@@ -6787,7 +7001,7 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 
 	/* remove srv from addr_node tree */
 	ceb32_item_delete(&be->conf.used_server_id, conf.puid_node, puid, srv);
-	cebis_item_delete(&be->conf.used_server_name, conf.name_node, id, srv);
+	cebuis_item_delete(&be->conf.used_server_name, conf.name_node, id, srv);
 	cebuis_item_delete(&be->used_server_addr, addr_node, addr_key, srv);
 
 	/* remove srv from idle_node tree for idle conn cleanup */
@@ -6807,6 +7021,58 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 
 out:
 	thread_release();
+	return 1;
+}
+
+/* Reset the statistics counters of a single server, invoked from the
+ * "clear counters server <backend>/<server> [force]" CLI command (dispatched
+ * by cli_parse_clear_counters() in stats.c, since "clear counters" is a
+ * two-word keyword that would otherwise shadow a three-word variant).
+ *
+ * The command is not gated by the server's administrative state: like
+ * "clear counters" / "clear counters all", it only zeroes counter values
+ * and does not touch the server object or its runtime state, so it is safe
+ * to issue on a live server (a concurrent counter increment races on a
+ * value exactly as it already does for "clear counters all"). This is
+ * useful when a server slot is being reused to represent a different
+ * logical entity (e.g. a different Kubernetes pod occupying the same slot
+ * after a rename) and per-entity counter attribution is required.
+ *
+ * When the server's counters are registered in a shared-memory stats file
+ * object (COUNTERS_SHARED_F_LOCAL not set), clearing them breaks the
+ * monotonicity that monitoring tools consuming the shared stats rely on,
+ * and affects every process attached to the object. Such a clear is
+ * therefore refused unless <force> is set.
+ *
+ * <arg> is the "<backend>/<server>" argument. Always returns 1 (the CLI
+ * parser convention for "message emitted, stop"); success or error is
+ * reported to <appctx>.
+ */
+int cli_clear_counters_server(struct appctx *appctx, char *arg, int force)
+{
+	struct server *sv;
+
+	sv = cli_find_server(appctx, arg);
+	if (!sv)
+		return 1;
+
+	if (!force && !(sv->counters.shared.flags & COUNTERS_SHARED_F_LOCAL)) {
+		cli_err(appctx,
+		        "Server counters are stored in a shared-memory stats "
+		        "file; clearing them breaks monotonicity for monitoring "
+		        "tools and affects all attached processes. Append 'force' "
+		        "to clear anyway.\n");
+		return 1;
+	}
+
+	HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
+
+	counters_be_reset(&sv->counters);
+	srv_stats_clear_extra_counters(sv);
+
+	HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
+
+	cli_msg(appctx, LOG_NOTICE, "Server counters cleared.\n");
 	return 1;
 }
 
@@ -7822,7 +8088,15 @@ static void srv_close_idle_conns(struct server *srv)
 		for (cleaned_tree = conn_trees; *cleaned_tree; ++cleaned_tree) {
 			while ((conn = ceb64_item_first(*cleaned_tree, hash_node.node,
 							hash_node.key, struct connection))) {
-				if (conn->ctrl->ctrl_close)
+				/*
+				 * Make sure we only close our own fds. If the
+				 * connection was owned by another thread group,
+				 * it should be closed already as all those
+				 * threads exited already.
+				 */
+				if (conn->ctrl->ctrl_close &&
+				    (!(global.tune.options & GTUNE_NO_TG_FD_SHARING) ||
+				     ha_thread_info[i].tgid == tgid))
 					conn->ctrl->ctrl_close(conn);
 				conn_delete_from_tree(conn, i);
 			}

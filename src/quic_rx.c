@@ -669,6 +669,7 @@ static int qc_handle_crypto_frm(struct quic_conn *qc,
 	struct quic_cstream *cstream = qel->cstream;
 	struct ncbmbuf *ncbuf = &qel->cstream->rx.ncbuf;
 	uint64_t off_rel;
+	ncb_sz_t data;
 
 	TRACE_ENTER(QUIC_EV_CONN_PRSHPKT, qc);
 
@@ -718,8 +719,22 @@ static int qc_handle_crypto_frm(struct quic_conn *qc,
 	                    crypto_frm->len, NCB_ADD_OVERWRT);
 	BUG_ON(ncb_ret != NCB_RET_OK);
 
+	data = ncbmb_data(ncbuf, 0);
 	/* Reschedule with TASK_HEAVY if CRYPTO data ready for decoding. */
-	if (ncbmb_data(ncbuf, 0)) {
+	if (data) {
+		/* Reject CRYPTO content in case of wrapping. This ensures
+		 * there is no read of out-of-bound read by the SSL stack in
+		 * ha_quic_ossl_crypto_recv_rcd()/qc_ssl_provide_all_quic_data().
+		 * TODO implement proper support for CRYPTO wrapping.
+		 */
+		if (ncbmb_head(ncbuf) + data >= ncbmb_wrap(ncbuf)) {
+			TRACE_ERROR("unsupported wrapping CRYPTO frames", QUIC_EV_CONN_PRSHPKT, qc);
+			COUNT_IF(1, "connection closed on unsupported wrapping CRYPTO content");
+			quic_set_connection_close(qc, quic_err_transport(QC_ERR_CRYPTO_BUFFER_EXCEEDED));
+			quic_free_ncbuf(ncbuf);
+			goto err;
+		}
+
 		HA_ATOMIC_OR(&qc->wait_event.tasklet->state, TASK_HEAVY);
 		tasklet_wakeup(qc->wait_event.tasklet);
 	}
@@ -2047,6 +2062,19 @@ static int quic_rx_pkt_parse(struct quic_conn *qc, struct quic_rx_packet *pkt,
 				goto drop;
 			}
 
+			/* RFC 9000 17.2.5.2. Handling a Retry Packet
+			 *
+			 * A client MUST accept and process at most one Retry packet for each
+			 * connection attempt. After the client has received and processed an
+			 * Initial or Retry packet from the server, it MUST discard any
+			 * subsequent Retry packets that it receives.
+			 */
+			if (qc->retry_token) {
+				TRACE_PROTO("Drop duplicate Retry packet",
+				            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
+				goto drop_silent;
+			}
+
 			if (!quic_retry_packet_check(qc, pkt, beg, end, pos, &qc->retry_token_len))
 				/* TODO: should close the connection? */
 				goto drop;
@@ -2429,6 +2457,24 @@ int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *from_qc,
 
 	TRACE_ENTER(QUIC_EV_CONN_LPKT);
 
+	/*
+	 * Make sure we have a usable file descriptor. When each thread
+	 * group has its own file descriptor tables, we can't just assume
+	 * we can use the current listener, so find a more fitting one if
+	 * needed.
+	 */
+	if (li && (global.tune.options & GTUNE_NO_TG_FD_SHARING) &&
+	    li->rx.bind_tgroup != tgid) {
+		struct listener *l2;
+
+		list_for_each_entry(l2, &li->bind_conf->listeners, by_bind) {
+			if (l2->rx.bind_tgroup == tgid) {
+				li = l2;
+				break;
+			}
+		}
+	}
+
 	pos = dgram->buf;
 	end = pos + dgram->len;
 	do {
@@ -2458,7 +2504,8 @@ int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *from_qc,
 			pkt->flags |= QUIC_FL_RX_PACKET_DGRAM_FIRST;
 
 		quic_rx_packet_refinc(pkt);
-		if (quic_rx_pkt_parse(from_qc, pkt, pos, end, dgram, o))
+		if (quic_rx_pkt_parse(from_qc, pkt, pos, end, dgram,
+		                      li ? &li->obj_type : o))
 			goto next;
 
 		/* Search quic-conn instance for first packet of the datagram.

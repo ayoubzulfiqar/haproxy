@@ -80,13 +80,14 @@
 #define GTUNE_DISABLE_ACTIVE_CLOSE (1<<22)
 #define GTUNE_QUICK_EXIT         (1<<23)
 #define GTUNE_COLLECT_LIBS       (1<<24)
-/* (1<<25) unused */
+#define GTUNE_PURGE_DEF_SRV      (1<<25)
 #define GTUNE_USE_FAST_FWD       (1<<26)
 #define GTUNE_LISTENER_MQ_FAIR   (1<<27)
 #define GTUNE_LISTENER_MQ_OPT    (1<<28)
 #define GTUNE_LISTENER_MQ_ANY    (GTUNE_LISTENER_MQ_FAIR | GTUNE_LISTENER_MQ_OPT)
 #define GTUNE_NO_KTLS            (1<<29)
 #define GTUNE_NO_MAX_COUNTER     (1<<30)
+#define GTUNE_NO_TG_FD_SHARING   (1U<<31)
 
 /* subsystem-specific debugging options for tune.debug */
 #define GDBG_CPU_AFFINITY           (1U<< 0)

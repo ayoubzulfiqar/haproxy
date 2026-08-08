@@ -589,6 +589,11 @@ static struct appctx *spoe_create_appctx(struct spoe_context *ctx)
  out_free_appctx:
 	appctx_free_on_early_error(appctx);
  out_free_spoe_appctx:
+	/* the context must not be left pointing to the applet we're about to
+	 * release, the caller still uses it on the error path.
+	 */
+	if (ctx->spoe_appctx == spoe_appctx)
+		ctx->spoe_appctx = NULL;
 	pool_free(pool_head_spoe_appctx, spoe_appctx);
  out_error:
 	send_log(&agent->fe, LOG_EMERG, "SPOE: [%s] failed to create SPOE applet\n", agent->id);
@@ -1237,7 +1242,7 @@ static int spoe_init(struct proxy *px, struct flt_conf *fconf)
 	conf->agent->fe.options2 |= PR_O2_INDEPSTR;
 	conf->agent->fe.conn_retries = CONN_RETRIES;
 	conf->agent->fe.accept = frontend_accept;
-	conf->agent->fe.srv = NULL;
+	LIST_INIT(&conf->agent->fe.servers);
 	conf->agent->fe.timeout.client = TICK_ETERNITY;
 	conf->agent->fe.fe_req_ana = AN_REQ_SWITCHING_RULES;
 
@@ -2870,7 +2875,7 @@ static int spoe_postcheck_spop_proxy(struct proxy *px)
 	if (!(px->cap & PR_CAP_BE) || px->mode != PR_MODE_SPOP)
 		goto out;
 
-	for (srv = px->srv; srv; srv = srv->next) {
+	list_for_each_entry(srv, &px->servers, el_px) {
 		if (srv->pool_conn_name) {
 			ha_free(&srv->pool_conn_name);
 			release_sample_expr(srv->pool_conn_name_expr);

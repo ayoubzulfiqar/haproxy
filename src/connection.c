@@ -908,6 +908,7 @@ const char *conn_err_code_name(struct connection *c)
 	case CO_ER_SSL_TOO_MANY:     return "SSL_TOO_MANY";
 	case CO_ER_SSL_NO_MEM:       return "SSL_NO_MEM";
 	case CO_ER_SSL_RENEG:        return "SSL_RENEG";
+	case CO_ER_SSL_KEYUPDATE:    return "SSL_KEYUPDATE";
 	case CO_ER_SSL_CA_FAIL:      return "SSL_CA_FAIL";
 	case CO_ER_SSL_CRT_FAIL:     return "SSL_CRT_FAIL";
 	case CO_ER_SSL_MISMATCH:     return "SSL_MISMATCH";
@@ -979,6 +980,7 @@ const char *conn_err_code_str(struct connection *c)
 	case CO_ER_SSL_TOO_MANY:  return "Too many SSL connections";
 	case CO_ER_SSL_NO_MEM:    return "Out of memory when initializing an SSL connection";
 	case CO_ER_SSL_RENEG:     return "Rejected a client-initiated SSL renegotiation attempt";
+	case CO_ER_SSL_KEYUPDATE: return "Aborted connection after a TLS 1.3 KeyUpdate flood";
 	case CO_ER_SSL_CA_FAIL:   return "SSL client CA chain cannot be verified";
 	case CO_ER_SSL_CRT_FAIL:  return "SSL client certificate not trusted";
 	case CO_ER_SSL_MISMATCH:  return "Server presented an SSL certificate different from the configured one";
@@ -2355,7 +2357,8 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 	if (srv->pp_opts & SRV_PP_V2_CRC32C) {
 		uint32_t zero_crc32c = 0;
 
-		if ((buf_len - ret) < sizeof(struct tlv))
+		/* make sure the whole TLV fits, not just its header */
+		if ((buf_len - ret) < sizeof(struct tlv) + sizeof(zero_crc32c))
 			return 0;
 		tlv_crc32c_p = (void *)((struct tlv *)&buf[ret])->value;
 		ret += make_tlv(&buf[ret], (buf_len - ret), PP2_TYPE_CRC32C, sizeof(zero_crc32c), (const char *)&zero_crc32c);
