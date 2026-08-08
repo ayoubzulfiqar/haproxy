@@ -335,6 +335,13 @@ int aes_process(struct buffer *data, struct buffer *nonce, struct buffer *key, i
 	if (!ctx)
 		goto err;
 
+	/* The key size may be dictated by the input (e.g. the "alg" field of a
+	 * JWE token), so make sure the configured key is large enough for the
+	 * selected cipher, otherwise OpenSSL would read past its end.
+	 */
+	if (b_data(key) < key_size / 8)
+		goto err;
+
 	switch(key_size) {
 	case 128:
 		sample_conv_aes_init(decrypt, ctx, (gcm ? EVP_aes_128_gcm() : EVP_aes_128_cbc()),
@@ -400,6 +407,12 @@ int aes_process(struct buffer *data, struct buffer *nonce, struct buffer *key, i
 	size = out->data;
 
 	if (decrypt && gcm) {
+		/* the tag length is provided by the caller, hence often by the
+		 * input itself; OpenSSL happily verifies tags as short as one
+		 * byte, so require the full length that the encrypt path emits.
+		 */
+		if (b_data(aead_tag) != 16)
+			goto err;
 		if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, b_data(aead_tag), b_orig(aead_tag)))
 			goto err;
 	}

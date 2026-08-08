@@ -1,0 +1,120 @@
+varnishtest "Test server from keyword"
+
+feature ignore_unknown_macro
+
+# Do nothing. Is there only to create s1_* macros
+server s1 {
+	rxreq
+	txresp
+} -start
+
+haproxy h1 -conf {
+	global
+	.if feature(THREAD)
+		thread-groups 1
+	.endif
+
+	defaults
+		mode http
+		timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+		timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+		timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+	frontend fe
+		bind "fd@${feS}"
+		use_backend be
+
+	backend be
+		default-server weight 10
+		# ensure that default-server overloading is working as expected
+		default-server inter 5s
+
+		server srvconf1 ${s1_addr}:${s1_port}
+		server srvconf2 ${s1_addr}:${s1_port} from none
+
+		# reset the default-server
+		default-server from none
+		server srvconf3 ${s1_addr}:${s1_port}
+
+		# configure new default-server settings used for dynamic servers
+		default-server weight 10
+
+		# named default-server should use base settings by default
+		default-server name other
+		server srvconf4 ${s1_addr}:${s1_port} from srv:other
+
+		# override named default-server
+		default-server name other from be:
+		server srvconf5 ${s1_addr}:${s1_port} from srv:other
+
+		# reset named default-server
+		default-server name other from none
+		server srvconf6 ${s1_addr}:${s1_port} from srv:other
+
+		# define new settings on named default-server
+		default-server name other weight 5
+		server srvconf7 ${s1_addr}:${s1_port} from srv:other
+
+	backend be_defempty
+		default-server check
+		# reset default-server will be purged on post parsing
+		default-server from none
+} -start
+
+haproxy h1 -cli {
+	# static server uses by default the default-server
+	send "get weight be/srvconf1"
+	expect ~ "10 \\(initial 10\\)"
+
+	# from none keyword
+	send "get weight be/srvconf2"
+	expect ~ "1 \\(initial 1\\)"
+
+	# check from none on default-server
+	send "get weight be/srvconf3"
+	expect ~ "1 \\(initial 1\\)"
+}
+
+# named default-server
+haproxy h1 -cli {
+	send "get weight be/srvconf4"
+	expect ~ "1 \\(initial 1\\)"
+
+	send "get weight be/srvconf5"
+	expect ~ "10 \\(initial 10\\)"
+
+	send "get weight be/srvconf6"
+	expect ~ "1 \\(initial 1\\)"
+
+	send "get weight be/srvconf7"
+	expect ~ "5 \\(initial 5\\)"
+}
+
+# dynamic servers
+haproxy h1 -cli {
+	# dynamic server does not use the default-server by default
+	send "add server be/srvdyn1 ${s1_addr}:${s1_port}"
+	expect ~ "New server registered."
+	send "get weight be/srvdyn1"
+	expect ~ "1 \\(initial 1\\)"
+
+	# reuse default-server for a dynamic server insertion
+	send "add server be/srvdyn2 ${s1_addr}:${s1_port} from be:"
+	expect ~ "New server registered."
+	send "get weight be/srvdyn2"
+	expect ~ "10 \\(initial 10\\)"
+
+	# use from keyword for dynamic server
+	send "add server be/srvdyn3 ${s1_addr}:${s1_port} from srv:other"
+	expect ~ "New server registered."
+	send "get weight be/srvdyn3"
+	expect ~ "5 \\(initial 5\\)"
+}
+
+haproxy h1 -cli {
+	send "show default-server"
+	expect ~  "\\* be\n  be/other"
+
+	send "show default-server"
+	expect !~ "be_defempty"
+}

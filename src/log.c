@@ -56,7 +56,7 @@
 int cum_log_messages;
 
 /* log forward proxy list */
-struct proxy *cfg_log_forward;
+struct list cfg_log_forward = LIST_HEAD_INIT(cfg_log_forward);
 
 struct log_fmt_st {
 	char *name;
@@ -1447,8 +1447,7 @@ static int postcheck_log_backend(struct proxy *be)
 	}
 
 	/* finish the initialization of proxy's servers */
-	srv = be->srv;
-	while (srv) {
+	list_for_each_entry(srv, &be->servers, el_px) {
 		BUG_ON(srv->log_target);
 		BUG_ON(srv->addr_type.proto_type != PROTO_TYPE_DGRAM &&
 		       srv->addr_type.proto_type != PROTO_TYPE_STREAM);
@@ -1497,7 +1496,6 @@ static int postcheck_log_backend(struct proxy *be)
 			goto end;
 		}
 		srv->log_target->flags |= LOG_TARGET_FL_RESOLVED;
-		srv = srv->next;
 	}
  end:
 	if (err_code & ERR_CODE) {
@@ -2030,8 +2028,8 @@ static THREAD_LOCAL char lf_buildbuf[256]; /* fixed size buffer for building sma
 
 /* helper to encode a single byte in hex form
  *
- * Returns the position of the last written byte on success and NULL on
- * error.
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static char *_encode_byte_hex(char *start, char *stop, unsigned char byte)
 {
@@ -2048,8 +2046,8 @@ static char *_encode_byte_hex(char *start, char *stop, unsigned char byte)
  * The function may only be called under CBOR context (that is when
  * LOG_OPT_ENCODE_CBOR option is set).
  *
- * Returns the position of the last written byte on success and NULL on
- * error.
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static char *_lf_cbor_encode_byte(struct cbor_encode_ctx *cbor_ctx,
                                   char *start, char *stop, unsigned char byte)
@@ -2095,6 +2093,9 @@ static inline void lf_buildctx_prepare(struct lf_buildctx *ctx,
 
 /* helper function for _lf_encode_bytes() to escape a single byte
  * with <escape>
+ *
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_escape_byte(char *start, char *stop,
                                     char byte, const char escape)
@@ -2110,6 +2111,9 @@ static inline char *_lf_escape_byte(char *start, char *stop,
 
 /* helper function for _lf_encode_bytes() to escape a single byte
  * with <escape> and deal with cbor-specific encoding logic
+ *
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_cbor_escape_byte(char *start, char *stop,
                                          char byte, const char escape,
@@ -2134,8 +2138,8 @@ static inline char *_lf_cbor_escape_byte(char *start, char *stop,
  *
  * The function assumes that at least 1 byte is available for writing
  *
- * Returns the address of the last written byte on success, or NULL
- * on error
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_map_escape_byte(char *start, char *stop,
                                         const char *byte,
@@ -2157,8 +2161,8 @@ static inline char *_lf_map_escape_byte(char *start, char *stop,
  *
  * The function assumes that at least 1 byte is available for writing
  *
- * Returns the address of the last written byte on success, or NULL
- * on error
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_cbor_map_escape_byte(char *start, char *stop,
                                              const char *byte,
@@ -2201,8 +2205,8 @@ static inline char *_lf_cbor_map_escape_byte(char *start, char *stop,
  *
  * The function assumes that at least 1 byte is available for writing
  *
- * Returns the address of the last written byte on success, or NULL
- * on error
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_rfc5424_escape_byte(char *start, char *stop,
                                             const char *byte,
@@ -2232,8 +2236,8 @@ static inline char *_lf_rfc5424_escape_byte(char *start, char *stop,
  *
  * The function assumes that at least 1 byte is available for writing
  *
- * Returns the address of the last written byte on success, or NULL
- * on error
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_json_escape_byte(char *start, char *stop,
                                          const char *byte,
@@ -2310,7 +2314,9 @@ static char *_lf_encode_bytes(char *start, char *stop,
 	}
 
 	if (start < stop) {
-		stop--; /* reserve one byte for the final '\0' */
+		stop--; /* reserve one byte for the final '\0' as encoding functions
+			 * will try to use all available space
+			 */
 
 		if ((ctx->options & LOG_OPT_ENCODE_CBOR) && !ctx->in_text) {
 			/* start indefinite-length cbor byte string or text */
@@ -2426,7 +2432,10 @@ static inline char *_lf_text_len(char *dst, const char *src,
 			 */
 			len = strnlen2(src, len);
 
-			ret = cbor_encode_text(&ctx->encode.cbor, dst, dst + size, src, len);
+			/* cbor_encode_text() doesn't append terminating NULL
+			 * byte, we must reserve 1 byte for that.
+			 */
+			ret = cbor_encode_text(&ctx->encode.cbor, dst, dst + size - 1, src, len);
 			if (ret == NULL)
 				return NULL;
 			len = ret - dst;
@@ -3542,7 +3551,7 @@ const char sess_set_cookie[] = "NPDIRU67";	/* No set-cookie, Set-cookie found an
 #define LOG_CBOR_BYTE(x) do {                                          \
 			ret = _lf_cbor_encode_byte(&ctx->encode.cbor,  \
 			                           tmplog,             \
-			                           dst + maxsize,      \
+			                           dst + maxsize - 1,  \
 			                           (x));               \
 			if (ret == NULL)                               \
 				goto out;                              \
@@ -3563,7 +3572,7 @@ const char sess_set_cookie[] = "NPDIRU67";	/* No set-cookie, Set-cookie found an
 				_x[0] = (x);                                   \
 				ret = cbor_encode_text(&ctx->encode.cbor,      \
 				                       tmplog,                 \
-				                       dst + maxsize,          \
+				                       dst + maxsize - 1,      \
 				                       _x, sizeof(_x));        \
 				if (ret == NULL)                               \
 					goto out;                              \
@@ -3785,12 +3794,10 @@ void deinit_log_forward()
 {
 	struct proxy *p, *p0;
 
-	p = cfg_log_forward;
 	/* we need to manually clean cfg_log_forward proxy list */
-	while (p) {
-		p0 = p;
-		p = p->next;
-		proxy_drop(p0);
+	list_for_each_entry_safe(p, p0, &cfg_log_forward, el) {
+		LIST_DEL_INIT(&p->el);
+		proxy_drop(p);
 	}
 }
 
@@ -4137,7 +4144,7 @@ size_t sess_build_logline_orig(struct session *sess, struct stream *s,
 			}
 			else if (ctx->options & LOG_OPT_ENCODE_CBOR) {
 				ret = cbor_encode_text(&ctx->encode.cbor, tmplog,
-				                       dst + maxsize, tmp->name,
+				                       dst + maxsize - 1, tmp->name,
 				                       strlen(tmp->name));
 				if (ret == NULL)
 					goto out;
@@ -6125,7 +6132,6 @@ ssize_t syslog_applet_append_event(void *ctx, struct ist v1, struct ist v2, size
 int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 {
 	int err_code = ERR_NONE;
-	struct proxy *px;
 	char *errmsg = NULL;
 	const char *err = NULL;
 
@@ -6147,53 +6153,52 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		px = log_forward_by_name(args[1]);
-		if (px) {
+		curproxy = log_forward_by_name(args[1]);
+		if (curproxy) {
 			ha_alert("Parsing [%s:%d]: log-forward section '%s' has the same name as another log-forward section declared at %s:%d.\n",
-				 file, linenum, args[1], px->conf.file, px->conf.line);
+				 file, linenum, args[1], curproxy->conf.file, curproxy->conf.line);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 
-		px = proxy_find_by_name(args[1], 0, 0);
-		if (px) {
+		curproxy = proxy_find_by_name(args[1], 0, 0);
+		if (curproxy) {
 			ha_alert("Parsing [%s:%d]: log forward section '%s' has the same name as %s '%s' declared at %s:%d.\n",
-			         file, linenum, args[1], proxy_type_str(px),
-			         px->id, px->conf.file, px->conf.line);
+			         file, linenum, args[1], proxy_type_str(curproxy),
+			         curproxy->id, curproxy->conf.file, curproxy->conf.line);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 
-		px = proxy_find_by_name(args[1], PR_CAP_DEF, 0);
-		if (px) {
+		curproxy = proxy_find_by_name(args[1], PR_CAP_DEF, 0);
+		if (curproxy) {
 			/* collision with a "defaults" section */
 			ha_warning("Parsing [%s:%d]: log-forward section '%s' has the same name as %s '%s' declared at %s:%d."
 				   " This is dangerous and will not be supported anymore in version 3.3.\n",
-				   file, linenum, args[1], proxy_type_str(px),
-				   px->id, px->conf.file, px->conf.line);
+				   file, linenum, args[1], proxy_type_str(curproxy),
+				   curproxy->id, curproxy->conf.file, curproxy->conf.line);
 			err_code |= ERR_WARN;
 		}
 
-		px = alloc_new_proxy(args[1], PR_CAP_FE, &errmsg);
-		if (!px) {
+		curproxy = alloc_new_proxy(args[1], PR_CAP_FE, &errmsg);
+		if (!curproxy) {
 			ha_alert("Parsing [%s:%d]: %s\n", file, linenum, errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 
-		px->next = cfg_log_forward;
-		cfg_log_forward = px;
-		px->conf.file = copy_file_name(file);
-		px->conf.line = linenum;
-		px->mode = PR_MODE_SYSLOG;
-		px->maxconn = 10;
-		px->timeout.client = TICK_ETERNITY;
-		px->accept = frontend_accept;
-		px->default_target = &syslog_applet.obj_type;
-		px->options3 |= PR_O3_LOGF_HOST_FILL;
+		LIST_INSERT(&cfg_log_forward, &curproxy->el);
+		curproxy->conf.file = copy_file_name(file);
+		curproxy->conf.line = linenum;
+		curproxy->mode = PR_MODE_SYSLOG;
+		curproxy->maxconn = 10;
+		curproxy->timeout.client = TICK_ETERNITY;
+		curproxy->accept = frontend_accept;
+		curproxy->default_target = &syslog_applet.obj_type;
+		curproxy->options3 |= PR_O3_LOGF_HOST_FILL;
 	}
 	else if (strcmp(args[0], "maxconn") == 0) {  /* maxconn */
-		if (warnifnotcap(cfg_log_forward, PR_CAP_FE, file, linenum, args[0], " Maybe you want 'fullconn' instead ?"))
+		if (warnifnotcap(curproxy, PR_CAP_FE, file, linenum, args[0], " Maybe you want 'fullconn' instead ?"))
 			err_code |= ERR_WARN;
 
 		if (*(args[1]) == 0) {
@@ -6201,12 +6206,12 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		cfg_log_forward->maxconn = atol(args[1]);
+		curproxy->maxconn = atol(args[1]);
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
 	}
 	else if (strcmp(args[0], "backlog") == 0) {  /* backlog */
-		if (warnifnotcap(cfg_log_forward, PR_CAP_FE, file, linenum, args[0], NULL))
+		if (warnifnotcap(curproxy, PR_CAP_FE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
 		if (*(args[1]) == 0) {
@@ -6214,7 +6219,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		cfg_log_forward->backlog = atol(args[1]);
+		curproxy->backlog = atol(args[1]);
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
 	}
@@ -6226,8 +6231,8 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 
 		cur_arg = 1;
 
-		bind_conf = bind_conf_alloc(cfg_log_forward, file, linenum,
-					    NULL, xprt_get(XPRT_RAW));
+		bind_conf = bind_conf_alloc(curproxy, file, linenum,
+		                            NULL, xprt_get(XPRT_RAW));
 		if (!bind_conf) {
 			ha_alert("parsing [%s:%d] : out of memory error.", file, linenum);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -6237,7 +6242,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		bind_conf->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : MAX_ACCEPT;
 		bind_conf->accept = session_accept_fd;
 
-		if (!str2listener(args[1], cfg_log_forward, bind_conf, file, linenum, &errmsg)) {
+		if (!str2listener(args[1], curproxy, bind_conf, file, linenum, &errmsg)) {
 			if (errmsg) {
 				indent_msg(&errmsg, 2);
 				ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
@@ -6269,7 +6274,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 
 		cur_arg = 1;
 
-		bind_conf = bind_conf_alloc(cfg_log_forward, file, linenum,
+		bind_conf = bind_conf_alloc(curproxy, file, linenum,
 		                            NULL, xprt_get(XPRT_RAW));
 		if (!bind_conf) {
 			ha_alert("parsing [%s:%d] : out of memory error.", file, linenum);
@@ -6279,7 +6284,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 
 		bind_conf->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : MAX_ACCEPT;
 
-		if (!str2receiver(args[1], cfg_log_forward, bind_conf, file, linenum, &errmsg)) {
+		if (!str2receiver(args[1], curproxy, bind_conf, file, linenum, &errmsg)) {
 			if (errmsg) {
 				indent_msg(&errmsg, 2);
 				ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
@@ -6301,7 +6306,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		while (*args[cur_arg] && (kw = bind_find_kw(args[cur_arg]))) {
 			int ret;
 
-			ret = kw->parse(args, cur_arg, cfg_log_forward, bind_conf, &errmsg);
+			ret = kw->parse(args, cur_arg, curproxy, bind_conf, &errmsg);
 			err_code |= ret;
 			if (ret) {
 				if (errmsg) {
@@ -6329,7 +6334,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		}
 	}
 	else if (strcmp(args[0], "log") == 0) {
-		if (!parse_logger(args, &cfg_log_forward->loggers, (kwm == KWM_NO), file, linenum, &errmsg)) {
+		if (!parse_logger(args, &curproxy->loggers, (kwm == KWM_NO), file, linenum, &errmsg)) {
 			ha_alert("parsing [%s:%d] : %s : %s\n", file, linenum, args[0], errmsg);
 			         err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
@@ -6366,7 +6371,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		cfg_log_forward->timeout.client = MS_TO_TICKS(timeout);
+		curproxy->timeout.client = MS_TO_TICKS(timeout);
 	}
 	else if (strcmp(args[0], "option") == 0) {
 		if (*(args[1]) == '\0') {
@@ -6381,10 +6386,10 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		 * also, cfg_parse_listen_match_option() assumes global curproxy variable points to
 		 * currently evaluated proxy
 		 */
-		curproxy = cfg_log_forward;
+		curproxy = LIST_NEXT(&cfg_log_forward, struct proxy *, el);
 		if (cfg_parse_listen_match_option(file, linenum, kwm, cfg_opts3, &err_code, args,
 		                                  PR_MODE_SYSLOG, PR_CAP_FE,
-		                                  &cfg_log_forward->options3, &cfg_log_forward->no_options3))
+		                                  &curproxy->options3, &curproxy->no_options3))
 			goto out;
 
 		if (err_code & ERR_CODE)
@@ -6409,15 +6414,15 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 				goto out;
 			}
 
-			cfg_log_forward->options3 &= ~PR_O3_LOGF_HOST;
-			cfg_log_forward->no_options3 &= ~PR_O3_LOGF_HOST;
+			curproxy->options3 &= ~PR_O3_LOGF_HOST;
+			curproxy->no_options3 &= ~PR_O3_LOGF_HOST;
 
 			switch (kwm) {
 				case KWM_STD:
-					cfg_log_forward->options3 |= value;
+					curproxy->options3 |= value;
 					break;
 				case KWM_NO:
-					cfg_log_forward->no_options3 |= value;
+					curproxy->no_options3 |= value;
 					break;
 				case KWM_DEF: /* already cleared */
 					break;
@@ -6909,10 +6914,10 @@ static int postresolve_loggers()
 	/* global log directives */
 	err_code |= postresolve_logger_list(NULL, &global.loggers, NULL, NULL);
 	/* proxy log directives */
-	for (px = proxies_list; px; px = px->next)
+	list_for_each_entry(px, &main_proxies, el)
 		err_code |= postresolve_logger_list(px, &px->loggers, "proxy", px->id);
 	/* log-forward log directives */
-	for (px = cfg_log_forward; px; px = px->next)
+	list_for_each_entry(px, &cfg_log_forward, el)
 		err_code |= postresolve_logger_list(NULL, &px->loggers, "log-forward", px->id);
 
 	return err_code;

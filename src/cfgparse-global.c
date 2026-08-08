@@ -1433,7 +1433,42 @@ static int cfg_parse_global_tune_opts(char **args, int section_type,
 		return 0;
 	}
 	else if (strcmp(args[0], "tune.defaults.purge") == 0) {
-		global.tune.options |= GTUNE_PURGE_DEFAULTS;
+		if (args[1]) {
+			struct ist arg = ist(args[1]);
+			/* First check exclusive values "all" and "none". */
+			if (isteq(arg, ist("all"))) {
+				global.tune.options |= GTUNE_PURGE_DEFAULTS|GTUNE_PURGE_DEF_SRV;
+			}
+			else if (isteq(arg, ist("none"))) {
+				global.tune.options &= ~(GTUNE_PURGE_DEFAULTS|GTUNE_PURGE_DEF_SRV);
+			}
+			else {
+				/* Treat argument value as a comma separated list. */
+				do {
+					struct ist token = istsplit(&arg, ',');
+
+					if (isteq(token, ist("proxies"))) {
+						global.tune.options |= GTUNE_PURGE_DEFAULTS;
+					}
+					else if (isteq(token, ist("servers"))) {
+						global.tune.options |= GTUNE_PURGE_DEF_SRV;
+					}
+					else if (isteq(token, ist("all")) ||
+					         isteq(token, ist("none"))) {
+						memprintf(err, "'%s' value '%s' is exclusive.", args[0], ist0(token));
+						return -1;
+					}
+					else {
+						memprintf(err, "'%s' unknown directive '%s'.", args[0], ist0(token));
+						return -1;
+					}
+				} while (istlen(arg));
+			}
+		}
+		else {
+			/* default value if no argument : purge defaults proxies. */
+			global.tune.options |= GTUNE_PURGE_DEFAULTS;
+		}
 	}
 	else if (strcmp(args[0], "tune.pattern.cache-size") == 0) {
 		if (*(args[1]) == 0) {
@@ -1457,6 +1492,7 @@ static int cfg_parse_global_tune_opts(char **args, int section_type,
 		}
 	}
 	else if (strcmp(args[0], "tune.takeover-other-tg-connections") == 0) {
+		ha_warning("parsing [%s:%d]: '%s' is deprecated and will be removed in version 3.7. Please use 'tune.idle-pool.shared\n", file, line, args[0]);
 		if (*(args[1]) == 0) {
 			memprintf(err, "'%s' expects 'none', 'restricted', or 'full'", args[0]);
 			return -1;
@@ -1483,6 +1519,22 @@ static int cfg_parse_global_tune_opts(char **args, int section_type,
 			return -1;
 		}
 		return 0;
+	}
+	else if (strcmp(args[0], "tune.fd.tables") == 0) {
+#ifdef CLONE_FILES
+		if (strcmp(args[1], "per-thread-group") == 0)
+			global.tune.options |= GTUNE_NO_TG_FD_SHARING;
+		else if (strcmp(args[1], "shared") == 0)
+			global.tune.options &= ~GTUNE_NO_TG_FD_SHARING;
+		else {
+			memprintf(err, "'%s' expects 'shared' or 'per-thread-group', got '%s'", args[0], args[1]);
+			return -1;
+		}
+		return 0;
+#else
+		memprintf(err, "'%s' is not supported on that platform", args[0]);
+		return -1;
+#endif
 	}
 	else {
 		BUG_ON(1, "Triggered in cfg_parse_global_tune_opts() by unsupported keyword.");
@@ -1882,6 +1934,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "tune.defaults.purge", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.disable-fast-forward", cfg_parse_global_tune_forward_opts },
 	{ CFG_GLOBAL, "tune.disable-zero-copy-forwarding", cfg_parse_global_tune_forward_opts },
+	{ CFG_GLOBAL, "tune.fd.tables", cfg_parse_global_tune_opts, KWF_EXPERIMENTAL },
 	{ CFG_GLOBAL, "tune.glitches.kill.cpu-usage", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.http.cookielen", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.http.logurilen", cfg_parse_global_tune_opts },

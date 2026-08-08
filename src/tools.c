@@ -1608,32 +1608,33 @@ void len2mask6(int len, struct in6_addr *addr)
 int str2net(const char *str, int resolve, struct in_addr *addr, struct in_addr *mask)
 {
 	__label__ out_free, out_err;
-	char *c, *s;
+	char *s = NULL;
+	const char *c;
 	int ret_val;
-
-	s = strdup(str);
-	if (!s)
-		return 0;
 
 	memset(mask, 0, sizeof(*mask));
 	memset(addr, 0, sizeof(*addr));
 
-	if ((c = strrchr(s, '/')) != NULL) {
-		*c++ = '\0';
-		/* c points to the mask */
-		if (!str2mask(c, mask))
+	if ((c = strrchr(str, '/')) != NULL) {
+		/* we have a mask */
+		if (!str2mask(c + 1, mask))
+			goto out_err;
+
+		s = my_strndup(str, c - str);
+		if (!s)
 			goto out_err;
 	}
 	else {
 		mask->s_addr = ~0U;
 	}
-	if (!inet_pton(AF_INET, s, addr)) {
+
+	if (!inet_pton(AF_INET, s ? s : str, addr)) {
 		struct hostent *he;
 
 		if (!resolve)
 			goto out_err;
 
-		if ((he = gethostbyname(s)) == NULL) {
+		if ((he = gethostbyname(s ? s : str)) == NULL) {
 			goto out_err;
 		}
 		else
@@ -1658,30 +1659,28 @@ int str2net(const char *str, int resolve, struct in_addr *addr, struct in_addr *
  */
 int str62net(const char *str, struct in6_addr *addr, unsigned char *mask)
 {
-	char *c, *s;
+	char *s = NULL;
+	const char *c;
 	int ret_val = 0;
 	char *err;
 	unsigned long len = 128;
 
-	s = strdup(str);
-	if (!s)
-		return 0;
-
 	memset(mask, 0, sizeof(*mask));
 	memset(addr, 0, sizeof(*addr));
 
-	if ((c = strrchr(s, '/')) != NULL) {
-		*c++ = '\0'; /* c points to the mask */
-		if (!*c)
+	if ((c = strrchr(str, '/')) != NULL) {
+		len = strtoul(c + 1, &err, 10);
+		if (!c[1] || (err && *err) || (unsigned)len > 128)
 			goto out_free;
 
-		len = strtoul(c, &err, 10);
-		if ((err && *err) || (unsigned)len > 128)
+		s = my_strndup(str, c - str);
+		if (!s)
 			goto out_free;
 	}
+
 	*mask = len; /* OK we have a valid mask in <len> */
 
-	if (!inet_pton(AF_INET6, s, addr))
+	if (!inet_pton(AF_INET6, s ? s : str, addr))
 		goto out_free;
 
 	ret_val = 1;
@@ -2036,8 +2035,9 @@ int addr_is_local(const struct netns_entry *ns,
  * <map> with the hexadecimal representation of their ASCII-code (2 digits)
  * prefixed by <escape>, and will store the result between <start> (included)
  * and <stop> (excluded), and will always terminate the string with a '\0'
- * before <stop>. If bytes are missing between <start> and <stop>, then the
- * conversion will be incomplete and truncated.
+ * before <stop>. If bytes are missing between <start> and <stop>, if
+ * <truncate> is non zero, then the conversion will be incomplete and
+ * truncated. Otherwise an error is returned.
  * The input string must also be zero-terminated.
  *
  * Return the address of the \0 character, or NULL on error
@@ -2045,7 +2045,7 @@ int addr_is_local(const struct netns_entry *ns,
 const char hextab[16] __nonstring = "0123456789ABCDEF";
 char *encode_string(char *start, char *stop,
 		    const char escape, const long *map,
-		    const char *string)
+		    const char *string, int truncate)
 {
 	if (start < stop) {
 		stop--; /* reserve one byte for the final '\0' */
@@ -2053,8 +2053,11 @@ char *encode_string(char *start, char *stop,
 			if (!ha_bit_test((unsigned char)(*string), map))
 				*start++ = *string;
 			else {
-				if (start + 3 >= stop)
-					break;
+				if (start + 3 >= stop) {
+					if (truncate)
+						break;
+					goto error;
+				}
 				*start++ = escape;
 				*start++ = hextab[(*string >> 4) & 15];
 				*start++ = hextab[*string & 15];
@@ -2064,6 +2067,7 @@ char *encode_string(char *start, char *stop,
 		*start = '\0';
 		return start;
 	}
+  error:
 	return NULL;
 }
 
@@ -2072,8 +2076,8 @@ char *encode_string(char *start, char *stop,
  * <chunk> instead of a string.
  */
 char *encode_chunk(char *start, char *stop,
-		    const char escape, const long *map,
-		    const struct buffer *chunk)
+		   const char escape, const long *map,
+		   const struct buffer *chunk, int truncate)
 {
 	char *str = chunk->area;
 	char *end = chunk->area + chunk->data;
@@ -2084,8 +2088,11 @@ char *encode_chunk(char *start, char *stop,
 			if (!ha_bit_test((unsigned char)(*str), map))
 				*start++ = *str;
 			else {
-				if (start + 3 >= stop)
-					break;
+				if (start + 3 >= stop) {
+					if (truncate)
+						break;
+					goto error;
+				}
 				*start++ = escape;
 				*start++ = hextab[(*str >> 4) & 15];
 				*start++ = hextab[*str & 15];
@@ -2095,6 +2102,7 @@ char *encode_chunk(char *start, char *stop,
 		*start = '\0';
 		return start;
 	}
+  error:
 	return NULL;
 }
 
@@ -2190,8 +2198,9 @@ int chunk_escape_string(struct buffer *chunk, const char *str, size_t len)
  *
  * CBOR encode ctx is provided in <ctx>
  *
- * Returns the position of the last written byte on success and NULL on
- * error. The function cannot write past <stop>
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. The function cannot write past <stop>.
+ * It will not append terminating NULL byte.
  */
 char *cbor_encode_uint64_prefix(struct cbor_encode_ctx *ctx,
                                 char *start, char *stop, uint64_t value,
@@ -2252,8 +2261,9 @@ char *cbor_encode_uint64_prefix(struct cbor_encode_ctx *ctx,
  *
  * CBOR encode ctx is provided in <ctx>
  *
- * Returns the position of the last written byte on success and NULL on
- * error. The function cannot write past <stop>
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. The function cannot write past <stop>.
+ * It will not append terminating NULL byte.
  */
 char *cbor_encode_int64(struct cbor_encode_ctx *ctx,
                         char *start, char *stop, int64_t value)
@@ -2283,8 +2293,9 @@ char *cbor_encode_int64(struct cbor_encode_ctx *ctx,
  *
  * CBOR encode ctx is provided in <ctx>
  *
- * Returns the position of the last written byte on success and NULL on
- * error. The function cannot write past <stop>
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. The function cannot write past <stop>.
+ * It will not append terminating NULL byte.
  */
 char *cbor_encode_bytes_prefix(struct cbor_encode_ctx *ctx,
                                char *start, char *stop,
@@ -2316,8 +2327,9 @@ char *cbor_encode_bytes_prefix(struct cbor_encode_ctx *ctx,
  *
  * CBOR encode ctx is provided in <ctx>
  *
- * Returns the position of the last written byte on success and NULL on
- * error. The function cannot write past <stop>
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. The function cannot write past <stop>.
+ * It will not append terminating NULL byte.
  */
 char *cbor_encode_text(struct cbor_encode_ctx *ctx,
                        char *start, char *stop,
@@ -2333,8 +2345,9 @@ char *cbor_encode_text(struct cbor_encode_ctx *ctx,
  *
  * CBOR encode ctx is provided in <ctx>
  *
- * Returns the position of the last written byte on success and NULL on
- * error. The function cannot write past <stop>
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. The function cannot write past <stop>.
+ * It will not append terminating NULL byte.
  */
 char *cbor_encode_bytes(struct cbor_encode_ctx *ctx,
                         char *start, char *stop,
@@ -3892,6 +3905,72 @@ size_t ipaddrcpy(unsigned char *buf, const struct sockaddr_storage *saddr)
 	return p - buf;
 }
 
+/* cache of conversions from time_t to struct tm via localtime() and gmtime(). */
+static THREAD_LOCAL struct {
+	time_t sec;
+	struct tm tm;
+} localtime_cache[TIME_CACHE_SLOTS], gmtime_cache[TIME_CACHE_SLOTS];
+
+/* slot where most recent value was stored */
+static THREAD_LOCAL uint localtime_cache_slot, gmtime_cache_slot;
+
+/* This function converts the time_t value <now> into a broken out struct tm
+ * which must be allocated by the caller. It is highly recommended to use this
+ * function instead of localtime() because that one requires a time_t* which
+ * is not always compatible with tv_sec depending on OS/hardware combinations.
+ * Also it implements a cache that avoids internal libc contention on tz_lock
+ * when entering __tz_convert().
+ */
+void get_localtime(const time_t now, struct tm *tm)
+{
+	uint32_t idx;
+
+	/* visit recent entries in age order */
+	idx = localtime_cache_slot;
+	do {
+		if (likely(localtime_cache[idx].sec == now)) {
+			/* that's a hit, return the cached entry */
+			*tm = localtime_cache[idx].tm;
+			return;
+		}
+		idx = (idx - 1) % TIME_CACHE_SLOTS;
+	} while (idx != localtime_cache_slot);
+
+	/* that's a miss, convert the time and cache it */
+	localtime_r(&now, tm);
+	localtime_cache_slot = (localtime_cache_slot + 1) % TIME_CACHE_SLOTS;
+	localtime_cache[localtime_cache_slot].sec = now;
+	localtime_cache[localtime_cache_slot].tm = *tm;
+}
+
+/* This function converts the time_t value <now> into a broken out struct tm
+ * which must be allocated by the caller. It is highly recommended to use this
+ * function instead of gmtime() because that one requires a time_t* which
+ * is not always compatible with tv_sec depending on OS/hardware combinations.
+ * Also it implements a cache that avoids internal libc contention on tz_lock
+ * when entering __tz_convert().
+ */
+void get_gmtime(const time_t now, struct tm *tm)
+{
+	uint32_t idx;
+
+	/* visit recent entries in age order */
+	idx = gmtime_cache_slot;
+	do {
+		if (likely(gmtime_cache[idx].sec == now)) {
+			/* that's a hit, return the cached entry */
+			*tm = gmtime_cache[idx].tm;
+			return;
+		}
+		idx = (idx - 1) % TIME_CACHE_SLOTS;
+	} while (idx != gmtime_cache_slot);
+
+	/* that's a miss, convert the time and cache it */
+	gmtime_r(&now, tm);
+	gmtime_cache_slot = (gmtime_cache_slot + 1) % TIME_CACHE_SLOTS;
+	gmtime_cache[gmtime_cache_slot].sec = now;
+	gmtime_cache[gmtime_cache_slot].tm = *tm;
+}
 
 char *human_time(int t, short hz_div) {
 	static char rv[sizeof("24855d23h")+1];	// longest of "23h59m" and "59m59s"

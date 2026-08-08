@@ -175,6 +175,7 @@ enum srv_init_state {
 #define SRV_F_CHK_NO_AUTO_SNI 0x20000    /* disable automatic SNI selection for healthcheck */
 #define SRV_F_UDP_GSO_NOTSUPP 0x40000    /* UDP GSO is disabled due to a previous error encountered */
 #define SRV_F_NAME_REFD    0x80000       /* this server's name is statically referenced (use-server, track, sample arg) */
+#define SRV_F_UMODIFIED    0x100000      /* at least one setting has been explicitely set via a server keyword */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1               0x0001   /* proxy protocol version 1 */
@@ -350,8 +351,8 @@ struct server {
 	signed char use_ssl;		        /* ssl enabled (1: on, 0: disabled, -1 forced off)  */
 	unsigned int flags;                     /* server flags (SRV_F_*) */
 	unsigned int pp_opts;                   /* proxy protocol options (SRV_PP_*) */
-	struct mt_list global_list;             /* attach point in the global servers_list */
-	struct server *next;
+	struct mt_list global_list;             /* attach point in the global servers */
+	struct list el_px;                      /* attach point in parent proxy */
 	int cklen;				/* the len of the cookie, to speed up checks */
 	int rdr_len;				/* the length of the redirection prefix */
 	char *cookie;				/* the id set in the cookie */

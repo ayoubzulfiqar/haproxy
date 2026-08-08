@@ -21,6 +21,7 @@
 #include <haproxy/backend.h>
 #include <haproxy/errors.h>
 #include <haproxy/guid.h>
+#include <haproxy/proxy.h>
 #include <haproxy/queue.h>
 #include <haproxy/server.h>
 #include <haproxy/tools.h>
@@ -240,7 +241,7 @@ static void chash_set_server_status_down(struct server *srv)
 			 */
 			struct server *srv2 = p->lbprm.fbck;
 			do {
-				srv2 = srv2->next;
+				srv2 = proxy_next_server(srv2);
 			} while (srv2 &&
 				 !((srv2->flags & SRV_F_BACKUP) &&
 				   srv_willbe_usable(srv2)));
@@ -301,7 +302,7 @@ static void chash_set_server_status_up(struct server *srv)
 				 */
 				struct server *srv2 = srv;
 				do {
-					srv2 = srv2->next;
+					srv2 = proxy_next_server(srv2);
 				} while (srv2 && (srv2 != p->lbprm.fbck));
 				if (srv2)
 					p->lbprm.fbck = srv;
@@ -500,6 +501,7 @@ struct server *chash_get_next_server(struct proxy *p, struct server *srvtoavoid)
 	struct server *srv, *avoided;
 	struct eb32_node *node, *stop, *avoided_node;
 	struct eb_root *root;
+	int wrapped = 0;
 
 	srv = avoided = NULL;
 	avoided_node = NULL;
@@ -524,8 +526,16 @@ struct server *chash_get_next_server(struct proxy *p, struct server *srvtoavoid)
 
 		if (node)
 			node = eb32_next(node);
-		if (!node)
+		if (!node) {
+			/* Reaching the end of the tree twice means that <stop>
+			 * does not belong to <root> (e.g. active servers found
+			 * from .last when only backup usable). So let's count
+			 * wraps to avoid looping forever.
+			 */
+			if (wrapped++)
+				break;
 			node = eb32_first(root);
+		}
 
 		p->lbprm.chash.last = node;
 		if (!node) {
@@ -605,7 +615,7 @@ static int chash_init_server_tree(struct proxy *p)
 	struct eb_root init_head = EB_ROOT;
 
 	p->lbprm.wdiv = BE_WEIGHT_SCALE;
-	for (srv = p->srv; srv; srv = srv->next) {
+	list_for_each_entry(srv, &p->servers, el_px) {
 		srv->next_eweight = (srv->uweight * p->lbprm.wdiv + p->lbprm.wmult - 1) / p->lbprm.wmult;
 		srv_lb_commit_status(srv);
 	}
@@ -618,7 +628,7 @@ static int chash_init_server_tree(struct proxy *p)
 	p->lbprm.chash.last = NULL;
 
 	/* queue active and backup servers in two distinct groups */
-	for (srv = p->srv; srv; srv = srv->next) {
+	list_for_each_entry(srv, &p->servers, el_px) {
 		srv->lb_tree = (srv->flags & SRV_F_BACKUP) ? &p->lbprm.chash.bck : &p->lbprm.chash.act;
 		srv->lb_nodes_tot = srv->uweight * BE_WEIGHT_SCALE;
 		srv->lb_nodes_now = 0;
